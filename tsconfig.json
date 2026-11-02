@@ -1,0 +1,31 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "lib": [
+            "ES2022",
+            "DOM"
+        ],
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "strict": true,
+        "skipLibCheck": true,
+        "outDir": "dist",
+        "rootDir": ".",
+        "esModuleInterop": true,
+        "types": [
+            "node"
+        ]
+    },
+    "include": [
+        "*.ts",
+        "databases/**/*.ts",
+        "auth/**/*.ts",
+        "agents/**/*.ts"
+    ],
+    "exclude": [
+        "tests",
+        "dist",
+        "deploy.ts",
+        "deployment.ts"
+    ]
+}

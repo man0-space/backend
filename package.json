@@ -1,0 +1,42 @@
+{
+  "name": "backend",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "migrate": "tsx databases/migrate.ts",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "tsx check.ts",
+    "deploy": "npm run build && tsx deploy.ts"
+  },
+  "dependencies": {
+    "@compose-market/sdk": "^0.8.45",
+    "@defuse-protocol/crosschain-assetid": "^1.15.0",
+    "@defuse-protocol/intents-sdk": "^0.98.0",
+    "@defuse-protocol/one-click-sdk-typescript": "^0.1.26",
+    "@fastify/cors": "^11.4.3",
+    "@fastify/rate-limit": "^11.2.2",
+    "@neondatabase/serverless": "^1.2.1",
+    "@noble/curves": "^2.4.0",
+    "@scure/base": "^2.4.0",
+    "@simplewebauthn/server": "^14.1.0",
+    "dotenv": "^18.0.10",
+    "drizzle-orm": "^0.45.4",
+    "fastify": "^5.12.8",
+    "ioredis": "^6.0.0",
+    "jose": "^6.2.17",
+    "near-api-js": "^7.5.3",
+    "near-kit": "^0.20.2",
+    "viem": "^2.57.19",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "overrides": {
+    "@noble/hashes@^1.7.1": "^1.8.0"
+  }
+}
