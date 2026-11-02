@@ -172,3 +172,32 @@ export type Listing = Flow & {
   terms: Terms | null;
   published: string | null;
 };
+
+export const thread = z.object({
+  threadId: z.string().trim().min(1).max(200),
+  workflowId: z.string().uuid(),
+  userAddress: z.string().trim().min(1).max(160),
+  title: z.string().max(400),
+  status: z.enum([
+    'running',
+    'input_required',
+    'connector_required',
+    'succeeded',
+    'failed',
+  ]),
+  runId: z.string().trim().min(1).max(200),
+  dry: z.boolean(),
+  prompt: z.string().max(32000),
+  attachments: z.array(z.record(z.string(), z.unknown())).max(8).default([]),
+  coordinator: coordinator.nullable().optional(),
+  runningStepId: z.string().nullable().optional(),
+  stepOutputs: z.record(z.string(), z.string()).default({}),
+  missingInputs: z.array(z.record(z.string(), z.unknown())).default([]),
+  missingConnectors: z.array(z.record(z.string(), z.unknown())).default([]),
+  error: z.string().nullable().optional(),
+  billing: z.record(z.string(), z.unknown()).nullable().optional(),
+  execution: z.record(z.string(), z.unknown()).nullable().optional(),
+  created: z.string().datetime(),
+  updated: z.string().datetime(),
+});
+export type Thread = z.infer<typeof thread>;
