@@ -131,3 +131,45 @@ export function singleFlight<T>(key: string, fn: () => Promise<T>): Promise<T> {
   inflight.set(key, promise);
   return promise;
 }
+
+export async function cached<T>(
+  key: string,
+  l2TtlSeconds: number,
+  l1TtlMsOrFetcher: number | (() => Promise<T>),
+  maybeFetcher?: () => Promise<T>,
+): Promise<T> {
+  const l1TtlMs =
+    typeof l1TtlMsOrFetcher === 'number'
+      ? l1TtlMsOrFetcher
+      : Math.min(l2TtlSeconds * 1000, 60_000);
+  const fetcher = typeof l1TtlMsOrFetcher === 'function' ? l1TtlMsOrFetcher : maybeFetcher!;
+  const hit = await cacheGet<T>(key, l1TtlMs);
+  if (hit !== undefined) return hit;
+  return singleFlight(key, async () => {
+    const secondHit = await cacheGet<T>(key, l1TtlMs);
+    if (secondHit !== undefined) return secondHit;
+    const value = await fetcher();
+    await cacheSet(key, value, l2TtlSeconds, l1TtlMs);
+    return value;
+  });
+}
+
+export async function ready() {
+  await Promise.all(
+    [cache, composer].map(service =>
+      service.status === 'wait' ? service.connect() : Promise.resolve(),
+    ),
+  );
+}
+
+export async function close() {
+  l1.clear();
+  inflight.clear();
+  await Promise.all(
+    [cache, composer].map(service =>
+      service.quit().catch(() => {
+        service.disconnect();
+      }),
+    ),
+  );
+}
