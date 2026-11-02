@@ -112,3 +112,63 @@ export const graph = z
     if (data.nodes.some(node => !walk(node.id)))
       ctx.addIssue({ code: 'custom', message: 'A workflow cannot contain circular connections.' });
   });
+export const terms = z.object({
+  creatorFee: z.number().int().min(1).max(3),
+  tasks: z
+    .array(z.string().trim().min(1).max(64))
+    .min(1)
+    .max(12)
+    .transform(val => resolveCanonicalTasks(val))
+    .refine(val => val.length >= 1 && val.length <= MAX_TASK_TAGS, {
+      message: 'Choose between 1 and 3 task categories.',
+    }),
+  description: z.string().trim().min(1).max(4000),
+  cid: z.string().trim().min(1).max(256).optional(),
+  chainWorkflowId: z.number().int().min(1).optional(),
+  txHash: z.string().trim().min(1).max(256).optional(),
+  contractId: z.string().trim().min(1).max(256).optional(),
+});
+export const socialPlatform = z.enum(['x', 'discord', 'github', 'google', 'telegram']);
+export const socialLink = z.object({
+  platform: socialPlatform,
+  handle: z.string().trim().min(1).max(120),
+  url: z.string().trim().url().max(512),
+  verified: z.boolean().optional(),
+  providerId: z.string().trim().max(160).optional(),
+});
+export const profile = z.object({
+  name: z.string().trim().max(100),
+  bio: z.string().max(1000),
+  image: z.string().max(524288).nullable().optional(),
+  banner: z.string().max(524288).nullable().optional(),
+  socials: z.array(socialLink).max(10).optional(),
+});
+
+export type SocialPlatform = z.infer<typeof socialPlatform>;
+export type SocialLink = z.infer<typeof socialLink>;
+export type Coordinator = z.infer<typeof coordinator>;
+export type Flow = z.infer<typeof graph>;
+export type Terms = z.infer<typeof terms>;
+export type Profile = z.infer<typeof profile>;
+export type CreatorWallets = {
+  near: string;
+  evm: string | null;
+  svm: string | null;
+};
+export type CreatorProfile = {
+  userAddress: string;
+  name: string;
+  bio: string;
+  image: string | null;
+  banner: string | null;
+  socials: SocialLink[];
+  wallets?: CreatorWallets;
+};
+export type User = CreatorProfile & { consented: boolean };
+export type Listing = Flow & {
+  userAddress: string;
+  creatorName?: string;
+  creatorAvatar?: string | null;
+  terms: Terms | null;
+  published: string | null;
+};
