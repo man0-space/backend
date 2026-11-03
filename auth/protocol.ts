@@ -417,3 +417,62 @@ export function commitment(msg: Message): Buffer {
   ]);
   return createHash('sha3-256').update(DOMAIN_SEPARATOR).update(encoded).digest();
 }
+
+export function ed25519AccessKeyHandle(pubKey32: Uint8Array): Buffer {
+  if (pubKey32.length !== 32) {
+    throw new Error('Invalid Ed25519 public key length for UniversalStateInit.');
+  }
+  return Buffer.concat([Buffer.from([0]), Buffer.from(pubKey32)]);
+}
+
+export function universalStateInitAction(rawStateInit: Uint8Array, deposit = 0n): Buffer {
+  return Buffer.concat([Buffer.from([15]), borshBytes(rawStateInit), u128le(deposit)]);
+}
+
+export function transferAction(amount: bigint): Buffer {
+  return Buffer.concat([Buffer.from([3]), u128le(amount)]);
+}
+
+export function addFullAccessKeyAction(pubKey32: Uint8Array): Buffer {
+  return Buffer.concat([
+    Buffer.from([5]),
+    ed25519AccessKeyHandle(pubKey32),
+    u64le(0n),
+    Buffer.from([1]),
+  ]);
+}
+
+export function functionCallAction(
+  methodName: string,
+  args: Uint8Array,
+  gas: bigint,
+  deposit: bigint,
+): Buffer {
+  return Buffer.concat([
+    Buffer.from([2]),
+    borshString(methodName),
+    borshBytes(args),
+    u64le(gas),
+    u128le(deposit),
+  ]);
+}
+
+export function serializeTransaction(input: {
+  signerId: string;
+  publicKey: Uint8Array;
+  nonce: bigint;
+  receiverId: string;
+  blockHash: Uint8Array;
+  actions: Uint8Array[];
+}): Buffer {
+  return Buffer.concat([
+    borshString(input.signerId),
+    Buffer.from([0]),
+    Buffer.from(input.publicKey),
+    u64le(input.nonce),
+    borshString(input.receiverId),
+    Buffer.from(input.blockHash),
+    u32le(input.actions.length),
+    ...input.actions.map(a => Buffer.from(a)),
+  ]);
+}
