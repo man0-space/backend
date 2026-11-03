@@ -181,3 +181,110 @@ export function state(
     ...sortedExtensions.map(borshString),
   ]);
 }
+
+export type GlobalContractCode =
+  | string
+  | { accountId: string; codeHash?: never }
+  | { codeHash: string; accountId?: never };
+
+function encodeGlobalContractIdentifier(code: GlobalContractCode): Buffer {
+  if (typeof code === 'object') {
+    if ('accountId' in code && code.accountId) {
+      return Buffer.concat([Buffer.from([1]), borshString(code.accountId)]);
+    }
+    if ('codeHash' in code && code.codeHash) {
+      const decoded = base58.decode(code.codeHash);
+      if (decoded.length !== 32) {
+        throw new Error('Global contract code hash must be 32 bytes.');
+      }
+      return Buffer.concat([Buffer.from([0]), Buffer.from(decoded)]);
+    }
+    throw new Error('Global contract identifier is required.');
+  }
+  const trimmed = code.trim();
+  if (
+    /^0s[0-9a-f]{40}$/.test(trimmed) ||
+    /^0u[0123456789abcdefghjkmnpqrstvwxyz]{52}$/.test(trimmed) ||
+    trimmed.includes('.')
+  ) {
+    return Buffer.concat([Buffer.from([1]), borshString(trimmed)]);
+  }
+  const codeHash = base58.decode(trimmed);
+  if (codeHash.length !== 32) {
+    throw new Error('Global contract code hash must be 32 bytes.');
+  }
+  return Buffer.concat([Buffer.from([0]), Buffer.from(codeHash)]);
+}
+
+export function initialization(
+  code: GlobalContractCode,
+  stateBytes: Uint8Array,
+  accessKeys: Uint8Array[] = [],
+): Buffer {
+  const encodedCode = encodeGlobalContractIdentifier(code);
+  const uniqueKeys = [
+    ...new Map(accessKeys.map(k => [Buffer.from(k).toString('hex'), Buffer.from(k)])).values(),
+  ].sort(Buffer.compare);
+
+  return Buffer.concat([
+    Buffer.from([0]),
+    Buffer.from([1]),
+    encodedCode,
+    u32le(1),
+    u32le(0),
+    borshBytes(stateBytes),
+    u32le(uniqueKeys.length),
+    ...uniqueKeys,
+  ]);
+}
+
+export function extractStateKey(rawStateInit: Uint8Array): Buffer {
+  const buf = Buffer.from(rawStateInit);
+  if (buf.length < 20 || buf[0] !== 0 || buf[1] !== 1) {
+    throw new Error('Malformed UniversalStateInit bytes.');
+  }
+  let offset = 2;
+  const codeDiscriminant = buf[offset++];
+  if (codeDiscriminant === 0) {
+    offset += 32;
+  } else if (codeDiscriminant === 1) {
+    const accountLen = buf.readUInt32LE(offset);
+    offset += 4 + accountLen;
+  } else {
+    throw new Error('Unknown GlobalContractIdentifier discriminant.');
+  }
+  const dataCount = buf.readUInt32LE(offset);
+  offset += 4;
+  if (dataCount < 1) {
+    throw new Error('UniversalStateInit has no state entries.');
+  }
+  const keyLen = buf.readUInt32LE(offset);
+  offset += 4 + keyLen;
+  const valLen = buf.readUInt32LE(offset);
+  offset += 4;
+  if (valLen < 38 || offset + valLen > buf.length) {
+    throw new Error('Invalid wallet State value in UniversalStateInit.');
+  }
+  // State layout: [signature_enabled(1), subwallet_id(4), compressed_p256(33), ...]
+  const keySlice = buf.subarray(offset + 5, offset + 38);
+  return compress(keySlice);
+}
+
+export function address(rawStateInit: Uint8Array): string {
+  const digest = createHash('sha3-256').update(rawStateInit).digest();
+  let bits = 0;
+  let value = 0;
+  let out = '0u';
+  for (const byte of digest) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += CROCKFORD[(value >>> bits) & 31];
+    }
+  }
+  if (bits > 0) {
+    out += CROCKFORD[(value << (5 - bits)) & 31];
+  }
+  return out;
+}
