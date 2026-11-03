@@ -476,3 +476,121 @@ export function serializeTransaction(input: {
     ...input.actions.map(a => Buffer.from(a)),
   ]);
 }
+
+export interface WebAuthnProof {
+  authenticator_data: string;
+  client_data_json: string;
+  signature: string;
+}
+
+export function normalizeP256Signature(sig: Uint8Array): Buffer {
+  if (sig.length === 64) {
+    const parsed = p256.Signature.fromBytes(sig);
+    const normalized = parsed.hasHighS()
+      ? new p256.Signature(parsed.r, p256.Point.Fn.ORDER - parsed.s)
+      : parsed;
+    return Buffer.from(normalized.toBytes());
+  }
+  const parsed = p256.Signature.fromBytes(sig, 'der');
+  const normalized = parsed.hasHighS()
+    ? new p256.Signature(parsed.r, p256.Point.Fn.ORDER - parsed.s)
+    : parsed;
+  return Buffer.from(normalized.toBytes());
+}
+
+export function signWebAuthnP256(
+  privateKey32: Uint8Array,
+  challenge32: Uint8Array,
+  originUrl = 'https://man0.space',
+  rpId = 'man0.space',
+  signCount = 1,
+): WebAuthnProof {
+  const rpIdHash = createHash('sha256').update(rpId).digest();
+  const countBuf = Buffer.alloc(4);
+  countBuf.writeUInt32BE(signCount >>> 0, 0);
+  const authData = Buffer.concat([rpIdHash, Buffer.from([0x05]), countBuf]);
+  const clientDataJSON = JSON.stringify({
+    type: 'webauthn.get',
+    challenge: Buffer.from(challenge32).toString('base64url'),
+    origin: originUrl,
+  });
+  const clientDataHash = createHash('sha256').update(clientDataJSON, 'utf8').digest();
+  const effectiveMsg = Buffer.concat([authData, clientDataHash]);
+  const prehash = createHash('sha256').update(effectiveMsg).digest();
+  const sig64 = p256.sign(prehash, privateKey32, { prehash: false, lowS: true });
+  return {
+    authenticator_data: authData.toString('base64url'),
+    client_data_json: clientDataJSON,
+    signature: `p256:${base58.encode(sig64)}`,
+  };
+}
+
+export function webAuthnAssertionToProof(assertion: {
+  response?: {
+    authenticatorData?: string;
+    clientDataJSON?: string;
+    signature?: string;
+  };
+  authenticator_data?: string;
+  client_data_json?: string;
+  signature?: string;
+}): WebAuthnProof {
+  const authenticatorData = assertion.response?.authenticatorData ?? assertion.authenticator_data;
+  const clientDataJSON = assertion.response?.clientDataJSON ?? assertion.client_data_json;
+  const rawSignature = assertion.response?.signature ?? assertion.signature;
+  if (!authenticatorData || !clientDataJSON || !rawSignature) {
+    throw Object.assign(new Error('Malformed WebAuthn assertion payload.'), { statusCode: 400 });
+  }
+  const clientDataText = (() => {
+    const trimmed = clientDataJSON.trim();
+    if (trimmed.startsWith('{')) return trimmed;
+    return Buffer.from(trimmed, 'base64url').toString('utf8');
+  })();
+  const sigBytes = rawSignature.startsWith('p256:')
+    ? base58.decode(rawSignature.slice(5))
+    : Buffer.from(rawSignature, 'base64url');
+  const sig64 = normalizeP256Signature(sigBytes);
+  return {
+    authenticator_data: authenticatorData,
+    client_data_json: clientDataText,
+    signature: `p256:${base58.encode(sig64)}`,
+  };
+}
+
+
+export function verifyWebAuthnP256(
+  publicKey: Uint8Array,
+  challenge32: Uint8Array,
+  proof: WebAuthnProof,
+): boolean {
+  try {
+    const authData = Buffer.from(proof.authenticator_data, 'base64url');
+    if (authData.length < 37) return false;
+    const flags = authData[32];
+    if ((flags & 0x01) !== 0x01) return false;
+    if ((flags & 0x08) !== 0x08 && (flags & 0x10) === 0x10) return false;
+
+    const clientData = JSON.parse(proof.client_data_json) as {
+      type?: string;
+      challenge?: string;
+    };
+    if (clientData.type !== 'webauthn.get' || !clientData.challenge) return false;
+    const challengeBytes = Buffer.from(clientData.challenge, 'base64url');
+    if (!challengeBytes.equals(Buffer.from(challenge32))) return false;
+
+    const rawSig = proof.signature.startsWith('p256:')
+      ? base58.decode(proof.signature.slice(5))
+      : Buffer.from(proof.signature, 'base64url');
+    const sig64 = normalizeP256Signature(rawSig);
+    const parsedSig = p256.Signature.fromBytes(sig64);
+    if (parsedSig.hasHighS()) return false;
+
+    const clientDataHash = createHash('sha256').update(proof.client_data_json, 'utf8').digest();
+    const effectiveMsg = Buffer.concat([authData, clientDataHash]);
+    const prehash = createHash('sha256').update(effectiveMsg).digest();
+    const compressed = compress(publicKey);
+    return p256.verify(sig64, prehash, compressed, { prehash: false, lowS: true });
+  } catch {
+    return false;
+  }
+}
