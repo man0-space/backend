@@ -594,3 +594,93 @@ export function verifyWebAuthnP256(
     return false;
   }
 }
+
+function decodeFlexibleBytes(input: string): Buffer {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('0x') || trimmed.startsWith('0X')) {
+    return Buffer.from(trimmed.slice(2), 'hex');
+  }
+  const stripped = trimmed.replace(/^(ed25519:|secp256k1:|p256:)/, '');
+  if (/^[0-9a-fA-F]+$/.test(stripped) && stripped.length % 2 === 0 && stripped.length >= 128) {
+    return Buffer.from(stripped, 'hex');
+  }
+  try {
+    return Buffer.from(base58.decode(stripped));
+  } catch {
+    return Buffer.from(stripped, 'base64');
+  }
+}
+
+export function verifyExternalOwnershipProof(input: {
+  network: 'evm' | 'svm';
+  address: string;
+  message: string;
+  signature: string;
+}): { address: string; publicKey: string } {
+  const msgBytes = Buffer.from(input.message, 'utf8');
+  if (input.network === 'evm') {
+    const normalizedAddr = input.address.trim().toLowerCase();
+    if (!/^0x[0-9a-f]{40}$/.test(normalizedAddr)) {
+      throw Object.assign(new Error('Invalid EVM wallet address.'), { statusCode: 400 });
+    }
+    const sigBytes = decodeFlexibleBytes(input.signature);
+    if (sigBytes.length !== 65) {
+      throw Object.assign(new Error('Invalid ERC-191 signature length.'), { statusCode: 401 });
+    }
+    let recId = sigBytes[64];
+    if (recId >= 27) recId -= 27;
+    if (recId !== 0 && recId !== 1) {
+      throw Object.assign(new Error('Invalid ERC-191 signature recovery id.'), { statusCode: 401 });
+    }
+    const prefix = Buffer.from(`\x19Ethereum Signed Message:\n${msgBytes.length}`, 'utf8');
+    const digest = keccak256(Buffer.concat([prefix, msgBytes]));
+    let raw64: Buffer;
+    try {
+      const sigObj = secp256k1.Signature.fromBytes(sigBytes.subarray(0, 64)).addRecoveryBit(recId);
+      if (sigObj.hasHighS()) {
+        throw new Error('High-S signature');
+      }
+      const point = sigObj.recoverPublicKey(digest);
+      raw64 = Buffer.from(point.toBytes(false).subarray(1, 65));
+    } catch {
+      throw Object.assign(new Error('Invalid ERC-191 wallet signature.'), { statusCode: 401 });
+    }
+    const recoveredAddr = `0x${keccak256(raw64).subarray(12, 32).toString('hex')}`;
+    if (recoveredAddr !== normalizedAddr) {
+      throw Object.assign(
+        new Error('External EVM signature does not match the claimed wallet address.'),
+        { statusCode: 401 },
+      );
+    }
+    return {
+      address: normalizedAddr,
+      publicKey: intentsPublicKey('secp256k1', raw64),
+    };
+  }
+
+  const trimmedAddr = input.address.trim();
+  let pubKey32: Buffer;
+  try {
+    pubKey32 = Buffer.from(base58.decode(trimmedAddr));
+  } catch {
+    throw Object.assign(new Error('Invalid Solana wallet address.'), { statusCode: 400 });
+  }
+  if (pubKey32.length !== 32) {
+    throw Object.assign(new Error('Invalid Solana wallet address length.'), { statusCode: 400 });
+  }
+  const sigBytes = decodeFlexibleBytes(input.signature);
+  if (sigBytes.length !== 64) {
+    throw Object.assign(new Error('Invalid Solana Ed25519 signature length.'), { statusCode: 401 });
+  }
+  const ok = ed25519.verify(sigBytes, msgBytes, pubKey32);
+  if (!ok) {
+    throw Object.assign(
+      new Error('External Solana signature does not match the claimed wallet address.'),
+      { statusCode: 401 },
+    );
+  }
+  return {
+    address: trimmedAddr,
+    publicKey: intentsPublicKey('ed25519', pubKey32),
+  };
+}
