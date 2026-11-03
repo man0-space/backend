@@ -684,3 +684,80 @@ export function verifyExternalOwnershipProof(input: {
     publicKey: intentsPublicKey('ed25519', pubKey32),
   };
 }
+
+export function buildWalletAddPublicKeyMessage(input: {
+  signerId: string;
+  networkId: string;
+  publicKey: string;
+  nonce?: number;
+  createdAt?: string;
+  timeoutSecs?: number;
+  intentsContractId?: string;
+}): Message {
+  const args = Buffer.from(JSON.stringify({ public_key: input.publicKey }), 'utf8').toString(
+    'base64',
+  );
+  return {
+    pay_for_gas: false,
+    chain_id: input.networkId,
+    signer_id: input.signerId,
+    nonce: input.nonce ?? randomInt(1, 0x100000000),
+    created_at: input.createdAt ?? new Date(Date.now() - 60_000).toISOString(),
+    timeout_secs: input.timeoutSecs ?? 300,
+    request: {
+      internal: [],
+      external: [
+        {
+          receiver_id: input.intentsContractId ?? 'intents.near',
+          actions: [
+            {
+              action: 'function_call',
+              payload: {
+                function_name: 'add_public_key',
+                args,
+                deposit: '1',
+                gas: 30_000_000_000_000,
+                gas_weight: '1',
+              },
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+export function verifyWalletAddPublicKeyMessage(
+  msg: Message,
+  expectedSignerId: string,
+  expectedChainId: string,
+  expectedPublicKey: string,
+  intentsContractId = 'intents.near',
+): boolean {
+  try {
+    if (msg.signer_id !== expectedSignerId) return false;
+    if ((msg.chain_id ?? msg.network_id) !== expectedChainId) return false;
+    const createdMs = Date.parse(msg.created_at);
+    if (Number.isNaN(createdMs)) return false;
+    const timeoutMs = (msg.timeout_secs || 300) * 1000;
+    const now = Date.now();
+    if (createdMs > now + 120_000 || now - createdMs > timeoutMs) return false;
+    if ((msg.request.internal?.length ?? 0) !== 0) return false;
+    const external = msg.request.external ?? [];
+    if (external.length !== 1) return false;
+    const call = external[0];
+    if (call.receiver_id !== intentsContractId) return false;
+    if (call.actions.length !== 1) return false;
+    const action = call.actions[0];
+    if (action.action !== 'function_call') return false;
+    if (action.payload.function_name !== 'add_public_key') return false;
+    if (action.payload.deposit !== '1') return false;
+    if (!action.payload.args) return false;
+    const parsedArgs = JSON.parse(Buffer.from(action.payload.args, 'base64').toString('utf8')) as {
+      public_key?: string;
+    };
+    return parsedArgs.public_key === expectedPublicKey;
+  } catch {
+    return false;
+  }
+}
