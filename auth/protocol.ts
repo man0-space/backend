@@ -95,3 +95,89 @@ export function borshBytes(bytes: Uint8Array): Buffer {
 export function borshString(value: string): Buffer {
   return borshBytes(Buffer.from(value, 'utf8'));
 }
+
+export function compress(key: Uint8Array): Buffer {
+  if (key.length === 33) {
+    if (key[0] !== 0x02 && key[0] !== 0x03) {
+      throw new Error('Invalid P-256 compressed public key.');
+    }
+    return Buffer.from(key);
+  }
+  if (key.length === 65 && key[0] === 0x04) {
+    const prefix = (key[64] & 1) === 1 ? 0x03 : 0x02;
+    return Buffer.concat([Buffer.from([prefix]), Buffer.from(key.subarray(1, 33))]);
+  }
+  if (key.length === 64) {
+    const prefix = (key[63] & 1) === 1 ? 0x03 : 0x02;
+    return Buffer.concat([Buffer.from([prefix]), Buffer.from(key.subarray(0, 32))]);
+  }
+  throw new Error('Invalid P-256 public key length.');
+}
+
+export function uncompress(key: Uint8Array): Buffer {
+  if (key.length === 64) {
+    const tagged = Buffer.concat([Buffer.from([0x04]), Buffer.from(key)]);
+    const pt = p256.Point.fromBytes(tagged);
+    return Buffer.from(pt.toBytes(false).subarray(1, 65));
+  }
+  if (key.length === 65 && key[0] === 0x04) {
+    const pt = p256.Point.fromBytes(key);
+    return Buffer.from(pt.toBytes(false).subarray(1, 65));
+  }
+  if (key.length === 33 && (key[0] === 0x02 || key[0] === 0x03)) {
+    const pt = p256.Point.fromBytes(key);
+    return Buffer.from(pt.toBytes(false).subarray(1, 65));
+  }
+  throw new Error('Invalid P-256 public key for uncompressed conversion.');
+}
+
+export function intentsPublicKey(
+  curve: 'p256' | 'secp256k1' | 'ed25519',
+  key: Uint8Array,
+): string {
+  if (curve === 'p256') {
+    const raw64 = uncompress(key);
+    return `p256:${base58.encode(raw64)}`;
+  }
+  if (curve === 'secp256k1') {
+    let raw64: Uint8Array;
+    if (key.length === 64) {
+      const pt = secp256k1.Point.fromBytes(Buffer.concat([Buffer.from([0x04]), Buffer.from(key)]));
+      raw64 = pt.toBytes(false).subarray(1, 65);
+    } else if (key.length === 65 && key[0] === 0x04) {
+      const pt = secp256k1.Point.fromBytes(key);
+      raw64 = pt.toBytes(false).subarray(1, 65);
+    } else if (key.length === 33 && (key[0] === 0x02 || key[0] === 0x03)) {
+      const pt = secp256k1.Point.fromBytes(key);
+      raw64 = pt.toBytes(false).subarray(1, 65);
+    } else {
+      throw new Error('Invalid secp256k1 public key length.');
+    }
+    return `secp256k1:${base58.encode(raw64)}`;
+  }
+  if (key.length !== 32) {
+    throw new Error('Invalid ed25519 public key length.');
+  }
+  return `ed25519:${base58.encode(key)}`;
+}
+
+export function state(
+  key: Uint8Array,
+  subwalletId = 0,
+  timeoutSecs = 3600,
+  extensions: string[] = [],
+): Buffer {
+  const compressed = compress(key);
+  const sortedExtensions = [...new Set(extensions)].sort();
+  return Buffer.concat([
+    Buffer.from([1]),
+    u32le(subwalletId),
+    compressed,
+    u32le(timeoutSecs),
+    u64le(0n),
+    u32le(0),
+    u32le(0),
+    u32le(sortedExtensions.length),
+    ...sortedExtensions.map(borshString),
+  ]);
+}
