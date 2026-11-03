@@ -288,3 +288,132 @@ export function address(rawStateInit: Uint8Array): string {
   }
   return out;
 }
+
+export interface Operation {
+  op: 'set_signature_mode' | 'add_extension' | 'remove_extension';
+  payload: {
+    enable?: boolean;
+    account_id?: string;
+  };
+}
+
+export interface Action {
+  action: 'function_call' | 'transfer' | 'state_init';
+  payload: {
+    function_name?: string;
+    args?: string;
+    deposit?: string;
+    gas?: number | string;
+    gas_weight?: number | string;
+    amount?: string;
+    code?: { hash?: string; account_id?: string };
+    data?: Record<string, string>;
+  };
+}
+
+export interface Call {
+  receiver_id: string;
+  refund_to?: string;
+  actions: Action[];
+}
+
+export interface Message {
+  pay_for_gas?: boolean;
+  chain_id?: string;
+  network_id?: string;
+  signer_id: string;
+  nonce: number;
+  created_at: string;
+  timeout_secs: number;
+  request: {
+    internal?: Operation[];
+    external?: Call[];
+  };
+}
+
+function parseTimestampNanos(iso: string): bigint {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) throw new Error('Invalid RFC-3339 timestamp.');
+  return BigInt(ms) * 1000000n;
+}
+
+function serializeOp(op: Operation): Buffer {
+  if (op.op === 'set_signature_mode') {
+    return Buffer.from([0, op.payload.enable ? 1 : 0]);
+  }
+  if (op.op === 'add_extension') {
+    return Buffer.concat([Buffer.from([1]), borshString(op.payload.account_id ?? '')]);
+  }
+  if (op.op === 'remove_extension') {
+    return Buffer.concat([Buffer.from([2]), borshString(op.payload.account_id ?? '')]);
+  }
+  throw new Error('Unsupported wallet internal operation.');
+}
+
+function serializeAction(item: Action): Buffer {
+  if (item.action === 'function_call') {
+    const args = item.payload.args ? Buffer.from(item.payload.args, 'base64') : Buffer.alloc(0);
+    const deposit = BigInt(item.payload.deposit ?? '0');
+    const gas = BigInt(item.payload.gas ?? 0);
+    const gasWeight = BigInt(item.payload.gas_weight ?? 1);
+    return Buffer.concat([
+      Buffer.from([2]),
+      borshString(item.payload.function_name ?? ''),
+      borshBytes(args),
+      u128le(deposit),
+      u64le(gas),
+      u64le(gasWeight),
+    ]);
+  }
+  if (item.action === 'transfer') {
+    return Buffer.concat([Buffer.from([3]), u128le(BigInt(item.payload.amount ?? '0'))]);
+  }
+  if (item.action === 'state_init') {
+    const code = item.payload.code ?? {};
+    const codeBytes = code.hash
+      ? Buffer.concat([Buffer.from([0]), Buffer.from(base58.decode(code.hash))])
+      : Buffer.concat([Buffer.from([1]), borshString(code.account_id ?? '')]);
+    const entries = Object.entries(item.payload.data ?? {})
+      .map(([k, v]) => [Buffer.from(k, 'base64'), Buffer.from(v, 'base64')] as const)
+      .sort(([a], [b]) => Buffer.compare(a, b));
+    return Buffer.concat([
+      Buffer.from([11]),
+      Buffer.from([0]),
+      codeBytes,
+      u32le(entries.length),
+      ...entries.flatMap(([k, v]) => [borshBytes(k), borshBytes(v)]),
+      u128le(BigInt(item.payload.deposit ?? '0')),
+    ]);
+  }
+  throw new Error('Unsupported wallet external action.');
+}
+
+function serializePromise(promise: Call): Buffer {
+  const refund = promise.refund_to
+    ? Buffer.concat([Buffer.from([1]), borshString(promise.refund_to)])
+    : Buffer.from([0]);
+  return Buffer.concat([
+    borshString(promise.receiver_id),
+    refund,
+    u32le(promise.actions.length),
+    ...promise.actions.map(serializeAction),
+  ]);
+}
+
+export function commitment(msg: Message): Buffer {
+  const internal = msg.request.internal ?? [];
+  const external = msg.request.external ?? [];
+  const encoded = Buffer.concat([
+    Buffer.from([msg.pay_for_gas ? 1 : 0]),
+    borshString(msg.chain_id ?? msg.network_id ?? ''),
+    borshString(msg.signer_id),
+    u32le(msg.nonce),
+    u64le(parseTimestampNanos(msg.created_at)),
+    u32le(msg.timeout_secs),
+    u32le(internal.length),
+    ...internal.map(serializeOp),
+    u32le(external.length),
+    ...external.map(serializePromise),
+  ]);
+  return createHash('sha3-256').update(DOMAIN_SEPARATOR).update(encoded).digest();
+}
