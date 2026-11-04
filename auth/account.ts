@@ -114,3 +114,100 @@ export function prepareSpending(
     code: targetCode,
   };
 }
+
+let accountColumnsEnsured = false;
+async function ensureAccountColumns(): Promise<void> {
+  if (accountColumnsEnsured) return;
+  await user`
+    ALTER TABLE accounts
+    ADD COLUMN IF NOT EXISTS "spendingAddress" text,
+    ADD COLUMN IF NOT EXISTS "spendingState" text
+  `;
+  await user`
+    CREATE INDEX IF NOT EXISTS accounts_spending_idx ON accounts ("spendingAddress")
+  `;
+  accountColumnsEnsured = true;
+}
+
+export function oneClickBaseUrl(network: 'mainnet' | 'testnet' = config.network): string {
+  if (network === 'testnet') {
+    return (process.env.ONECLICK_TESTNET_URL?.trim() || 'https://www.usetidepool.tech').replace(
+      /\/+$/,
+      '',
+    );
+  }
+  return (
+    process.env.ONECLICK_MAINNET_URL?.trim() || 'https://1click.chaindefuser.com'
+  ).replace(/\/+$/, '');
+}
+
+export interface NearIntentsContracts {
+  verifier: string;
+  intentsUsdcContract: string | null;
+  nearTokenContracts: string[];
+}
+
+export async function discoverNearIntentsContracts(
+  network: 'mainnet' | 'testnet' = config.network,
+): Promise<NearIntentsContracts> {
+  const baseUrl = oneClickBaseUrl(network);
+  return cached(`near:intents:contracts:${network}:${baseUrl}`, 300, async () => {
+    const [healthRes, tokensRes] = await Promise.all([
+      fetch(`${baseUrl}/v0/health`, { signal: AbortSignal.timeout(8_000) }).catch(() => null),
+      fetch(`${baseUrl}/v0/tokens`, { signal: AbortSignal.timeout(10_000) }).catch(() => null),
+    ]);
+    let verifier = '';
+    if (healthRes?.ok) {
+      const health = (await healthRes.json().catch(() => null)) as { verifier?: string } | null;
+      if (typeof health?.verifier === 'string' && health.verifier.trim()) {
+        verifier = health.verifier.trim();
+      }
+    }
+    if (!verifier) {
+      const intentsPkg = require('@defuse-protocol/intents-sdk') as {
+        IntentsSDK?: new (args: { referral: string }) => unknown;
+      };
+      void intentsPkg;
+      verifier =
+        network === 'mainnet'
+          ? process.env.NEAR_INTENTS_VERIFIER_MAINNET?.trim() || 'intents.near'
+          : process.env.NEAR_INTENTS_VERIFIER_TESTNET?.trim() || '';
+    }
+    const nearTokenContracts: string[] = [];
+    let intentsUsdcContract: string | null = null;
+    if (tokensRes?.ok) {
+      const tokens = (await tokensRes.json().catch(() => null)) as Array<{
+        blockchain?: string;
+        symbol?: string;
+        contractAddress?: string;
+        assetId?: string;
+      }> | null;
+      if (Array.isArray(tokens)) {
+        for (const token of tokens) {
+          if (token.blockchain !== 'near') continue;
+          const contract =
+            token.contractAddress?.trim() ||
+            (typeof token.assetId === 'string' && token.assetId.startsWith('nep141:')
+              ? token.assetId.slice('nep141:'.length).trim()
+              : '');
+          if (!contract) continue;
+          if (!nearTokenContracts.includes(contract)) nearTokenContracts.push(contract);
+          if (!intentsUsdcContract && token.symbol?.toUpperCase() === 'USDC') {
+            intentsUsdcContract = contract;
+          }
+          if (!verifier && contract.includes('.')) {
+            const dot = contract.indexOf('.');
+            const domain = contract.slice(dot + 1);
+            if (domain.endsWith('.testnet')) {
+              verifier = `verifier.${domain}`;
+            }
+          }
+        }
+      }
+    }
+    if (!verifier) {
+      throw new Error(`Unable to discover NEAR Intents verifier contract for ${network}.`);
+    }
+    return { verifier, intentsUsdcContract, nearTokenContracts };
+  });
+}
