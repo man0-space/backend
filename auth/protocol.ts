@@ -761,3 +761,82 @@ export function verifyWalletAddPublicKeyMessage(
     return false;
   }
 }
+
+export function buildWalletContractCallMessage(input: {
+  signerId: string;
+  networkId: string;
+  receiverId: string;
+  methodName: string;
+  args: Record<string, unknown>;
+  deposit?: string;
+  gas?: number;
+  nonce?: number;
+  createdAt?: string;
+  timeoutSecs?: number;
+}): Message {
+  const encodedArgs = Buffer.from(JSON.stringify(input.args ?? {}), 'utf8').toString('base64');
+  return {
+    pay_for_gas: false,
+    chain_id: input.networkId,
+    signer_id: input.signerId,
+    nonce: input.nonce ?? randomInt(1, 0x100000000),
+    created_at: input.createdAt ?? new Date(Date.now() - 60_000).toISOString(),
+    timeout_secs: input.timeoutSecs ?? 300,
+    request: {
+      internal: [],
+      external: [
+        {
+          receiver_id: input.receiverId,
+          actions: [
+            {
+              action: 'function_call',
+              payload: {
+                function_name: input.methodName,
+                args: encodedArgs,
+                deposit: input.deposit ?? '0',
+                gas: input.gas ?? 100_000_000_000_000,
+                gas_weight: '1',
+              },
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+export function verifyWalletContractCallMessage(
+  msg: Message,
+  expected: {
+    signerId: string;
+    chainId: string;
+    receiverId: string;
+    methodName?: string;
+    maxDepositYocto?: bigint;
+  },
+): boolean {
+  try {
+    if (msg.signer_id !== expected.signerId) return false;
+    if ((msg.chain_id ?? msg.network_id) !== expected.chainId) return false;
+    const createdMs = Date.parse(msg.created_at);
+    if (Number.isNaN(createdMs)) return false;
+    const timeoutMs = (msg.timeout_secs || 300) * 1000;
+    const now = Date.now();
+    if (createdMs > now + 120_000 || now - createdMs > timeoutMs) return false;
+    if ((msg.request.internal?.length ?? 0) !== 0) return false;
+    const external = msg.request.external ?? [];
+    if (external.length !== 1) return false;
+    const call = external[0];
+    if (call.receiver_id !== expected.receiverId) return false;
+    if (call.actions.length !== 1) return false;
+    const action = call.actions[0];
+    if (action.action !== 'function_call') return false;
+    if (expected.methodName && action.payload.function_name !== expected.methodName) return false;
+    const deposit = BigInt(action.payload.deposit ?? '0');
+    const maxDeposit = expected.maxDepositYocto ?? 1n;
+    if (deposit < 0n || deposit > maxDeposit) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
