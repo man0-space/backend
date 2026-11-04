@@ -840,3 +840,221 @@ export function verifyWalletContractCallMessage(
     return false;
   }
 }
+
+
+export interface SignedAddPublicKeyIntent {
+  standard: 'webauthn' | 'raw_ed25519' | 'erc191';
+  payload: string;
+  public_key?: string;
+  signature: string;
+  authenticator_data?: string;
+  client_data_json?: string;
+}
+
+export function signIntentsAddPublicKeyWebAuthn(input: {
+  signerId: string;
+  privateKey32: Uint8Array;
+  publicKeyToAdd: string;
+  nonce?: string;
+  deadline?: string;
+  verifyingContract?: string;
+  originUrl?: string;
+  rpId?: string;
+}): SignedAddPublicKeyIntent {
+  const pubCompressed = p256.getPublicKey(input.privateKey32, true);
+  const signerIntentsKey = intentsPublicKey('p256', pubCompressed);
+  const payload = JSON.stringify({
+    signer_id: input.signerId,
+    verifying_contract: input.verifyingContract ?? 'intents.near',
+    deadline: input.deadline ?? new Date(Date.now() + 5 * 60_000).toISOString(),
+    nonce: input.nonce ?? Buffer.from(createHash('sha256').update(`${Date.now()}:${Math.random()}`).digest()).toString('base64'),
+    intents: [
+      {
+        intent: 'add_public_key',
+        public_key: input.publicKeyToAdd,
+      },
+    ],
+  });
+  const challenge32 = createHash('sha256').update(payload, 'utf8').digest();
+  const proof = signWebAuthnP256(
+    input.privateKey32,
+    challenge32,
+    input.originUrl ?? 'https://man0.space',
+    input.rpId ?? 'man0.space',
+  );
+  return {
+    standard: 'webauthn',
+    payload,
+    public_key: signerIntentsKey,
+    signature: proof.signature,
+    authenticator_data: proof.authenticator_data,
+    client_data_json: proof.client_data_json,
+  };
+}
+
+export function verifyIntentsAddPublicKeyPayload(
+  signedIntent: SignedAddPublicKeyIntent,
+  expectedSignerId: string,
+  expectedPublicKeyToAdd: string,
+  verifyingContract = 'intents.near',
+): { signerPublicKey: string; normalizedIntent: SignedAddPublicKeyIntent } {
+  let parsed: {
+    signer_id?: string;
+    verifying_contract?: string;
+    deadline?: string;
+    nonce?: string;
+    intents?: Array<{ intent?: string; public_key?: string }>;
+  };
+  try {
+    parsed = JSON.parse(signedIntent.payload);
+  } catch {
+    throw Object.assign(new Error('Invalid AddPublicKey intent payload JSON.'), { statusCode: 400 });
+  }
+  if (parsed.signer_id !== expectedSignerId) {
+    throw Object.assign(new Error('Intent signer_id does not match the authenticated account.'), {
+      statusCode: 401,
+    });
+  }
+  if (parsed.verifying_contract !== verifyingContract) {
+    throw Object.assign(new Error('Intent verifying_contract must be intents.near.'), {
+      statusCode: 400,
+    });
+  }
+  if (!parsed.deadline || Number.isNaN(Date.parse(parsed.deadline)) || Date.parse(parsed.deadline) <= Date.now()) {
+    throw Object.assign(new Error('AddPublicKey intent deadline has expired.'), {
+      statusCode: 401,
+    });
+  }
+  if (!parsed.nonce || typeof parsed.nonce !== 'string') {
+    throw Object.assign(new Error('AddPublicKey intent requires a nonce.'), { statusCode: 400 });
+  }
+  if (
+    !Array.isArray(parsed.intents) ||
+    parsed.intents.length !== 1 ||
+    parsed.intents[0]?.intent !== 'add_public_key' ||
+    parsed.intents[0]?.public_key !== expectedPublicKeyToAdd
+  ) {
+    throw Object.assign(new Error('Intent payload does not authorize adding the target public key.'), {
+      statusCode: 401,
+    });
+  }
+
+  if (signedIntent.standard === 'webauthn') {
+    if (
+      !signedIntent.public_key?.startsWith('p256:') ||
+      !signedIntent.authenticator_data ||
+      !signedIntent.client_data_json
+    ) {
+      throw Object.assign(new Error('Malformed WebAuthn intent payload.'), { statusCode: 400 });
+    }
+    const rawKey = base58.decode(signedIntent.public_key.slice(5));
+    if (rawKey.length !== 64) {
+      throw Object.assign(new Error('WebAuthn intent public_key must be 64-byte P-256 coordinates.'), {
+        statusCode: 400,
+      });
+    }
+    const challenge32 = createHash('sha256').update(signedIntent.payload, 'utf8').digest();
+    const ok = verifyWebAuthnP256(rawKey, challenge32, {
+      authenticator_data: signedIntent.authenticator_data,
+      client_data_json: signedIntent.client_data_json,
+      signature: signedIntent.signature,
+    });
+    if (!ok) {
+      throw Object.assign(new Error('Invalid WebAuthn signature on AddPublicKey intent.'), {
+        statusCode: 401,
+      });
+    }
+    const rawSig = signedIntent.signature.startsWith('p256:')
+      ? base58.decode(signedIntent.signature.slice(5))
+      : Buffer.from(signedIntent.signature, 'base64url');
+    const normalizedSig = normalizeP256Signature(rawSig);
+    const signerPublicKey = intentsPublicKey('p256', rawKey);
+    return {
+      signerPublicKey,
+      normalizedIntent: {
+        ...signedIntent,
+        public_key: signerPublicKey,
+        signature: `p256:${base58.encode(normalizedSig)}`,
+      },
+    };
+  }
+
+  if (signedIntent.standard === 'raw_ed25519') {
+    if (!signedIntent.public_key?.startsWith('ed25519:')) {
+      throw Object.assign(new Error('Missing ed25519 public_key on AddPublicKey intent.'), {
+        statusCode: 400,
+      });
+    }
+    const rawKey = base58.decode(signedIntent.public_key.slice(8));
+    if (rawKey.length !== 32) {
+      throw Object.assign(new Error('Invalid ed25519 public_key on AddPublicKey intent.'), {
+        statusCode: 400,
+      });
+    }
+    const sigBytes = decodeFlexibleBytes(signedIntent.signature);
+    if (sigBytes.length !== 64) {
+      throw Object.assign(new Error('Invalid ed25519 signature on AddPublicKey intent.'), {
+        statusCode: 401,
+      });
+    }
+    const ok = ed25519.verify(sigBytes, Buffer.from(signedIntent.payload, 'utf8'), rawKey);
+    if (!ok) {
+      throw Object.assign(new Error('Invalid ed25519 signature on AddPublicKey intent.'), {
+        statusCode: 401,
+      });
+    }
+    const signerPublicKey = intentsPublicKey('ed25519', rawKey);
+    return {
+      signerPublicKey,
+      normalizedIntent: {
+        ...signedIntent,
+        public_key: signerPublicKey,
+        signature: `ed25519:${base58.encode(sigBytes)}`,
+      },
+    };
+  }
+
+  if (signedIntent.standard === 'erc191') {
+    const sigBytes = decodeFlexibleBytes(signedIntent.signature);
+    if (sigBytes.length !== 65) {
+      throw Object.assign(new Error('Invalid ERC-191 signature on AddPublicKey intent.'), {
+        statusCode: 401,
+      });
+    }
+    let recId = sigBytes[64];
+    if (recId >= 27) recId -= 27;
+    if (recId !== 0 && recId !== 1) {
+      throw Object.assign(new Error('Invalid ERC-191 signature recovery id.'), {
+        statusCode: 401,
+      });
+    }
+    const msgBytes = Buffer.from(signedIntent.payload, 'utf8');
+    const prefix = Buffer.from(`\x19Ethereum Signed Message:\n${msgBytes.length}`, 'utf8');
+    const digest = keccak256(Buffer.concat([prefix, msgBytes]));
+    let raw64: Buffer;
+    try {
+      const sigObj = secp256k1.Signature.fromBytes(sigBytes.subarray(0, 64)).addRecoveryBit(recId);
+      if (sigObj.hasHighS()) throw new Error('High-S signature');
+      const point = sigObj.recoverPublicKey(digest);
+      raw64 = Buffer.from(point.toBytes(false).subarray(1, 65));
+    } catch {
+      throw Object.assign(new Error('Invalid ERC-191 signature on AddPublicKey intent.'), {
+        statusCode: 401,
+      });
+    }
+    const canonicalSig = Buffer.alloc(65);
+    sigBytes.copy(canonicalSig, 0, 0, 64);
+    canonicalSig[64] = recId;
+    const signerPublicKey = intentsPublicKey('secp256k1', raw64);
+    return {
+      signerPublicKey,
+      normalizedIntent: {
+        standard: 'erc191',
+        payload: signedIntent.payload,
+        signature: `secp256k1:${base58.encode(canonicalSig)}`,
+      },
+    };
+  }
+
+  throw Object.assign(new Error('Unsupported AddPublicKey intent standard.'), { statusCode: 400 });
+}
