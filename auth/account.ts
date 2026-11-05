@@ -900,3 +900,103 @@ export async function provision(
     status: (account?.status as string) ?? 'ready',
   };
 }
+
+function normalizeExternalAddress(network: 'evm' | 'svm', rawAddress: string): string {
+  const trimmed = rawAddress.trim();
+  if (network === 'evm') {
+    const lower = trimmed.toLowerCase();
+    if (!/^0x[0-9a-f]{40}$/.test(lower)) {
+      throw Object.assign(new Error('Invalid EVM wallet address.'), { statusCode: 400 });
+    }
+    return lower;
+  }
+  let decoded: Uint8Array;
+  try {
+    decoded = base58.decode(trimmed);
+  } catch {
+    throw Object.assign(new Error('Invalid Solana wallet address.'), { statusCode: 400 });
+  }
+  if (decoded.length !== 32) {
+    throw Object.assign(new Error('Invalid Solana wallet address length.'), { statusCode: 400 });
+  }
+  return trimmed;
+}
+
+export interface LinkedWalletRecord {
+  id: string;
+  userAddress: string;
+  network: 'evm' | 'svm';
+  address: string;
+  publicKey: string;
+  status: 'pending' | 'active' | 'failed';
+  transaction: string | null;
+}
+
+export async function listLinkedWallets(userAddress: string): Promise<LinkedWalletRecord[]> {
+  const rows = await user`
+    SELECT id, "userAddress", network, address, "publicKey", status, transaction
+    FROM links
+    WHERE "userAddress" = ${userAddress}
+    ORDER BY created ASC
+  `;
+  return rows.map(row => ({
+    id: row.id as string,
+    userAddress: row.userAddress as string,
+    network: row.network as 'evm' | 'svm',
+    address: row.address as string,
+    publicKey: row.publicKey as string,
+    status: row.status as 'pending' | 'active' | 'failed',
+    transaction: (row.transaction as string | null) ?? null,
+  }));
+}
+
+export async function attachExternalWallet(
+  userAddress: string,
+  input: {
+    network: 'evm' | 'svm';
+    address: string;
+  },
+): Promise<LinkedWalletRecord> {
+  const normalizedAddress = normalizeExternalAddress(input.network, input.address);
+
+  const [existingLink] = await user`
+    SELECT id, "userAddress" FROM links
+    WHERE network = ${input.network} AND address = ${normalizedAddress}
+  `;
+  if (existingLink && existingLink.userAddress !== userAddress) {
+    throw Object.assign(
+      new Error('This external wallet is already linked to another account.'),
+      { statusCode: 409 },
+    );
+  }
+
+  const linkId = (existingLink?.id as string | undefined) ?? randomBytes(16).toString('hex');
+  const serializedAuth = JSON.stringify({ mode: 'smart' });
+  const [saved] = await user`
+    INSERT INTO links(id, "userAddress", network, address, "publicKey", status, "authorization", modified)
+    VALUES (
+      ${linkId},
+      ${userAddress},
+      ${input.network},
+      ${normalizedAddress},
+      ${normalizedAddress},
+      'active',
+      ${serializedAuth}::jsonb,
+      now()
+    )
+    ON CONFLICT (network, address) DO UPDATE
+    SET status = 'active',
+        modified = now()
+    RETURNING id, "userAddress", network, address, "publicKey", status, transaction
+  `;
+
+  return {
+    id: saved.id as string,
+    userAddress: saved.userAddress as string,
+    network: saved.network as 'evm' | 'svm',
+    address: saved.address as string,
+    publicKey: saved.publicKey as string,
+    status: 'active',
+    transaction: (saved.transaction as string | null) ?? null,
+  };
+}
