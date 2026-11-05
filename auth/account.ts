@@ -1137,3 +1137,140 @@ export async function resolveMainUserAddress(addressOrSpending: string): Promise
 
   return trimmed;
 }
+
+export interface SpendingRecord {
+  userAddress: string;
+  accountNetwork: 'mainnet' | 'testnet';
+  rpcUrl: string;
+  ownerCompressedKey: Buffer;
+  rawMainInit: Buffer;
+  spendingAddress: string;
+  rawSpendingInit: Buffer;
+  activeMainAddress: string;
+  rawActiveMainInit: Buffer;
+  activeSpendingAddress: string;
+  rawActiveSpendingInit: Buffer;
+  seedId: string;
+}
+
+export async function ensureSpendingRecord(userAddress: string): Promise<SpendingRecord> {
+  await ensureAccountColumns();
+  const [account] = await user`
+    SELECT "userAddress", network, state, code, "spendingAddress", "spendingState"
+    FROM accounts
+    WHERE "userAddress" = ${userAddress}
+  `;
+  if (!account) {
+    throw Object.assign(new Error(`Universal account ${userAddress} not found.`), {
+      statusCode: 404,
+    });
+  }
+  const [identity] = await user`
+    SELECT id FROM identities WHERE "userAddress" = ${userAddress} LIMIT 1
+  `;
+  if (!identity?.id) {
+    throw Object.assign(new Error(`Smart account identity not found for ${userAddress}.`), {
+      statusCode: 401,
+    });
+  }
+  const seedId = identity.id as string;
+  const accountNetwork = (account.network === 'testnet' ? 'testnet' : 'mainnet') as
+    | 'mainnet'
+    | 'testnet';
+  const rpcUrl = rpcFor(accountNetwork);
+  const rawMainInit = Buffer.from(account.state as string, 'base64');
+  const ownerCompressedKey = extractStateKey(rawMainInit);
+  const computed = prepareSpending(ownerCompressedKey, accountNetwork);
+
+  if (!account.spendingAddress || !account.spendingState) {
+    await user`
+      UPDATE accounts
+      SET "spendingAddress" = COALESCE("spendingAddress", ${computed.account}),
+          "spendingState" = COALESCE("spendingState", ${computed.state})
+      WHERE "userAddress" = ${userAddress}
+    `;
+  }
+
+  const persistedSpendingAddress = (account.spendingAddress as string | null) ?? computed.account;
+  const persistedSpendingState = (account.spendingState as string | null) ?? computed.state;
+
+  const activeMainPrepared =
+    accountNetwork === config.network
+      ? { account: userAddress, state: account.state as string }
+      : await prepare(ownerCompressedKey, config.network);
+  const activeSpendingPrepared =
+    accountNetwork === config.network
+      ? { account: persistedSpendingAddress, state: persistedSpendingState }
+      : prepareSpending(ownerCompressedKey, config.network);
+
+  derivedAddressToCanonical.set(activeMainPrepared.account, userAddress);
+  derivedAddressToCanonical.set(activeSpendingPrepared.account, userAddress);
+
+  return {
+    userAddress,
+    accountNetwork,
+    rpcUrl,
+    ownerCompressedKey,
+    rawMainInit,
+    spendingAddress: persistedSpendingAddress,
+    rawSpendingInit: Buffer.from(persistedSpendingState, 'base64'),
+    activeMainAddress: activeMainPrepared.account,
+    rawActiveMainInit: Buffer.from(activeMainPrepared.state, 'base64'),
+    activeSpendingAddress: activeSpendingPrepared.account,
+    rawActiveSpendingInit: Buffer.from(activeSpendingPrepared.state, 'base64'),
+    seedId,
+  };
+}
+
+interface ActiveAccountBalances {
+  mainWei: bigint;
+  spendingWei: bigint;
+  settlementUsdc: string;
+}
+
+async function readActiveAccountBalances(rec: SpendingRecord): Promise<ActiveAccountBalances> {
+  const activeNet = config.network;
+  const activeRpc = rpcFor(activeNet);
+  const settlementUsdc = usdcFor(activeNet);
+
+  const [mainStr, spendingStr] = await Promise.all([
+    readFtBalanceWei(activeRpc, settlementUsdc, rec.activeMainAddress),
+    readFtBalanceWei(activeRpc, settlementUsdc, rec.activeSpendingAddress),
+  ]);
+
+  return {
+    mainWei: BigInt(mainStr),
+    spendingWei: BigInt(spendingStr),
+    settlementUsdc,
+  };
+}
+
+export function nearBalanceCacheKey(userAddress: string): string {
+  return `near:bal:${config.network}:${userAddress.trim().toLowerCase()}`;
+}
+
+export async function invalidateNearBalanceCache(userAddress: string): Promise<void> {
+  await cacheDel(nearBalanceCacheKey(userAddress));
+}
+
+export async function getNearBalances(userAddress: string): Promise<{
+  userAddress: string;
+  depositAddress: string;
+  spendingAddress: string;
+  mainBalanceWei: string;
+  spendingBalanceWei: string;
+  network: 'mainnet' | 'testnet';
+}> {
+  return cached(nearBalanceCacheKey(userAddress), 4, 2_500, async () => {
+    const rec = await ensureSpendingRecord(userAddress);
+    const balances = await readActiveAccountBalances(rec);
+    return {
+      userAddress: rec.userAddress,
+      depositAddress: rec.activeMainAddress,
+      spendingAddress: rec.activeSpendingAddress,
+      mainBalanceWei: balances.mainWei.toString(),
+      spendingBalanceWei: balances.spendingWei.toString(),
+      network: config.network,
+    };
+  });
+}
