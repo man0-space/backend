@@ -333,3 +333,132 @@ export async function listIntentsPublicKeys(
     throw err;
   }
 }
+
+function getDeployerCredentials(network: 'mainnet' | 'testnet'): {
+  signerId: string;
+  secretKey32: Buffer;
+  pubKey32: Buffer;
+  pubKeyB58: string;
+} {
+  const rawKey =
+    network === 'testnet'
+      ? required('NEAR_DEPLOYER_TESTNET_PRIVATE_KEY')
+      : required('NEAR_DEPLOYER_PRIVATE_KEY');
+  const signerId = treasuryFor(network);
+  const stripped = rawKey.startsWith('ed25519:') ? rawKey.slice(8) : rawKey;
+  const decoded = Buffer.from(base58.decode(stripped));
+  const secretKey32 = decoded.subarray(0, 32);
+  const pubKey32 =
+    decoded.length >= 64
+      ? decoded.subarray(32, 64)
+      : Buffer.from(ed25519.getPublicKey(secretKey32));
+  return {
+    signerId,
+    secretKey32,
+    pubKey32,
+    pubKeyB58: base58.encode(pubKey32),
+  };
+}
+
+const RELAYER_POOL_SIZE = 16;
+
+interface RelayerKeySlot {
+  slot: number;
+  signerId: string;
+  secretKey32: Buffer;
+  pubKey32: Buffer;
+  pubKeyB58: string;
+  queue: Promise<unknown>;
+  inFlight: number;
+  lastNonce: bigint;
+  registered: boolean;
+}
+
+const relayerPools: Record<'mainnet' | 'testnet', RelayerKeySlot[] | null> = {
+  mainnet: null,
+  testnet: null,
+};
+let relayerRoundRobin: Record<'mainnet' | 'testnet', number> = {
+  mainnet: 0,
+  testnet: 0,
+};
+
+function getRelayerPool(network: 'mainnet' | 'testnet'): RelayerKeySlot[] {
+  const existing = relayerPools[network];
+  const master = getDeployerCredentials(network);
+  if (existing && existing[0]?.signerId === master.signerId && existing[0]?.pubKeyB58 === master.pubKeyB58) {
+    return existing;
+  }
+  const slots: RelayerKeySlot[] = [];
+  for (let i = 0; i < RELAYER_POOL_SIZE; i++) {
+    if (i === 0) {
+      slots.push({
+        slot: 0,
+        signerId: master.signerId,
+        secretKey32: master.secretKey32,
+        pubKey32: master.pubKey32,
+        pubKeyB58: master.pubKeyB58,
+        queue: Promise.resolve(),
+        inFlight: 0,
+        lastNonce: 0n,
+        registered: true,
+      });
+    } else {
+      const derivedSecret = Buffer.from(
+        hkdfSync(
+          'sha256',
+          master.secretKey32,
+          Buffer.from(`man0-relayer:${network}:${master.signerId}`, 'utf8'),
+          Buffer.from(`slot:${i}`, 'utf8'),
+          32,
+        ),
+      );
+      const derivedPub = Buffer.from(ed25519.getPublicKey(derivedSecret));
+      slots.push({
+        slot: i,
+        signerId: master.signerId,
+        secretKey32: derivedSecret,
+        pubKey32: derivedPub,
+        pubKeyB58: base58.encode(derivedPub),
+        queue: Promise.resolve(),
+        inFlight: 0,
+        lastNonce: 0n,
+        registered: false,
+      });
+    }
+  }
+  relayerPools[network] = slots;
+  return slots;
+}
+
+function enqueueSlotTx<T>(slotObj: RelayerKeySlot, fn: () => Promise<T>): Promise<T> {
+  slotObj.inFlight += 1;
+  const next = slotObj.queue.then(fn, fn);
+  slotObj.queue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next.finally(() => {
+    slotObj.inFlight = Math.max(0, slotObj.inFlight - 1);
+  });
+}
+
+function selectRelayerSlot(pool: RelayerKeySlot[], network: 'mainnet' | 'testnet'): RelayerKeySlot {
+  const primary = pool[0]!;
+  if (primary.inFlight === 0) {
+    return primary;
+  }
+  let best = primary;
+  const start = relayerRoundRobin[network] % pool.length;
+  relayerRoundRobin[network] = (start + 1) % pool.length;
+  for (let offset = 0; offset < pool.length; offset++) {
+    const candidate = pool[(start + offset) % pool.length]!;
+    if (candidate.inFlight === 0) {
+      return candidate;
+    }
+    if (candidate.inFlight < best.inFlight) {
+      best = candidate;
+    }
+  }
+  return best;
+}
