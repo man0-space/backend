@@ -1000,3 +1000,93 @@ export async function attachExternalWallet(
     transaction: (saved.transaction as string | null) ?? null,
   };
 }
+
+export async function assertAllowedNearContract(
+  contractId: string,
+): Promise<'mainnet' | 'testnet'> {
+  const trimmed = contractId.trim();
+  const mainnetUsdc = usdcFor('mainnet');
+  const testnetUsdc = usdcFor('testnet');
+  const activeIntents = await discoverNearIntentsContracts(config.network).catch(() => null);
+  const allowed = new Set<string>([
+    config.contracts.factory,
+    config.contracts.workflow,
+    config.contracts.reputation,
+    config.contracts.validation,
+    'intents.near',
+    mainnetUsdc,
+    testnetUsdc,
+    ...(activeIntents ? [activeIntents.verifier, ...activeIntents.nearTokenContracts] : []),
+  ]);
+  if (!allowed.has(trimmed)) {
+    throw Object.assign(new Error(`Contract ${trimmed} is not a configured man0 contract.`), {
+      statusCode: 400,
+    });
+  }
+  if (trimmed === testnetUsdc) return 'testnet';
+  if (
+    config.network === 'testnet' &&
+    activeIntents &&
+    (trimmed === activeIntents.verifier || activeIntents.nearTokenContracts.includes(trimmed))
+  ) {
+    return 'testnet';
+  }
+  return trimmed.endsWith('.testnet') ? 'testnet' : 'mainnet';
+}
+
+export async function ensureFtStorageDeposit(
+  rpcUrl: string,
+  ftContract: string,
+  accountId: string,
+  network: 'mainnet' | 'testnet',
+): Promise<void> {
+  const existing = await callViewFunction<{ total: string; available: string } | null>(
+    rpcUrl,
+    ftContract,
+    'storage_balance_of',
+    { account_id: accountId },
+  ).catch(() => null);
+  if (existing && existing.total) return;
+
+  const args = Buffer.from(
+    JSON.stringify({ account_id: accountId, registration_only: true }),
+    'utf8',
+  );
+  await broadcastActionsWithOutcome(
+    rpcUrl,
+    ftContract,
+    [functionCallAction('storage_deposit', args, 30_000_000_000_000n, 1_250_000_000_000_000_000_000n)],
+    network,
+  );
+}
+
+export async function ensureUsdcStorageDeposit(
+  rpcUrl: string,
+  accountId: string,
+  network: 'mainnet' | 'testnet',
+): Promise<void> {
+  return ensureFtStorageDeposit(rpcUrl, usdcFor(network), accountId, network);
+}
+
+export async function readFtBalanceWei(
+  rpcUrl: string,
+  ftContract: string,
+  accountId: string,
+): Promise<string> {
+  try {
+    const raw = await callViewFunction<string>(rpcUrl, ftContract, 'ft_balance_of', {
+      account_id: accountId,
+    });
+    return typeof raw === 'string' && /^\d+$/.test(raw) ? raw : '0';
+  } catch {
+    return '0';
+  }
+}
+
+export async function readUsdcBalanceWei(
+  rpcUrl: string,
+  accountId: string,
+  network: 'mainnet' | 'testnet',
+): Promise<string> {
+  return readFtBalanceWei(rpcUrl, usdcFor(network), accountId);
+}
