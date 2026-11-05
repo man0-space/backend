@@ -1376,3 +1376,111 @@ export async function ensureDepositReady(userAddress: string): Promise<{
     status,
   };
 }
+
+export async function approveSpendingLimit(
+  userAddress: string,
+  input: {
+    amountWei: string;
+  },
+): Promise<{
+  txHash: string;
+  userAddress: string;
+  depositAddress: string;
+  spendingAddress: string;
+  mainBalanceWei: string;
+  spendingBalanceWei: string;
+  network: 'mainnet' | 'testnet';
+}> {
+  const delta = BigInt(input.amountWei);
+  if (delta <= 0n) {
+    throw Object.assign(new Error('Enter an amount greater than $0.00.'), { statusCode: 400 });
+  }
+  const rec = await ensureSpendingRecord(userAddress);
+  const activeNet = config.network;
+  const activeRpc = rpcFor(activeNet);
+  const balances = await readActiveAccountBalances(rec);
+  if (balances.mainWei < delta) {
+    const availUsd = (Number(balances.mainWei) / 1_000_000).toFixed(2);
+    const reqUsd = (Number(delta) / 1_000_000).toFixed(2);
+    throw Object.assign(
+      new Error(
+        `Insufficient available balance ($${availUsd} available, $${reqUsd} requested).`,
+      ),
+      { statusCode: 400 },
+    );
+  }
+
+  if (!derive(rec.seedId).equals(rec.ownerCompressedKey)) {
+    throw Object.assign(new Error('Account authorization mismatch.'), { statusCode: 401 });
+  }
+
+  const nearMain = rec.activeMainAddress;
+  const nearMainInit = rec.rawActiveMainInit;
+  const nearSpending = rec.activeSpendingAddress;
+  const nearSpendingInit = rec.rawActiveSpendingInit;
+
+  const existingSpending = await viewAccount(activeRpc, nearSpending);
+  if (!existingSpending) {
+    await broadcastActionsWithOutcome(
+      activeRpc,
+      nearSpending,
+      [
+        transferAction(15_000_000_000_000_000_000_000n),
+        universalStateInitAction(nearSpendingInit, 0n),
+      ],
+      activeNet,
+    );
+  } else if (BigInt(existingSpending.amount) < 5_000_000_000_000_000_000_000n) {
+    await broadcastActionsWithOutcome(
+      activeRpc,
+      nearSpending,
+      [transferAction(12_000_000_000_000_000_000n)],
+      activeNet,
+    );
+  }
+
+  await ensureFtStorageDeposit(activeRpc, balances.settlementUsdc, nearSpending, activeNet);
+
+  const privKey = derivePrivate(rec.seedId);
+  const msg = buildWalletContractCallMessage({
+    signerId: nearMain,
+    networkId: activeNet,
+    receiverId: balances.settlementUsdc,
+    methodName: 'ft_transfer',
+    args: {
+      receiver_id: nearSpending,
+      amount: delta.toString(),
+    },
+    deposit: '1',
+    gas: 50_000_000_000_000,
+    nonce: randomInt(1, 0x100000000),
+  });
+  const proof = signWebAuthnP256(privKey, commitment(msg));
+
+  const existingMain = await viewAccount(activeRpc, nearMain);
+  const mainActions: Uint8Array[] = [];
+  if (!existingMain) {
+    mainActions.push(transferAction(12_000_000_000_000_000_000_000n));
+    mainActions.push(universalStateInitAction(nearMainInit, 0n));
+  } else if (BigInt(existingMain.amount) < 5_000_000_000_000_000_000_000n) {
+    mainActions.push(transferAction(12_000_000_000_000_000_000_000n));
+  }
+  const execArgs = Buffer.from(
+    JSON.stringify({ msg, proof: JSON.stringify(proof) }),
+    'utf8',
+  );
+  mainActions.push(functionCallAction('w_execute_signed', execArgs, 200_000_000_000_000n, 1n));
+  const outcome = await broadcastActionsWithOutcome(activeRpc, nearMain, mainActions, activeNet);
+
+  await invalidateNearBalanceCache(userAddress);
+  const updated = await readActiveAccountBalances(rec);
+  return {
+    txHash: outcome.txHash,
+    userAddress: rec.userAddress,
+    depositAddress: nearMain,
+    spendingAddress: nearSpending,
+    mainBalanceWei: updated.mainWei.toString(),
+    spendingBalanceWei: updated.spendingWei.toString(),
+    network: activeNet,
+  };
+}
