@@ -663,3 +663,240 @@ export async function broadcastActions(
   const outcome = await broadcastActionsWithOutcome(rpcUrl, receiverId, actions);
   return outcome.txHash;
 }
+
+export async function deployWallet(
+  userAddress: string,
+): Promise<{ userAddress: string; status: string; transaction: string | null }> {
+  const [account] = await user`
+    SELECT "userAddress", network, state, code, status, transaction
+    FROM accounts
+    WHERE "userAddress" = ${userAddress}
+  `;
+  if (!account) {
+    throw Object.assign(new Error(`Account ${userAddress} not found.`), { statusCode: 404 });
+  }
+
+  const network = (account.network === 'testnet' ? 'testnet' : 'mainnet') as
+    | 'mainnet'
+    | 'testnet';
+  const rpcUrl = rpcFor(network);
+  const rawStateInit = Buffer.from(account.state as string, 'base64');
+  const expectedKey = extractStateKey(rawStateInit);
+  const expectedWalletPublicKey = `p256:${base58.encode(expectedKey)}`;
+
+  let txHash: string | null = (account.transaction as string | null) ?? null;
+
+  try {
+    let existing = await viewAccount(rpcUrl, userAddress);
+
+    if (!existing) {
+      await user`
+        UPDATE accounts
+        SET status = 'pending'
+        WHERE "userAddress" = ${userAddress} AND status != 'active'
+      `;
+
+      const actions: Uint8Array[] = [];
+      const [identity] = await user`
+        SELECT id FROM identities WHERE "userAddress" = ${userAddress} LIMIT 1
+      `;
+      const intentsMeta =
+        network === 'testnet'
+          ? await discoverNearIntentsContracts('testnet').catch(() => null)
+          : { verifier: 'intents.near' };
+
+      if (identity?.id && intentsMeta?.verifier) {
+        const derivedKey = derive(identity.id as string);
+        if (derivedKey.equals(expectedKey)) {
+          actions.push(transferAction(5_000_000_000_000_000_000_000n));
+          actions.push(universalStateInitAction(rawStateInit, 0n));
+          const privKey = derivePrivate(identity.id as string);
+          const ownerIntentsKey = intentsPublicKey('p256', expectedKey);
+          const msg = buildWalletAddPublicKeyMessage({
+            signerId: userAddress,
+            networkId: network,
+            publicKey: ownerIntentsKey,
+            nonce: randomInt(1, 0x100000000),
+            intentsContractId: intentsMeta.verifier,
+          });
+          const proof = signWebAuthnP256(privKey, commitment(msg));
+          const execArgs = Buffer.from(
+            JSON.stringify({ msg, proof: JSON.stringify(proof) }),
+            'utf8',
+          );
+          actions.push(
+            functionCallAction('w_execute_signed', execArgs, 100_000_000_000_000n, 1n),
+          );
+        } else {
+          actions.push(universalStateInitAction(rawStateInit, 0n));
+        }
+      } else {
+        actions.push(universalStateInitAction(rawStateInit, 0n));
+      }
+
+      txHash = await broadcastActions(rpcUrl, userAddress, actions);
+      await user`
+        UPDATE accounts
+        SET transaction = ${txHash}
+        WHERE "userAddress" = ${userAddress}
+      `;
+      existing = await viewAccount(rpcUrl, userAddress);
+    }
+
+    if (!existing) {
+      throw new Error(`Account ${userAddress} is still not visible on-chain after initialization.`);
+    }
+
+    const expectedCode = account.code as string;
+    const matchesContract =
+      existing.global_contract_account_id === expectedCode ||
+      existing.global_contract_hash === expectedCode;
+    if (!matchesContract) {
+      throw new Error(
+        `Account ${userAddress} global contract mismatch on-chain (expected ${expectedCode}).`,
+      );
+    }
+
+    const onChainKey = await callViewFunction<string>(rpcUrl, userAddress, 'w_public_key', {});
+    if (onChainKey !== expectedWalletPublicKey) {
+      throw new Error(
+        `Account ${userAddress} w_public_key mismatch (expected ${expectedWalletPublicKey}, got ${String(onChainKey)}).`,
+      );
+    }
+
+    await user`
+      UPDATE accounts
+      SET status = 'active',
+          transaction = COALESCE(${txHash}, transaction)
+      WHERE "userAddress" = ${userAddress}
+    `;
+    return { userAddress, status: 'active', transaction: txHash };
+  } catch (err) {
+    const failedTx = (err as { txHash?: string }).txHash ?? txHash;
+    await user`
+      UPDATE accounts
+      SET status = CASE WHEN status = 'active' THEN 'active' ELSE 'failed' END,
+          transaction = COALESCE(${failedTx}, transaction)
+      WHERE "userAddress" = ${userAddress}
+    `;
+    const [updated] = await user`
+      SELECT status, transaction FROM accounts WHERE "userAddress" = ${userAddress}
+    `;
+    return {
+      userAddress,
+      status: (updated?.status as string) ?? 'failed',
+      transaction: (updated?.transaction as string | null) ?? failedTx ?? null,
+    };
+  }
+}
+
+export const activate = deployWallet;
+
+export async function reconcile(
+  userAddress: string,
+): Promise<{ userAddress: string; status: string }> {
+  const [account] = await user`
+    SELECT status FROM accounts WHERE "userAddress" = ${userAddress}
+  `;
+  if (!account) {
+    return { userAddress, status: 'ready' };
+  }
+  const currentStatus = account.status as string;
+  if (currentStatus !== 'active') {
+    const deployed = await deployWallet(userAddress);
+    return {
+      userAddress,
+      status: deployed.status,
+    };
+  }
+  return {
+    userAddress,
+    status: currentStatus,
+  };
+}
+
+export interface Input {
+  key: Uint8Array;
+  identity?: {
+    id: string;
+    provider: string;
+  };
+  credential?: {
+    id: string;
+    kind: string;
+    proof: Record<string, unknown>;
+    counter?: number;
+  };
+}
+
+export async function provision(
+  input: Input,
+): Promise<{ userAddress: string; status: string }> {
+  await ensureAccountColumns();
+  const prepared = await prepare(input.key, config.network);
+  const spending = prepareSpending(input.key, config.network);
+  let userAddress = prepared.account;
+
+  if (input.identity) {
+    const [existing] = await user`
+      SELECT "userAddress" FROM identities WHERE id = ${input.identity.id}
+    `;
+    if (existing?.userAddress) {
+      userAddress = existing.userAddress as string;
+    }
+  } else if (input.credential) {
+    const [existingCred] = await user`
+      SELECT "userAddress" FROM credentials WHERE id = ${input.credential.id}
+    `;
+    if (existingCred?.userAddress) {
+      userAddress = existingCred.userAddress as string;
+    }
+  }
+
+  await user`
+    INSERT INTO users("userAddress", name, image)
+    VALUES (${userAddress}, '', null)
+    ON CONFLICT ("userAddress") DO NOTHING
+  `;
+
+  await user`
+    INSERT INTO accounts("userAddress", network, state, code, status, "spendingAddress", "spendingState")
+    VALUES (${userAddress}, ${config.network}, ${prepared.state}, ${prepared.code}, 'ready', ${spending.account}, ${spending.state})
+    ON CONFLICT ("userAddress") DO UPDATE
+    SET "spendingAddress" = COALESCE(accounts."spendingAddress", EXCLUDED."spendingAddress"),
+        "spendingState" = COALESCE(accounts."spendingState", EXCLUDED."spendingState")
+  `;
+
+  if (input.identity) {
+    await user`
+      INSERT INTO identities(id, "userAddress", provider)
+      VALUES (${input.identity.id}, ${userAddress}, ${input.identity.provider})
+      ON CONFLICT (id) DO NOTHING
+    `;
+  }
+
+  if (input.credential) {
+    const proof = JSON.stringify(input.credential.proof);
+    await user`
+      INSERT INTO credentials(id, "userAddress", kind, proof, counter)
+      VALUES (
+        ${input.credential.id},
+        ${userAddress},
+        ${input.credential.kind},
+        ${proof}::jsonb,
+        ${input.credential.counter ?? 0}
+      )
+      ON CONFLICT (id) DO UPDATE
+      SET proof = EXCLUDED.proof,
+          counter = EXCLUDED.counter
+    `;
+  }
+
+  const [account] = await user`
+    SELECT status FROM accounts WHERE "userAddress" = ${userAddress}
+  `;
+  return {
+    userAddress,
+    status: (account?.status as string) ?? 'ready',
+  };
+}
