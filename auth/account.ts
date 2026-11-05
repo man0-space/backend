@@ -462,3 +462,204 @@ function selectRelayerSlot(pool: RelayerKeySlot[], network: 'mainnet' | 'testnet
   }
   return best;
 }
+
+export interface BroadcastOutcome {
+  txHash: string;
+  result: unknown;
+  logs: string[];
+}
+
+function decodeSuccessValue(b64?: string): unknown {
+  if (!b64) return undefined;
+  const raw = Buffer.from(b64, 'base64').toString('utf8').trim();
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+async function executeSignedBroadcastOnSlot(
+  rpcUrl: string,
+  slotObj: RelayerKeySlot,
+  receiverId: string,
+  actions: Uint8Array[],
+): Promise<BroadcastOutcome> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ak = await rpcCall<{ nonce: number; block_hash: string }>(rpcUrl, 'query', {
+      request_type: 'view_access_key',
+      finality: 'optimistic',
+      account_id: slotObj.signerId,
+      public_key: `ed25519:${slotObj.pubKeyB58}`,
+    });
+    slotObj.registered = true;
+    const candidateNonce = BigInt(ak.nonce) + 1n;
+    const prevNonce = slotObj.lastNonce;
+    const nonce = candidateNonce > prevNonce ? candidateNonce : prevNonce + 1n;
+    const blockHash = Buffer.from(base58.decode(ak.block_hash));
+    const txBytes = serializeTransaction({
+      signerId: slotObj.signerId,
+      publicKey: slotObj.pubKey32,
+      nonce,
+      receiverId,
+      blockHash,
+      actions,
+    });
+    const txHashBytes = createHash('sha256').update(txBytes).digest();
+    const signature = Buffer.from(ed25519.sign(txHashBytes, slotObj.secretKey32));
+    const signedTxBytes = Buffer.concat([txBytes, Buffer.from([0]), signature]);
+
+    try {
+      const outcome = await rpcCall<{
+        status?: { Failure?: unknown; SuccessValue?: string };
+        transaction?: { hash?: string };
+        transaction_outcome?: {
+          id?: string;
+          outcome?: { logs?: string[]; status?: { Failure?: unknown; SuccessValue?: string } };
+        };
+        receipts_outcome?: Array<{
+          outcome?: { logs?: string[]; status?: { Failure?: unknown; SuccessValue?: string } };
+        }>;
+      }>(rpcUrl, 'broadcast_tx_commit', [signedTxBytes.toString('base64')]);
+
+      slotObj.lastNonce = nonce;
+
+      const txHash =
+        outcome.transaction?.hash ||
+        outcome.transaction_outcome?.id ||
+        base58.encode(txHashBytes);
+
+      if (outcome.status?.Failure || outcome.transaction_outcome?.outcome?.status?.Failure) {
+        const failureJson = JSON.stringify(
+          outcome.status?.Failure ?? outcome.transaction_outcome?.outcome?.status?.Failure,
+        );
+        if (failureJson.includes('InvalidNonce') && attempt < 2) {
+          slotObj.lastNonce = 0n;
+          continue;
+        }
+        throw Object.assign(
+          new Error(`NEAR transaction ${txHash} failed: ${failureJson}`),
+          { txHash },
+        );
+      }
+      const logs: string[] = [...(outcome.transaction_outcome?.outcome?.logs ?? [])];
+      let latestReceiptSuccess: unknown;
+      for (const receipt of outcome.receipts_outcome ?? []) {
+        if (receipt.outcome?.logs) {
+          logs.push(...receipt.outcome.logs);
+        }
+        if (receipt.outcome?.status?.Failure) {
+          throw Object.assign(
+            new Error(
+              `NEAR receipt in ${txHash} failed: ${JSON.stringify(receipt.outcome.status.Failure)}`,
+            ),
+            { txHash },
+          );
+        }
+        const decoded = decodeSuccessValue(receipt.outcome?.status?.SuccessValue);
+        if (decoded !== undefined && decoded !== null) {
+          latestReceiptSuccess = decoded;
+        }
+      }
+      let result = decodeSuccessValue(outcome.status?.SuccessValue);
+      if (result === undefined || result === null) {
+        result = latestReceiptSuccess;
+      }
+      if (result === undefined || result === null) {
+        for (const log of logs) {
+          if (log.startsWith('EVENT_JSON:')) {
+            try {
+              const parsedEvent = JSON.parse(log.slice('EVENT_JSON:'.length)) as {
+                data?: Record<string, unknown>;
+              };
+              const eventId =
+                parsedEvent.data?.workflow_id ??
+                parsedEvent.data?.agent_id ??
+                parsedEvent.data?.rfa_id ??
+                parsedEvent.data?.lease_id;
+              if (eventId !== undefined) {
+                result = eventId;
+              }
+            } catch {
+              // ignore non-JSON log
+            }
+          }
+        }
+      }
+      return { txHash, result, logs };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const rpcData = JSON.stringify((err as { rpcError?: unknown }).rpcError ?? '');
+      if ((msg.includes('InvalidNonce') || rpcData.includes('InvalidNonce')) && attempt < 2) {
+        slotObj.lastNonce = 0n;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('NEAR broadcast failed after InvalidNonce retries.');
+}
+
+async function ensureRelayerSlotRegistered(
+  rpcUrl: string,
+  primarySlot: RelayerKeySlot,
+  targetSlot: RelayerKeySlot,
+): Promise<void> {
+  if (targetSlot.registered || targetSlot.slot === 0) return;
+  try {
+    await rpcCall<{ nonce: number; block_hash: string }>(rpcUrl, 'query', {
+      request_type: 'view_access_key',
+      finality: 'optimistic',
+      account_id: targetSlot.signerId,
+      public_key: `ed25519:${targetSlot.pubKeyB58}`,
+    });
+    targetSlot.registered = true;
+    return;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const rpcErr = JSON.stringify((err as { rpcError?: unknown }).rpcError ?? '');
+    if (
+      !msg.includes('UNKNOWN_ACCESS_KEY') &&
+      !rpcErr.includes('UNKNOWN_ACCESS_KEY') &&
+      !msg.toLowerCase().includes('does not exist')
+    ) {
+      throw err;
+    }
+  }
+  await enqueueSlotTx(primarySlot, async () => {
+    if (targetSlot.registered) return;
+    await executeSignedBroadcastOnSlot(rpcUrl, primarySlot, primarySlot.signerId, [
+      addFullAccessKeyAction(targetSlot.pubKey32),
+    ]);
+    targetSlot.registered = true;
+  });
+}
+
+export async function broadcastActionsWithOutcome(
+  rpcUrl: string,
+  receiverId: string,
+  actions: Uint8Array[],
+  explicitNetwork?: 'mainnet' | 'testnet',
+): Promise<BroadcastOutcome> {
+  const network: 'mainnet' | 'testnet' =
+    explicitNetwork ??
+    (rpcUrl.includes('testnet') || receiverId.endsWith('.testnet') ? 'testnet' : 'mainnet');
+  const pool = getRelayerPool(network);
+  const chosenSlot = selectRelayerSlot(pool, network);
+  return enqueueSlotTx(chosenSlot, async () => {
+    if (!chosenSlot.registered && chosenSlot.slot > 0) {
+      await ensureRelayerSlotRegistered(rpcUrl, pool[0]!, chosenSlot);
+    }
+    return executeSignedBroadcastOnSlot(rpcUrl, chosenSlot, receiverId, actions);
+  });
+}
+
+export async function broadcastActions(
+  rpcUrl: string,
+  receiverId: string,
+  actions: Uint8Array[],
+): Promise<string> {
+  const outcome = await broadcastActionsWithOutcome(rpcUrl, receiverId, actions);
+  return outcome.txHash;
+}
