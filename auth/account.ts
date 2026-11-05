@@ -1274,3 +1274,105 @@ export async function getNearBalances(userAddress: string): Promise<{
     };
   });
 }
+
+export async function ensureDepositReady(userAddress: string): Promise<{
+  userAddress: string;
+  depositAddress: string;
+  spendingAddress: string;
+  network: 'mainnet' | 'testnet';
+  status: string;
+}> {
+  const rec = await ensureSpendingRecord(userAddress);
+  const activeNet = config.network;
+  const activeRpc = rpcFor(activeNet);
+  const intentsMeta = await discoverNearIntentsContracts(activeNet).catch(() => null);
+
+  let status = 'active';
+  if (rec.accountNetwork === activeNet) {
+    const deployed = await deployWallet(userAddress);
+    status = deployed.status;
+  } else {
+    const existing = await viewAccount(activeRpc, rec.activeMainAddress);
+    if (!existing) {
+      const actions: Uint8Array[] = [
+        transferAction(12_000_000_000_000_000_000_000n),
+        universalStateInitAction(rec.rawActiveMainInit, 0n),
+      ];
+      if (intentsMeta?.verifier && derive(rec.seedId).equals(rec.ownerCompressedKey)) {
+        const privKey = derivePrivate(rec.seedId);
+        const ownerIntentsKey = intentsPublicKey('p256', rec.ownerCompressedKey);
+        const msg = buildWalletAddPublicKeyMessage({
+          signerId: rec.activeMainAddress,
+          networkId: activeNet,
+          publicKey: ownerIntentsKey,
+          nonce: randomInt(1, 0x100000000),
+          intentsContractId: intentsMeta.verifier,
+        });
+        const proof = signWebAuthnP256(privKey, commitment(msg));
+        const execArgs = Buffer.from(
+          JSON.stringify({ msg, proof: JSON.stringify(proof) }),
+          'utf8',
+        );
+        actions.push(functionCallAction('w_execute_signed', execArgs, 100_000_000_000_000n, 1n));
+      }
+      await broadcastActionsWithOutcome(activeRpc, rec.activeMainAddress, actions, activeNet);
+    } else if (BigInt(existing.amount) < 5_000_000_000_000_000_000_000n) {
+      await broadcastActionsWithOutcome(
+        activeRpc,
+        rec.activeMainAddress,
+        [transferAction(12_000_000_000_000_000_000_000n)],
+        activeNet,
+      );
+    }
+  }
+
+  if (intentsMeta?.verifier && derive(rec.seedId).equals(rec.ownerCompressedKey)) {
+    const ownerIntentsKey = intentsPublicKey('p256', rec.ownerCompressedKey);
+    const hasKey = await hasIntentsPublicKey(
+      activeRpc,
+      rec.activeMainAddress,
+      ownerIntentsKey,
+      intentsMeta.verifier,
+    );
+    if (!hasKey) {
+      const existing = await viewAccount(activeRpc, rec.activeMainAddress);
+      const actions: Uint8Array[] = [];
+      if (existing && BigInt(existing.amount) < 5_000_000_000_000_000_000_000n) {
+        actions.push(transferAction(12_000_000_000_000_000_000_000n));
+      }
+      const privKey = derivePrivate(rec.seedId);
+      const msg = buildWalletAddPublicKeyMessage({
+        signerId: rec.activeMainAddress,
+        networkId: activeNet,
+        publicKey: ownerIntentsKey,
+        nonce: randomInt(1, 0x100000000),
+        intentsContractId: intentsMeta.verifier,
+      });
+      const proof = signWebAuthnP256(privKey, commitment(msg));
+      const execArgs = Buffer.from(JSON.stringify({ msg, proof: JSON.stringify(proof) }), 'utf8');
+      actions.push(functionCallAction('w_execute_signed', execArgs, 100_000_000_000_000n, 1n));
+      await broadcastActionsWithOutcome(activeRpc, rec.activeMainAddress, actions, activeNet).catch(
+        () => undefined,
+      );
+    }
+  }
+
+  await ensureFtStorageDeposit(activeRpc, usdcFor(activeNet), rec.activeMainAddress, activeNet);
+  if (intentsMeta?.intentsUsdcContract && intentsMeta.intentsUsdcContract !== usdcFor(activeNet)) {
+    await ensureFtStorageDeposit(
+      activeRpc,
+      intentsMeta.intentsUsdcContract,
+      rec.activeMainAddress,
+      activeNet,
+    );
+  }
+
+  await invalidateNearBalanceCache(userAddress);
+  return {
+    userAddress: rec.userAddress,
+    depositAddress: rec.activeMainAddress,
+    spendingAddress: rec.activeSpendingAddress,
+    network: activeNet,
+    status,
+  };
+}
