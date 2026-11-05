@@ -1090,3 +1090,50 @@ export async function readUsdcBalanceWei(
 ): Promise<string> {
   return readFtBalanceWei(rpcUrl, usdcFor(network), accountId);
 }
+
+const derivedAddressToCanonical = new Map<string, string>();
+let derivedIndexHydratedFor: 'mainnet' | 'testnet' | null = null;
+
+export async function resolveMainUserAddress(addressOrSpending: string): Promise<string> {
+  const trimmed = addressOrSpending.trim();
+  if (!trimmed) return trimmed;
+  const cachedMain = derivedAddressToCanonical.get(trimmed);
+  if (cachedMain) return cachedMain;
+
+  await ensureAccountColumns();
+  const [row] = await user`
+    SELECT "userAddress"
+    FROM accounts
+    WHERE "userAddress" = ${trimmed}
+       OR "spendingAddress" = ${trimmed}
+    LIMIT 1
+  `;
+  if (row?.userAddress) {
+    return row.userAddress as string;
+  }
+
+  if (trimmed.startsWith('0u') && derivedIndexHydratedFor !== config.network) {
+    const allRows = await user`
+      SELECT "userAddress", network, state
+      FROM accounts
+    `;
+    for (const r of allRows) {
+      try {
+        const canonical = r.userAddress as string;
+        const rawInit = Buffer.from(r.state as string, 'base64');
+        const ownerKey = extractStateKey(rawInit);
+        const mainOnActive = await prepare(ownerKey, config.network);
+        const spendOnActive = prepareSpending(ownerKey, config.network);
+        derivedAddressToCanonical.set(mainOnActive.account, canonical);
+        derivedAddressToCanonical.set(spendOnActive.account, canonical);
+      } catch {
+        // ignore malformed state rows
+      }
+    }
+    derivedIndexHydratedFor = config.network;
+    const afterHydration = derivedAddressToCanonical.get(trimmed);
+    if (afterHydration) return afterHydration;
+  }
+
+  return trimmed;
+}
