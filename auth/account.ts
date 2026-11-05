@@ -211,3 +211,125 @@ export async function discoverNearIntentsContracts(
     return { verifier, intentsUsdcContract, nearTokenContracts };
   });
 }
+
+interface NearViewAccountResult {
+  amount: string;
+  locked: string;
+  code_hash: string;
+  storage_usage: number;
+  global_contract_account_id?: string;
+  global_contract_hash?: string;
+}
+
+async function rpcCall<T = unknown>(
+  rpcUrl: string,
+  method: string,
+  params: unknown,
+): Promise<T> {
+  const res = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: '1',
+      method,
+      params,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`NEAR RPC HTTP error ${res.status}`);
+  }
+  const data = (await res.json()) as {
+    result?: T;
+    error?: {
+      message?: string;
+      data?: unknown;
+      cause?: { name?: string };
+    };
+  };
+  if (data.error) {
+    const err = new Error(data.error.message || 'NEAR RPC error') as Error & {
+      causeName?: string;
+      rpcError?: unknown;
+    };
+    err.causeName = data.error.cause?.name;
+    err.rpcError = data.error;
+    throw err;
+  }
+  return data.result as T;
+}
+
+export async function viewAccount(
+  rpcUrl: string,
+  accountId: string,
+): Promise<NearViewAccountResult | null> {
+  try {
+    return await rpcCall<NearViewAccountResult>(rpcUrl, 'query', {
+      request_type: 'view_account',
+      finality: 'optimistic',
+      account_id: accountId,
+    });
+  } catch (err) {
+    const causeName = (err as { causeName?: string }).causeName;
+    const msg = err instanceof Error ? err.message : String(err);
+    if (causeName === 'UNKNOWN_ACCOUNT' || msg.includes('does not exist')) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function callViewFunction<T = unknown>(
+  rpcUrl: string,
+  accountId: string,
+  methodName: string,
+  args: Record<string, unknown> = {},
+): Promise<T> {
+  const argsBase64 = Buffer.from(JSON.stringify(args), 'utf8').toString('base64');
+  const res = await rpcCall<{ result: number[] }>(rpcUrl, 'query', {
+    request_type: 'call_function',
+    finality: 'optimistic',
+    account_id: accountId,
+    method_name: methodName,
+    args_base64: argsBase64,
+  });
+  const text = Buffer.from(res.result).toString('utf8');
+  return JSON.parse(text) as T;
+}
+
+export async function hasIntentsPublicKey(
+  rpcUrl: string,
+  accountId: string,
+  publicKey: string,
+  intentsContractId = 'intents.near',
+): Promise<boolean> {
+  try {
+    const res = await callViewFunction<boolean>(rpcUrl, intentsContractId, 'has_public_key', {
+      account_id: accountId,
+      public_key: publicKey,
+    });
+    return res === true;
+  } catch {
+    return false;
+  }
+}
+
+export async function listIntentsPublicKeys(
+  rpcUrl: string,
+  accountId: string,
+  intentsContractId = 'intents.near',
+): Promise<string[]> {
+  try {
+    const res = await callViewFunction<string[]>(rpcUrl, intentsContractId, 'public_keys_of', {
+      account_id: accountId,
+    });
+    return Array.isArray(res) ? res : [];
+  } catch (err) {
+    const causeName = (err as { causeName?: string }).causeName;
+    const msg = err instanceof Error ? err.message : String(err);
+    if (causeName === 'UNKNOWN_ACCOUNT' || msg.includes('does not exist')) {
+      return [];
+    }
+    throw err;
+  }
+}
