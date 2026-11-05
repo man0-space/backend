@@ -1581,3 +1581,163 @@ export async function reclaimSpendingLimit(
     network: activeNet,
   };
 }
+
+export async function resolveUserAddressOnNetwork(
+  userAddress: string,
+  targetNetwork: 'mainnet' | 'testnet',
+): Promise<{
+  signerId: string;
+  ownerCompressedKey: Buffer;
+  rawStateInit: Buffer;
+  network: 'mainnet' | 'testnet';
+  seedId: string | null;
+}> {
+  const [account] = await user`
+    SELECT "userAddress", network, state, code
+    FROM accounts
+    WHERE "userAddress" = ${userAddress}
+  `;
+  if (!account) {
+    throw Object.assign(new Error(`Universal account ${userAddress} not found.`), {
+      statusCode: 404,
+    });
+  }
+  const [identity] = await user`
+    SELECT id FROM identities WHERE "userAddress" = ${userAddress} LIMIT 1
+  `;
+  const identityId = (identity?.id as string | undefined) ?? null;
+  const accountStateInit = Buffer.from(account.state as string, 'base64');
+  const ownerCompressedKey = extractStateKey(accountStateInit);
+  const accountNetwork = (account.network === 'testnet' ? 'testnet' : 'mainnet') as
+    | 'mainnet'
+    | 'testnet';
+
+  if (accountNetwork === targetNetwork) {
+    return {
+      signerId: userAddress,
+      ownerCompressedKey,
+      rawStateInit: accountStateInit,
+      network: targetNetwork,
+      seedId: identityId,
+    };
+  }
+
+  const targetOwnerCompressedKey = identityId ? derive(identityId) : ownerCompressedKey;
+  const preparedOnTarget = await prepare(targetOwnerCompressedKey, targetNetwork);
+  return {
+    signerId: preparedOnTarget.account,
+    ownerCompressedKey: targetOwnerCompressedKey,
+    rawStateInit: Buffer.from(preparedOnTarget.state, 'base64'),
+    network: targetNetwork,
+    seedId: identityId,
+  };
+}
+
+export async function viewNearContract<T = unknown>(input: {
+  contractId: string;
+  methodName: string;
+  args?: Record<string, unknown>;
+}): Promise<T> {
+  const targetNetwork = await assertAllowedNearContract(input.contractId);
+  const rpcUrl = rpcFor(targetNetwork);
+  return callViewFunction<T>(rpcUrl, input.contractId.trim(), input.methodName, input.args ?? {});
+}
+
+export async function executeContractCall(
+  userAddress: string,
+  input: {
+    contractId: string;
+    methodName: string;
+    args: Record<string, unknown>;
+    deposit?: string;
+    gas?: number;
+  },
+): Promise<{
+  txHash: string;
+  signerId: string;
+  network: 'mainnet' | 'testnet';
+  result: unknown;
+  logs: string[];
+}> {
+  const targetNetwork = await assertAllowedNearContract(input.contractId);
+  const rpcUrl = rpcFor(targetNetwork);
+  const resolved = await resolveUserAddressOnNetwork(userAddress, targetNetwork);
+
+  if (!resolved.seedId) {
+    throw Object.assign(
+      new Error('Smart account identity is required to execute this contract call.'),
+      { statusCode: 401 },
+    );
+  }
+  const derivedPub = derive(resolved.seedId);
+  if (!derivedPub.equals(resolved.ownerCompressedKey)) {
+    throw Object.assign(
+      new Error('Identity key does not match universal account owner key.'),
+      { statusCode: 401 },
+    );
+  }
+
+  const privKey = derivePrivate(resolved.seedId);
+  const msg = buildWalletContractCallMessage({
+    signerId: resolved.signerId,
+    networkId: targetNetwork,
+    receiverId: input.contractId.trim(),
+    methodName: input.methodName,
+    args: input.args,
+    deposit: input.deposit ?? '0',
+    gas: input.gas ?? 100_000_000_000_000,
+    nonce: randomInt(1, 0x100000000),
+  });
+  const proof = signWebAuthnP256(privKey, commitment(msg));
+
+  if (
+    input.methodName === 'ft_transfer' &&
+    typeof input.args.receiver_id === 'string' &&
+    input.args.receiver_id.trim()
+  ) {
+    await ensureFtStorageDeposit(
+      rpcUrl,
+      input.contractId.trim(),
+      input.args.receiver_id.trim(),
+      targetNetwork,
+    );
+  }
+
+  const actions: Uint8Array[] = [];
+  const existing = await viewAccount(rpcUrl, resolved.signerId);
+  if (!existing) {
+    actions.push(transferAction(12_000_000_000_000_000_000_000n));
+    actions.push(universalStateInitAction(resolved.rawStateInit, 0n));
+  } else if (BigInt(existing.amount) < 5_000_000_000_000_000_000_000n) {
+    actions.push(transferAction(12_000_000_000_000_000_000_000n));
+  }
+
+  const externalDeposit = BigInt(
+    msg.request.external?.[0]?.actions?.[0]?.payload?.deposit ?? input.deposit ?? '0',
+  );
+  const execArgs = Buffer.from(
+    JSON.stringify({
+      msg,
+      proof: JSON.stringify(proof),
+    }),
+    'utf8',
+  );
+  actions.push(
+    functionCallAction('w_execute_signed', execArgs, 200_000_000_000_000n, externalDeposit),
+  );
+
+  const outcome = await broadcastActionsWithOutcome(
+    rpcUrl,
+    resolved.signerId,
+    actions,
+    targetNetwork,
+  );
+
+  return {
+    txHash: outcome.txHash,
+    signerId: resolved.signerId,
+    network: targetNetwork,
+    result: outcome.result,
+    logs: outcome.logs,
+  };
+}
