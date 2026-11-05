@@ -1484,3 +1484,100 @@ export async function approveSpendingLimit(
     network: activeNet,
   };
 }
+
+export async function reclaimSpendingLimit(
+  userAddress: string,
+  input: {
+    amountWei?: string;
+  } = {},
+): Promise<{
+  txHash: string;
+  userAddress: string;
+  depositAddress: string;
+  spendingAddress: string;
+  mainBalanceWei: string;
+  spendingBalanceWei: string;
+  network: 'mainnet' | 'testnet';
+}> {
+  const rec = await ensureSpendingRecord(userAddress);
+  const activeNet = config.network;
+  const activeRpc = rpcFor(activeNet);
+  const balances = await readActiveAccountBalances(rec);
+  const currentSpendingWei = balances.spendingWei.toString();
+  const reclaimWei = input.amountWei ?? currentSpendingWei;
+  if (BigInt(reclaimWei) <= 0n || balances.spendingWei < BigInt(reclaimWei)) {
+    throw Object.assign(new Error('There are no unused approved funds to return.'), {
+      statusCode: 400,
+    });
+  }
+
+  if (!derive(rec.seedId).equals(rec.ownerCompressedKey)) {
+    throw Object.assign(new Error('Account authorization mismatch.'), { statusCode: 401 });
+  }
+
+  const nearMain = rec.activeMainAddress;
+  const nearSpending = rec.activeSpendingAddress;
+  const privKey = derivePrivate(rec.seedId);
+
+  const msg = buildWalletContractCallMessage({
+    signerId: nearSpending,
+    networkId: activeNet,
+    receiverId: balances.settlementUsdc,
+    methodName: 'ft_transfer',
+    args: {
+      receiver_id: nearMain,
+      amount: reclaimWei,
+    },
+    deposit: '1',
+    gas: 50_000_000_000_000,
+    nonce: randomInt(1, 0x100000000),
+  });
+  const proof = signWebAuthnP256(privKey, commitment(msg));
+
+  const existingMain = await viewAccount(activeRpc, nearMain);
+  if (!existingMain) {
+    await broadcastActionsWithOutcome(
+      activeRpc,
+      nearMain,
+      [
+        transferAction(12_000_000_000_000_000_000_000n),
+        universalStateInitAction(rec.rawActiveMainInit, 0n),
+      ],
+      activeNet,
+    );
+  } else if (BigInt(existingMain.amount) < 5_000_000_000_000_000_000n) {
+    await broadcastActionsWithOutcome(
+      activeRpc,
+      nearMain,
+      [transferAction(12_000_000_000_000_000_000n)],
+      activeNet,
+    );
+  }
+  await ensureFtStorageDeposit(activeRpc, balances.settlementUsdc, nearMain, activeNet);
+
+  const existingSpending = await viewAccount(activeRpc, nearSpending);
+  const spendingActions: Uint8Array[] = [];
+  if (existingSpending && BigInt(existingSpending.amount) < 5_000_000_000_000_000_000n) {
+    spendingActions.push(transferAction(12_000_000_000_000_000_000n));
+  }
+  const execArgs = Buffer.from(JSON.stringify({ msg, proof: JSON.stringify(proof) }), 'utf8');
+  spendingActions.push(functionCallAction('w_execute_signed', execArgs, 200_000_000_000_000n, 1n));
+  const outcome = await broadcastActionsWithOutcome(
+    activeRpc,
+    nearSpending,
+    spendingActions,
+    activeNet,
+  );
+
+  await invalidateNearBalanceCache(userAddress);
+  const updated = await readActiveAccountBalances(rec);
+  return {
+    txHash: outcome.txHash,
+    userAddress: rec.userAddress,
+    depositAddress: nearMain,
+    spendingAddress: nearSpending,
+    mainBalanceWei: updated.mainWei.toString(),
+    spendingBalanceWei: updated.spendingWei.toString(),
+    network: activeNet,
+  };
+}
