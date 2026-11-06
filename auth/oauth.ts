@@ -181,3 +181,218 @@ export function verifyTelegramAuthData(
     avatar: authData.photo_url ? String(authData.photo_url) : null,
   };
 }
+
+export async function exchange(
+  id: Exclude<Provider, 'telegram'>,
+  code: string,
+  verifier: string,
+): Promise<VerifiedProviderAccount> {
+  const spec = provider(id);
+  const { clientId, clientSecret } = credentials(spec);
+  const redirectUri = `${issuer}/api/oauth/${spec.id}/callback`;
+
+  if (spec.id === 'google') {
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        code_verifier: verifier,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+      }),
+    });
+    if (!tokenRes.ok) {
+      throw Object.assign(new Error('Google authentication failed.'), { statusCode: 401 });
+    }
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    const profileRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { authorization: `Bearer ${tokenData.access_token}` },
+    });
+    if (!profileRes.ok) {
+      throw Object.assign(new Error('Failed to verify Google account.'), { statusCode: 401 });
+    }
+    const profile = (await profileRes.json()) as {
+      sub?: string;
+      email?: string;
+      name?: string;
+      picture?: string;
+    };
+    if (!profile.sub) {
+      throw Object.assign(new Error('Google account is missing subject ID.'), { statusCode: 401 });
+    }
+    const subject = String(profile.sub);
+    const email = String(profile.email ?? '').trim();
+    const handle = email || String(profile.name ?? '').trim() || subject;
+    const url = email ? `mailto:${email}` : 'https://accounts.google.com';
+    return {
+      subject,
+      social: {
+        platform: 'google',
+        handle,
+        url,
+        verified: true,
+        providerId: `google:${(email || subject).toLowerCase()}`,
+      },
+      name: profile.name ? String(profile.name) : null,
+      avatar: profile.picture ? String(profile.picture) : null,
+    };
+  }
+
+  if (spec.id === 'discord') {
+    const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        code_verifier: verifier,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+      }),
+    });
+    if (!tokenRes.ok) {
+      throw Object.assign(new Error('Discord authentication failed.'), { statusCode: 401 });
+    }
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    const profileRes = await fetch('https://discord.com/api/users/@me', {
+      headers: { authorization: `Bearer ${tokenData.access_token}` },
+    });
+    if (!profileRes.ok) {
+      throw Object.assign(new Error('Failed to verify Discord account.'), { statusCode: 401 });
+    }
+    const profile = (await profileRes.json()) as {
+      id?: string;
+      username?: string;
+      global_name?: string;
+      avatar?: string;
+    };
+    if (!profile.id) {
+      throw Object.assign(new Error('Discord account is missing user ID.'), { statusCode: 401 });
+    }
+    const subject = String(profile.id);
+    const username = String(profile.username ?? subject).trim().replace(/^@+/, '');
+    return {
+      subject,
+      social: {
+        platform: 'discord',
+        handle: `@${username}`,
+        url: `https://discord.com/users/${encodeURIComponent(subject)}`,
+        verified: true,
+        providerId: `discord:${subject.toLowerCase()}`,
+      },
+      name: profile.global_name ? String(profile.global_name) : username,
+      avatar: profile.avatar
+        ? `https://cdn.discordapp.com/avatars/${subject}/${profile.avatar}.png`
+        : null,
+    };
+  }
+
+  if (spec.id === 'github') {
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        code_verifier: verifier,
+        redirect_uri: redirectUri,
+      }),
+    });
+    if (!tokenRes.ok) {
+      throw Object.assign(new Error('GitHub authentication failed.'), { statusCode: 401 });
+    }
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenData.access_token) {
+      throw Object.assign(new Error('GitHub token exchange failed.'), { statusCode: 401 });
+    }
+    const profileRes = await fetch('https://api.github.com/user', {
+      headers: {
+        authorization: `Bearer ${tokenData.access_token}`,
+        'user-agent': 'oauth',
+        accept: 'application/vnd.github+json',
+      },
+    });
+    if (!profileRes.ok) {
+      throw Object.assign(new Error('Failed to verify GitHub account.'), { statusCode: 401 });
+    }
+    const profile = (await profileRes.json()) as {
+      id?: number | string;
+      login?: string;
+      name?: string;
+      avatar_url?: string;
+    };
+    if (!profile.id) {
+      throw Object.assign(new Error('GitHub account is missing user ID.'), { statusCode: 401 });
+    }
+    const subject = String(profile.id);
+    const login = String(profile.login ?? subject).trim().replace(/^@+/, '');
+    return {
+      subject,
+      social: {
+        platform: 'github',
+        handle: `@${login}`,
+        url: `https://github.com/${encodeURIComponent(login)}`,
+        verified: true,
+        providerId: `github:${login.toLowerCase()}`,
+      },
+      name: profile.name ? String(profile.name) : login,
+      avatar: profile.avatar_url ? String(profile.avatar_url) : null,
+    };
+  }
+
+  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const tokenRes = await fetch('https://api.x.com/2/oauth2/token', {
+    method: 'POST',
+    headers: {
+      authorization: `Basic ${basic}`,
+      'content-type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      code,
+      code_verifier: verifier,
+      grant_type: 'authorization_code',
+      redirect_uri: redirectUri,
+    }),
+  });
+  if (!tokenRes.ok) {
+    throw Object.assign(new Error('X authentication failed.'), { statusCode: 401 });
+  }
+  const tokenData = (await tokenRes.json()) as { access_token?: string };
+  const profileRes = await fetch(
+    'https://api.x.com/2/users/me?user.fields=id,name,username,profile_image_url',
+    {
+      headers: { authorization: `Bearer ${tokenData.access_token}` },
+    },
+  );
+  if (!profileRes.ok) {
+    throw Object.assign(new Error('Failed to verify X account.'), { statusCode: 401 });
+  }
+  const body = (await profileRes.json()) as {
+    data?: { id?: string; username?: string; name?: string; profile_image_url?: string };
+  };
+  if (!body.data?.id) {
+    throw Object.assign(new Error('X account is missing user ID.'), { statusCode: 401 });
+  }
+  const subject = String(body.data.id);
+  const username = String(body.data.username ?? subject).trim().replace(/^@+/, '');
+  return {
+    subject,
+    social: {
+      platform: 'x',
+      handle: `@${username}`,
+      url: `https://x.com/${encodeURIComponent(username)}`,
+      verified: true,
+      providerId: `x:${username.toLowerCase()}`,
+    },
+    name: body.data.name ? String(body.data.name) : username,
+    avatar: body.data.profile_image_url ? String(body.data.profile_image_url) : null,
+  };
+}
