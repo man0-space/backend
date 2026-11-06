@@ -123,3 +123,37 @@ function encrypt(value: string): string {
   const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
   return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64');
 }
+
+export async function create(userAddress: string) {
+  await ensureUserColumns();
+  const rec = await reconcile(userAddress);
+  const expires = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
+  const value = await sign(
+    privateKey,
+    issuer!,
+    userAddress,
+    randomBytes(32).toString('base64url'),
+    SESSION_TTL_SECONDS,
+  );
+  const tokenHash = digest(value);
+  await user`
+    INSERT INTO tokens(id, "userAddress", jwt, expires)
+    VALUES (${tokenHash}, ${userAddress}, ${encrypt(value)}, ${expires})
+  `;
+  const [row] = await user`
+    SELECT u."userAddress", u.name, u.bio, u.image, u.banner, u.socials,
+      EXISTS(
+        SELECT 1 FROM consents c
+        WHERE c."userAddress" = u."userAddress" AND c.policy = ${hash}
+      ) AS consented
+    FROM users u
+    WHERE u."userAddress" = ${userAddress}
+  `;
+  const normalized = normalizeUserRow(row, Boolean(row?.consented));
+  if (rec.status === 'active') {
+    const key = sessionCacheKey(tokenHash);
+    trackUserSessionKey(userAddress, key);
+    await cacheSet(key, normalized, SESSION_L2_TTL_SECONDS, SESSION_L1_TTL_MS);
+  }
+  return { token: value, user: normalized, expires };
+}
