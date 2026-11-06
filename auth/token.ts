@@ -157,3 +157,94 @@ export async function create(userAddress: string) {
   }
   return { token: value, user: normalized, expires };
 }
+
+export async function read(
+  value?: string,
+  options?: { reconcileIfNeeded?: boolean },
+): Promise<User> {
+  if (!value) {
+    throw Object.assign(new Error('Sign in to continue.'), { statusCode: 401 });
+  }
+  try {
+    await verify(value, publicKey, issuer!);
+  } catch {
+    throw Object.assign(new Error('Your sign-in expired. Please sign in again.'), {
+      statusCode: 401,
+    });
+  }
+
+  const tokenHash = digest(value);
+  const key = sessionCacheKey(tokenHash);
+  const cachedUser = await cacheGet<User>(key, SESSION_L1_TTL_MS);
+  if (cachedUser) {
+    trackUserSessionKey(cachedUser.userAddress, key);
+    return cachedUser;
+  }
+
+  await ensureUserColumns();
+
+  const [row] = await user`
+    SELECT u."userAddress", u.name, u.bio, u.image, u.banner, u.socials,
+      t.expires AS "tokenExpires",
+      a.status AS "accountStatus",
+      EXISTS(
+        SELECT 1 FROM consents c
+        WHERE c."userAddress" = u."userAddress" AND c.policy = ${hash}
+      ) AS consented
+    FROM tokens t
+    JOIN users u ON u."userAddress" = t."userAddress"
+    LEFT JOIN accounts a ON a."userAddress" = u."userAddress"
+    WHERE t.id = ${tokenHash}
+      AND t.expires > now()
+  `;
+  if (!row) {
+    throw Object.assign(new Error('Your sign-in expired. Please sign in again.'), {
+      statusCode: 401,
+    });
+  }
+
+  const resolvedUserAddress = String(row.userAddress);
+  const expiresMs = row.tokenExpires ? Date.parse(String(row.tokenExpires)) : NaN;
+  if (Number.isFinite(expiresMs) && expiresMs - Date.now() < SESSION_RENEW_THRESHOLD_MS) {
+    const renewedExpires = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
+    void user`UPDATE tokens SET expires = ${renewedExpires} WHERE id = ${tokenHash}`.catch(
+      () => undefined,
+    );
+  }
+
+  let accountStatus = row.accountStatus ? String(row.accountStatus) : null;
+  if (accountStatus && accountStatus !== 'active') {
+    if (options?.reconcileIfNeeded) {
+      const reconciled = await reconcile(resolvedUserAddress);
+      accountStatus = reconciled.status;
+    } else {
+      scheduleBackgroundReconcile(resolvedUserAddress);
+    }
+  }
+
+  const normalized = normalizeUserRow(row, Boolean(row.consented));
+  if (!accountStatus || accountStatus === 'active') {
+    trackUserSessionKey(resolvedUserAddress, key);
+    await cacheSet(key, normalized, SESSION_L2_TTL_SECONDS, SESSION_L1_TTL_MS);
+  }
+  return normalized;
+}
+
+export async function destroy(value: string): Promise<void> {
+  const tokenHash = digest(value);
+  await Promise.all([
+    user`DELETE FROM tokens WHERE id = ${tokenHash}`,
+    cacheDel(sessionCacheKey(tokenHash)),
+  ]);
+}
+
+export async function authorize(value?: string): Promise<User> {
+  const user = await read(value);
+  if (!user.consented) {
+    throw Object.assign(
+      new Error('Review and accept the account agreement before continuing.'),
+      { statusCode: 428 },
+    );
+  }
+  return user;
+}
