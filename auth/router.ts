@@ -131,3 +131,165 @@ export async function oauthRoutes(app: FastifyInstance) {
     return oauth.completeTelegram(body.state, body.tgAuthResult ?? undefined);
   });
 }
+
+export async function routes(app: FastifyInstance) {
+  app.post('/passkey/options', async request => {
+    const body = optionsBody.parse(request.body);
+    const allowed = checkOrigin(request.headers.origin);
+    const options = passkey.options(body.mode, allowed.rp);
+    const id = await challenge.create({
+      kind: `passkey:${body.mode}`,
+      challenge: options.challenge,
+      origin: allowed.origin,
+      rp: allowed.rp,
+    });
+    return { id, options };
+  });
+
+  app.post('/passkey/register', async request => {
+    const body = credentialBody.parse(request.body);
+    const stored = await challenge.consume<{
+      kind: string;
+      challenge: string;
+      origin: string;
+      rp: string;
+    }>(body.id);
+
+    if (stored.kind !== 'passkey:create') {
+      throw Object.assign(new Error('Invalid passkey registration challenge.'), {
+        statusCode: 401,
+      });
+    }
+
+    const verified = await passkey.registration(
+      body.credential as unknown as RegistrationResponseJSON,
+      {
+        challenge: stored.challenge,
+        origin: stored.origin,
+        rp: stored.rp,
+      },
+    );
+
+    const identityId = `passkey:${verified.credential.id}`;
+    const smartKey = derive(identityId);
+    const provisioned = await provision({
+      key: smartKey,
+      identity: { id: identityId, provider: 'passkey' },
+      credential: {
+        id: verified.credential.id,
+        kind: 'passkey',
+        proof: {
+          publicKey: Buffer.from(verified.credential.publicKey).toString('base64'),
+          rawKey: smartKey.toString('base64'),
+          transports: verified.credential.transports ?? [],
+        },
+        counter: verified.credential.counter,
+      },
+    });
+
+    return token.create(provisioned.userAddress);
+  });
+
+  app.post('/passkey/verify', async request => {
+    const body = credentialBody.parse(request.body);
+    const stored = await challenge.consume<{
+      kind: string;
+      challenge: string;
+      origin: string;
+      rp: string;
+    }>(body.id);
+
+    if (stored.kind !== 'passkey:login') {
+      throw Object.assign(new Error('Invalid passkey login challenge.'), { statusCode: 401 });
+    }
+
+    const response = body.credential as unknown as AuthenticationResponseJSON;
+    const [row] = await user`
+      SELECT id, "userAddress", proof, counter
+      FROM credentials
+      WHERE id = ${response.id} AND kind = 'passkey'
+    `;
+    if (!row) {
+      throw Object.assign(new Error('No account was found for this passkey.'), {
+        statusCode: 401,
+      });
+    }
+
+    const proof = row.proof as {
+      publicKey: string;
+      transports?: WebAuthnCredential['transports'];
+    };
+    const rawKeyBytes = Buffer.from(proof.publicKey, 'base64');
+    const publicKeyBytes = new Uint8Array(rawKeyBytes.length);
+    publicKeyBytes.set(rawKeyBytes);
+    const authInfo = await passkey.authentication(response, {
+      challenge: stored.challenge,
+      origin: stored.origin,
+      rp: stored.rp,
+      credential: {
+        id: row.id as string,
+        publicKey: publicKeyBytes,
+        counter: Number(row.counter ?? 0),
+        transports: proof.transports,
+      },
+    });
+
+    await user`
+      UPDATE credentials SET counter = ${authInfo.newCounter} WHERE id = ${row.id}
+    `;
+
+    return token.create(row.userAddress as string);
+  });
+
+  app.post('/email/start', async request => {
+    checkOrigin(request.headers.origin);
+    const body = emailStartBody.parse(request.body);
+    const email = body.email.toLowerCase();
+    return startEmailVerification(email, challenge.create);
+  });
+
+  app.post('/email/verify', async request => {
+    checkOrigin(request.headers.origin);
+    const body = emailVerifyBody.parse(request.body);
+    const stored = await challenge.consume<{
+      kind: string;
+      email: string;
+      codeHash: string;
+    }>(body.id);
+
+    if (stored.kind !== 'email' || digest(body.code) !== stored.codeHash) {
+      throw Object.assign(new Error('Invalid verification code.'), { statusCode: 401 });
+    }
+
+    const identityId = `email:${stored.email}`;
+    const key = derive(identityId);
+    const provisioned = await provision({
+      key,
+      identity: { id: identityId, provider: 'email' },
+    });
+
+    return token.create(provisioned.userAddress);
+  });
+
+  await app.register(oauthRoutes, { prefix: '/oauth' });
+
+  app.post('/link', async request => {
+    const account = await token.read(bearer(request.headers.authorization));
+    const body = linkAttachBody.parse(request.body);
+    const attached = await attachExternalWallet(account.userAddress, {
+      network: body.network,
+      address: body.address,
+    });
+    const staleKeys = [`profile:${account.userAddress.toLowerCase()}`];
+    if (account.name?.trim()) {
+      staleKeys.push(`profile:${account.name.trim().toLowerCase()}`);
+    }
+    await cacheDel(...staleKeys).catch(() => undefined);
+    return attached;
+  });
+
+  app.get('/links', async request => {
+    const account = await token.read(bearer(request.headers.authorization));
+    return listLinkedWallets(account.userAddress);
+  });
+}
