@@ -396,3 +396,187 @@ export async function exchange(
     avatar: body.data.profile_image_url ? String(body.data.profile_image_url) : null,
   };
 }
+
+async function finalizeResult(
+  specId: Provider,
+  mode: OAuthMode,
+  targetOrigin: string,
+  verified: VerifiedProviderAccount,
+): Promise<{ origin: string; payload: Record<string, unknown> }> {
+  if (mode === 'link') {
+    return {
+      origin: targetOrigin,
+      payload: {
+        type: 'oauth-link',
+        ok: true,
+        social: verified.social,
+      },
+    };
+  }
+
+  if (provider(specId).linkOnly) {
+    throw Object.assign(new Error(`${provider(specId).name} is only supported for profile linking.`), {
+      statusCode: 400,
+    });
+  }
+
+  const identityId = `${specId}:${verified.subject}`;
+  const key = derive(identityId);
+  const provisioned = await provision({
+    key,
+    identity: { id: identityId, provider: specId },
+  });
+  const auth = await token.create(provisioned.userAddress);
+  return {
+    origin: targetOrigin,
+    payload: {
+      type: 'oauth',
+      ok: true,
+      auth,
+    },
+  };
+}
+
+export async function complete(
+  id: string,
+  codeParam?: string,
+  stateParam?: string,
+  errorParam?: string,
+): Promise<{ origin: string; payload: Record<string, unknown> }> {
+  const spec = provider(id);
+  if (spec.id === 'telegram') {
+    throw Object.assign(new Error('Use Telegram verification endpoint.'), { statusCode: 400 });
+  }
+  if (!stateParam) {
+    throw Object.assign(new Error('Missing OAuth state parameter.'), { statusCode: 400 });
+  }
+  const stored = await challenge.consume<{
+    kind: string;
+    provider: Provider;
+    origin: string;
+    verifier: string;
+    mode?: OAuthMode;
+  }>(stateParam);
+
+  const eventType = stored.mode === 'link' ? 'oauth-link' : 'oauth';
+
+  if (stored.kind !== 'oauth' || stored.provider !== spec.id) {
+    return {
+      origin: stored.origin,
+      payload: {
+        type: eventType,
+        ok: false,
+        error: 'OAuth provider mismatch.',
+      },
+    };
+  }
+
+  if (errorParam || !codeParam) {
+    return {
+      origin: stored.origin,
+      payload: {
+        type: eventType,
+        ok: false,
+        error: errorParam || 'Authorization was cancelled.',
+      },
+    };
+  }
+
+  try {
+    const verified = await exchange(spec.id, codeParam, stored.verifier);
+    return finalizeResult(spec.id, stored.mode ?? 'auth', stored.origin, verified);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Verification failed.';
+    return {
+      origin: stored.origin,
+      payload: {
+        type: eventType,
+        ok: false,
+        error: message,
+      },
+    };
+  }
+}
+
+export async function completeTelegram(
+  stateParam?: string,
+  tgAuthResult?: string | Record<string, unknown>,
+): Promise<{ origin: string; payload: Record<string, unknown> }> {
+  const spec = provider('telegram');
+  const { clientSecret } = credentials(spec);
+  if (!stateParam) {
+    throw Object.assign(new Error('Missing OAuth state parameter.'), { statusCode: 400 });
+  }
+  const stored = await challenge.consume<{
+    kind: string;
+    provider: Provider;
+    origin: string;
+    verifier: string;
+    mode?: OAuthMode;
+  }>(stateParam);
+
+  const eventType = stored.mode === 'link' ? 'oauth-link' : 'oauth';
+
+  if (stored.kind !== 'oauth' || stored.provider !== 'telegram' || stored.mode !== 'link') {
+    return {
+      origin: stored.origin,
+      payload: {
+        type: eventType,
+        ok: false,
+        error:
+          stored.mode !== 'link'
+            ? 'Telegram is only supported for profile linking.'
+            : 'OAuth provider mismatch.',
+      },
+    };
+  }
+
+  let authData: Record<string, unknown> | null = null;
+  if (typeof tgAuthResult === 'string' && tgAuthResult.trim()) {
+    try {
+      const parsed = JSON.parse(
+        Buffer.from(tgAuthResult.trim(), 'base64url').toString('utf8'),
+      ) as unknown;
+      if (parsed && typeof parsed === 'object') {
+        authData = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return {
+        origin: stored.origin,
+        payload: {
+          type: eventType,
+          ok: false,
+          error: 'Malformed Telegram authorization data.',
+        },
+      };
+    }
+  } else if (tgAuthResult && typeof tgAuthResult === 'object') {
+    authData = tgAuthResult;
+  }
+
+  if (!authData) {
+    return {
+      origin: stored.origin,
+      payload: {
+        type: eventType,
+        ok: false,
+        error: 'Authorization was cancelled.',
+      },
+    };
+  }
+
+  try {
+    const verified = verifyTelegramAuthData(authData, clientSecret);
+    return finalizeResult('telegram', stored.mode ?? 'auth', stored.origin, verified);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Telegram verification failed.';
+    return {
+      origin: stored.origin,
+      payload: {
+        type: eventType,
+        ok: false,
+        error: message,
+      },
+    };
+  }
+}
