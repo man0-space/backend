@@ -1741,3 +1741,21 @@ export async function executeContractCall(
     logs: outcome.logs,
   };
 }
+
+export function deriveAgentWallet(
+  identitySeed: string,
+  timestamp: number,
+  targetNetwork: 'mainnet' | 'testnet' = config.network,
+): string {
+  const tsBuf = Buffer.alloc(8);
+  tsBuf.writeBigUInt64BE(BigInt(timestamp));
+  const seed = createHash('sha256')
+    .update(identitySeed.trim(), 'utf8')
+    .update(tsBuf)
+    .update(':agent:wallet', 'utf8')
+    .digest();
+  const ecdh = createECDH('prime256v1');
+  ecdh.setPrivateKey(seed);
+  const publicKey = Buffer.from(ecdh.getPublicKey(null, 'compressed'));
+  return address(initialization(codeFor(targetNetwork), state(publicKey)));
+}
