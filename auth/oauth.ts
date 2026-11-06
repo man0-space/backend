@@ -580,3 +580,59 @@ export async function completeTelegram(
     };
   }
 }
+
+export function html(targetOrigin: string, payload: Record<string, unknown>): string {
+  const serializedPayload = JSON.stringify(payload).replace(/</g, '\\u003c');
+  const serializedOrigin = JSON.stringify(targetOrigin);
+  return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Verify</title></head>
+<body style="background:#050505;color:#f5f5f7;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<p>Completing verification…</p>
+<script>
+(function(){
+  var payload = ${serializedPayload};
+  var targetOrigin = ${serializedOrigin};
+  if (window.opener && !window.opener.closed) {
+    window.opener.postMessage(payload, targetOrigin);
+  }
+  window.close();
+})();
+</script>
+</body>
+</html>`;
+}
+
+export function telegramCallbackHtml(state: string): string {
+  const safeState = JSON.stringify(state);
+  return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Telegram Verification</title></head>
+<body style="background:#050505;color:#f5f5f7;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<p id="status">Verifying Telegram account…</p>
+<script>
+(function(){
+  var state = ${safeState};
+  var hash = window.location.hash || "";
+  var match = hash.match(/[#?&]tgAuthResult=([A-Za-z0-9\\-_=]+)/);
+  var tgAuthResult = match ? match[1] : null;
+  fetch("/api/oauth/telegram/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ state: state, tgAuthResult: tgAuthResult })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (window.opener && !window.opener.closed && res && res.origin && res.payload) {
+        window.opener.postMessage(res.payload, res.origin);
+      }
+      window.close();
+    })
+    .catch(function(){
+      window.close();
+    });
+})();
+</script>
+</body>
+</html>`;
+}
