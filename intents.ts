@@ -604,3 +604,233 @@ export async function getLiveOneClickTokens(
   await discoverDynamicChains(tokens, network).catch(() => undefined);
   return tokens;
 }
+
+function encodeMulticallAggregate3(
+  calls: Array<{ target: string; allowFailure: boolean; callData: string }>,
+): string {
+  const headOffset = '0000000000000000000000000000000000000000000000000000000000000020';
+  const lenHex = calls.length.toString(16).padStart(64, '0');
+  const tupleOffsets: string[] = [];
+  const encodedTuples: string[] = [];
+  let currentOffset = calls.length * 32;
+  for (const call of calls) {
+    tupleOffsets.push(currentOffset.toString(16).padStart(64, '0'));
+    const cleanTarget = call.target.replace(/^0x/i, '').toLowerCase().padStart(64, '0');
+    const allow = (call.allowFailure ? '1' : '0').padStart(64, '0');
+    const dataOffset = (96).toString(16).padStart(64, '0');
+    const rawData = call.callData.replace(/^0x/i, '').toLowerCase();
+    const byteLen = rawData.length / 2;
+    const lenWord = byteLen.toString(16).padStart(64, '0');
+    const paddedData = rawData.padEnd(Math.ceil(rawData.length / 64) * 64, '0');
+    const tupleHex = cleanTarget + allow + dataOffset + lenWord + paddedData;
+    encodedTuples.push(tupleHex);
+    currentOffset += tupleHex.length / 2;
+  }
+  return '0x82ad56cb' + headOffset + lenHex + tupleOffsets.join('') + encodedTuples.join('');
+}
+
+function decodeMulticallAggregate3(
+  hexResult: string,
+): Array<{ success: boolean; dataHex: string }> {
+  const clean = hexResult.replace(/^0x/i, '');
+  if (clean.length < 128) return [];
+  const arrOffset = parseInt(clean.slice(0, 64), 16) * 2;
+  if (!Number.isFinite(arrOffset) || arrOffset + 64 > clean.length) return [];
+  const count = parseInt(clean.slice(arrOffset, arrOffset + 64), 16);
+  const elemBase = arrOffset + 64;
+  const results: Array<{ success: boolean; dataHex: string }> = [];
+  for (let i = 0; i < count; i++) {
+    const rel = parseInt(clean.slice(elemBase + i * 64, elemBase + (i + 1) * 64), 16) * 2;
+    const pos = elemBase + rel;
+    if (pos + 128 > clean.length) {
+      results.push({ success: false, dataHex: '' });
+      continue;
+    }
+    const success = parseInt(clean.slice(pos, pos + 64), 16) === 1;
+    const bytesRel = parseInt(clean.slice(pos + 64, pos + 128), 16) * 2;
+    const bytesPos = pos + bytesRel;
+    const byteLen = parseInt(clean.slice(bytesPos, bytesPos + 64), 16);
+    const dataHex = clean.slice(bytesPos + 64, bytesPos + 64 + byteLen * 2);
+    results.push({ success, dataHex });
+  }
+  return results;
+}
+
+async function readEvmBalancesViaRpc(
+  rpcUrl: string,
+  cleanWallet: string,
+  erc20Tokens: OneClickToken[],
+): Promise<{ nativeWei: bigint; erc20Balances: Map<string, bigint> } | null> {
+  const paddedAddr = cleanWallet.slice(2).padStart(64, '0');
+  const calls: Array<{ target: string; allowFailure: boolean; callData: string }> = [
+    {
+      target: MULTICALL3_ADDRESS,
+      allowFailure: true,
+      callData: '0x4d2301cc' + paddedAddr,
+    },
+    ...erc20Tokens.map(t => ({
+      target: t.contractAddress!,
+      allowFailure: true,
+      callData: '0x70a08231' + paddedAddr,
+    })),
+  ];
+
+  const multicallData = encodeMulticallAggregate3(calls);
+  const mcRes = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(3000),
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'eth_call',
+      params: [{ to: MULTICALL3_ADDRESS, data: multicallData }, 'latest'],
+    }),
+  }).catch(() => null);
+
+  if (mcRes?.ok) {
+    const mcJson = (await mcRes.json().catch(() => ({}))) as { result?: string };
+    if (typeof mcJson.result === 'string' && mcJson.result.length > 2 && mcJson.result !== '0x') {
+      const decoded = decodeMulticallAggregate3(mcJson.result);
+      if (decoded.length === calls.length) {
+        const nativeHex = decoded[0]?.success ? decoded[0].dataHex.slice(0, 64) : '';
+        const nativeWei =
+          nativeHex && /^[0-9a-fA-F]+$/.test(nativeHex) ? BigInt('0x' + nativeHex) : 0n;
+        const erc20Balances = new Map<string, bigint>();
+        for (let i = 0; i < erc20Tokens.length; i++) {
+          const item = decoded[i + 1];
+          const rawHex = item?.success ? item.dataHex.slice(0, 64) : '';
+          if (rawHex && /^[0-9a-fA-F]+$/.test(rawHex)) {
+            const bal = BigInt('0x' + rawHex);
+            if (bal > 0n) erc20Balances.set(erc20Tokens[i]!.assetId, bal);
+          }
+        }
+        return { nativeWei, erc20Balances };
+      }
+    }
+  }
+
+  const batchPayload = [
+    {
+      jsonrpc: '2.0',
+      id: 0,
+      method: 'eth_getBalance',
+      params: [cleanWallet, 'latest'],
+    },
+    ...erc20Tokens.map((t, idx) => ({
+      jsonrpc: '2.0',
+      id: idx + 1,
+      method: 'eth_call',
+      params: [{ to: t.contractAddress!, data: '0x70a08231' + paddedAddr }, 'latest'],
+    })),
+  ];
+
+  const batchRes = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(3500),
+    body: JSON.stringify(batchPayload),
+  }).catch(() => null);
+
+  if (!batchRes?.ok) return null;
+  const batchJson = (await batchRes.json().catch(() => null)) as Array<{
+    id?: number;
+    result?: string;
+  }> | null;
+  if (!Array.isArray(batchJson)) return null;
+
+  const byId = new Map<number, string>();
+  for (const item of batchJson) {
+    if (typeof item?.id === 'number' && typeof item.result === 'string') {
+      byId.set(item.id, item.result);
+    }
+  }
+
+  const rawNative = (byId.get(0) ?? '').replace(/^0x/i, '');
+  const nativeWei = rawNative && /^[0-9a-fA-F]+$/.test(rawNative) ? BigInt('0x' + rawNative) : 0n;
+  const erc20Balances = new Map<string, bigint>();
+  for (let i = 0; i < erc20Tokens.length; i++) {
+    const rawHex = (byId.get(i + 1) ?? '').replace(/^0x/i, '').slice(0, 64);
+    if (rawHex && /^[0-9a-fA-F]+$/.test(rawHex)) {
+      const bal = BigInt('0x' + rawHex);
+      if (bal > 0n) erc20Balances.set(erc20Tokens[i]!.assetId, bal);
+    }
+  }
+  return { nativeWei, erc20Balances };
+}
+
+async function scanEvmChainBalances(
+  chainMeta: DynamicChainMeta,
+  walletAddress: string,
+  chainTokens: OneClickToken[],
+): Promise<WalletHolding[]> {
+  if (chainTokens.length === 0 || chainMeta.rpcUrls.length === 0) return [];
+  const cleanWallet = walletAddress.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(cleanWallet)) return [];
+
+  const nativeToken = chainTokens.find(t => !t.contractAddress);
+  const erc20Tokens = chainTokens.filter(
+    t => t.contractAddress && /^0x[0-9a-fA-F]{40}$/.test(t.contractAddress),
+  );
+
+  let rpcData: { nativeWei: bigint; erc20Balances: Map<string, bigint> } | null = null;
+  for (const rpcUrl of chainMeta.rpcUrls.slice(0, 2)) {
+    rpcData = await readEvmBalancesViaRpc(rpcUrl, cleanWallet, erc20Tokens);
+    if (rpcData) break;
+  }
+  if (!rpcData) return [];
+
+  const hasNativeGas = rpcData.nativeWei >= 5_000_000_000_000n;
+  const holdings: WalletHolding[] = [];
+
+  if (nativeToken && rpcData.nativeWei > 0n) {
+    const formatted = atomicToDecimal(rpcData.nativeWei, nativeToken.decimals);
+    const usd =
+      formatted *
+      (nativeToken.price > 0
+        ? nativeToken.price
+        : STABLE_SYMBOLS.has(nativeToken.symbol.toUpperCase())
+          ? 1
+          : 0);
+    if (usd >= 0.01 || formatted > 0) {
+      holdings.push({
+        source: 'external',
+        walletNetwork: 'evm',
+        walletAddress: cleanWallet,
+        token: nativeToken,
+        chainLabel: chainMeta.label,
+        ...(chainMeta.hexChainId ? { hexChainId: chainMeta.hexChainId } : {}),
+        ...(chainMeta.explorerUrl ? { originExplorerUrl: chainMeta.explorerUrl } : {}),
+        balanceAtomic: rpcData.nativeWei.toString(),
+        balanceFormatted: formatted,
+        balanceUsd: usd,
+        hasNativeGas,
+      });
+    }
+  }
+
+  for (const tok of erc20Tokens) {
+    const bal = rpcData.erc20Balances.get(tok.assetId) ?? 0n;
+    if (bal <= 0n) continue;
+    const formatted = atomicToDecimal(bal, tok.decimals);
+    const usd =
+      formatted *
+      (tok.price > 0 ? tok.price : STABLE_SYMBOLS.has(tok.symbol.toUpperCase()) ? 1 : 0);
+    if (usd < 0.01 && formatted <= 0) continue;
+    holdings.push({
+      source: 'external',
+      walletNetwork: 'evm',
+      walletAddress: cleanWallet,
+      token: tok,
+      chainLabel: chainMeta.label,
+      ...(chainMeta.hexChainId ? { hexChainId: chainMeta.hexChainId } : {}),
+      ...(chainMeta.explorerUrl ? { originExplorerUrl: chainMeta.explorerUrl } : {}),
+      balanceAtomic: bal.toString(),
+      balanceFormatted: formatted,
+      balanceUsd: usd,
+      hasNativeGas,
+    });
+  }
+
+  return holdings;
+}
