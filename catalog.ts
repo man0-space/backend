@@ -389,3 +389,53 @@ async function fetchConnectorCatalog(): Promise<EntryItem[]> {
 
   return [...new Map(entries.map(item => [item.id, item])).values()];
 }
+
+async function fetchAgentCatalog(): Promise<EntryItem[]> {
+  const entries: EntryItem[] = [];
+  let cursor: string | undefined;
+
+  for (; ;) {
+    const page = await sdk.directory.agents.list(
+      { limit: PAGE_LIMIT, ...(cursor ? { cursor } : {}) },
+      { timeoutMs: 20000 },
+    );
+    const rows = Array.isArray(page.agents) ? page.agents : [];
+    for (const rawRow of rows) {
+      const row = rawRow as unknown as Record<string, unknown>;
+      const item = toEntry({
+        id: row.walletAddress,
+        name: row.name,
+        description: row.description,
+        kind: 'agent',
+        logo: row.avatarUrl,
+      });
+      if (item) entries.push(item);
+    }
+    const next = page.nextCursor ?? undefined;
+    if (!next) break;
+    if (next === cursor) throw new Error('The agent catalog cursor did not advance.');
+    cursor = next;
+  }
+
+  return [...new Map(entries.map(item => [item.id, item])).values()];
+}
+
+export async function catalog(value: string, forceRefresh = false): Promise<EntryItem[]> {
+  const role = kind.parse(value);
+  const cacheKey = `${CACHE_PREFIX}:${role}`;
+  if (forceRefresh) {
+    await cacheDel(cacheKey);
+  }
+  const items = await cached(cacheKey, 300, async () => {
+    if (role === 'model') return fetchModelCatalog();
+    if (role === 'connector') return fetchConnectorCatalog();
+    return fetchAgentCatalog();
+  });
+
+  if (role === 'connector' && !items.some(item => item.id === nearIntentsConnector.id)) {
+    return [nearIntentsConnector, ...items];
+  }
+  return items;
+}
+
+export { sdk };
