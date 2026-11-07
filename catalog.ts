@@ -296,3 +296,96 @@ async function fetchModelCatalog(): Promise<EntryItem[]> {
   const deduped = [...new Map(entries.map(item => [item.id, item])).values()];
   return sortModelEntries(deduped);
 }
+
+async function fetchConnectorCatalog(): Promise<EntryItem[]> {
+  const entries: EntryItem[] = [nearIntentsConnector];
+  const rootBody = await sdk.connectors.catalog({ limit: PAGE_LIMIT }, { timeoutMs: 20000 });
+
+  for (const row of rootBody.onchain?.connectors ?? []) {
+    if (!row.id) continue;
+    const cat = typeof row.category === 'string' ? row.category.trim().toLowerCase() : '';
+    const item = toEntry({
+      id: `onchain:${row.id}`,
+      name: row.name,
+      description: row.description,
+      kind: 'connector',
+      groups: ['onchain'],
+      subgroups: cat ? [`onchain/${cat}`] : undefined,
+    });
+    if (item) entries.push(item);
+  }
+
+  const pushToolkitRows = (rows: AccountToolkit[]) => {
+    for (const row of rows) {
+      if (!row.slug) continue;
+      const cats = Array.isArray(row.categories)
+        ? row.categories
+          .map(cat => (typeof cat === 'string' && cat.trim() ? `accounts/${cat.trim().toLowerCase()}` : ''))
+          .filter(Boolean)
+        : [];
+      const item = toEntry({
+        id: `account:${row.slug}`,
+        name: row.name,
+        description: row.description,
+        kind: 'connector',
+        groups: ['accounts'],
+        subgroups: cats.length > 0 ? cats : undefined,
+        logo: row.logo,
+      });
+      if (item) entries.push(item);
+    }
+  };
+
+  pushToolkitRows(rootBody.accounts?.toolkits ?? []);
+
+  const pushMcpRows = (rows: McpServerSummary[]) => {
+    for (const row of rows) {
+      if (!row.slug) continue;
+      const cat = typeof row.category === 'string' ? row.category.trim().toLowerCase() : '';
+      const item = toEntry({
+        id: row.slug,
+        name: row.name,
+        description: row.description ?? '',
+        kind: 'connector',
+        groups: ['mcps'],
+        subgroups: cat ? [`mcps/${cat}`] : undefined,
+        logo: row.iconUrl,
+      });
+      if (item) entries.push(item);
+    }
+  };
+
+  const firstMcps = rootBody.mcps?.servers ?? [];
+  if (!Array.isArray(rootBody.mcps?.servers)) {
+    throw Object.assign(new Error('Invalid connector catalog response.'), { statusCode: 502 });
+  }
+  pushMcpRows(firstMcps);
+
+  const mcpsTotal =
+    typeof rootBody.mcps.total === 'number' ? rootBody.mcps.total : firstMcps.length;
+  const stepSize = Math.max(1, rootBody.mcps.limit || firstMcps.length || PAGE_LIMIT);
+  const offsets: number[] = [];
+  if (firstMcps.length > 0 && firstMcps.length < mcpsTotal) {
+    for (let off = firstMcps.length; off < mcpsTotal; off += stepSize) {
+      offsets.push(off);
+    }
+  }
+
+  for (let i = 0; i < offsets.length; i += MCP_CONCURRENCY) {
+    const batch = offsets.slice(i, i + MCP_CONCURRENCY);
+    const pages = await Promise.all(
+      batch.map(async off => {
+        const page = await sdk.connectors.mcps.list(
+          { limit: stepSize, offset: off },
+          { timeoutMs: 20000 },
+        );
+        return Array.isArray(page.servers) ? page.servers : [];
+      }),
+    );
+    for (const rows of pages) {
+      pushMcpRows(rows);
+    }
+  }
+
+  return [...new Map(entries.map(item => [item.id, item])).values()];
+}
