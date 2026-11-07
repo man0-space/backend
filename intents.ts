@@ -834,3 +834,122 @@ async function scanEvmChainBalances(
 
   return holdings;
 }
+
+async function scanSolanaBalances(
+  chainMeta: DynamicChainMeta,
+  walletAddress: string,
+  solTokens: OneClickToken[],
+): Promise<WalletHolding[]> {
+  if (solTokens.length === 0 || chainMeta.rpcUrls.length === 0) return [];
+  const addr = walletAddress.trim();
+  if (!addr) return [];
+
+  const rpcFetch = async (method: string, params: unknown[]) => {
+    for (const rpcUrl of chainMeta.rpcUrls) {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        signal: AbortSignal.timeout(3500),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      }).catch(() => null);
+      if (res?.ok) {
+        const data = (await res.json().catch(() => ({}))) as { result?: unknown };
+        if (data.result !== undefined) return data.result;
+      }
+    }
+    return null;
+  };
+
+  const [nativeRes, splRes, spl2022Res] = await Promise.all([
+    rpcFetch('getBalance', [addr]).catch(() => null),
+    rpcFetch('getTokenAccountsByOwner', [
+      addr,
+      { programId: SPL_TOKEN_PROGRAM },
+      { encoding: 'jsonParsed' },
+    ]).catch(() => null),
+    rpcFetch('getTokenAccountsByOwner', [
+      addr,
+      { programId: SPL_TOKEN_2022_PROGRAM },
+      { encoding: 'jsonParsed' },
+    ]).catch(() => null),
+  ]);
+
+  const holdings: WalletHolding[] = [];
+  const nativeSolToken =
+    solTokens.find(t => !t.contractAddress && t.symbol.toUpperCase() === 'SOL') ??
+    solTokens.find(t => !t.contractAddress);
+
+  const lamports = BigInt((nativeRes as { value?: number } | null)?.value ?? 0);
+  const hasNativeGas = lamports >= 1_000_000n;
+
+  if (nativeSolToken && lamports > 0n) {
+    const formatted = atomicToDecimal(lamports, nativeSolToken.decimals);
+    holdings.push({
+      source: 'external',
+      walletNetwork: 'svm',
+      walletAddress: addr,
+      token: nativeSolToken,
+      chainLabel: chainMeta.label,
+      ...(chainMeta.explorerUrl ? { originExplorerUrl: chainMeta.explorerUrl } : {}),
+      balanceAtomic: lamports.toString(),
+      balanceFormatted: formatted,
+      balanceUsd: formatted * (nativeSolToken.price || 0),
+      hasNativeGas,
+    });
+  }
+
+  const byMint = new Map<string, OneClickToken>();
+  for (const t of solTokens) {
+    if (t.contractAddress) byMint.set(t.contractAddress, t);
+  }
+
+  const parsedAccounts = [
+    ...(((splRes as { value?: unknown[] } | null)?.value ?? []) as Array<{
+      account?: {
+        data?: {
+          parsed?: {
+            info?: { mint?: string; tokenAmount?: { amount?: string } };
+          };
+        };
+      };
+    }>),
+    ...(((spl2022Res as { value?: unknown[] } | null)?.value ?? []) as Array<{
+      account?: {
+        data?: {
+          parsed?: {
+            info?: { mint?: string; tokenAmount?: { amount?: string } };
+          };
+        };
+      };
+    }>),
+  ];
+
+  for (const entry of parsedAccounts) {
+    const info = entry.account?.data?.parsed?.info;
+    const mint = info?.mint;
+    const amountStr = info?.tokenAmount?.amount;
+    if (!mint || !amountStr || !/^\d+$/.test(amountStr)) continue;
+    const raw = BigInt(amountStr);
+    if (raw <= 0n) continue;
+    const tok = byMint.get(mint);
+    if (!tok) continue;
+    const formatted = atomicToDecimal(raw, tok.decimals);
+    const usd =
+      formatted *
+      (tok.price > 0 ? tok.price : STABLE_SYMBOLS.has(tok.symbol.toUpperCase()) ? 1 : 0);
+    holdings.push({
+      source: 'external',
+      walletNetwork: 'svm',
+      walletAddress: addr,
+      token: tok,
+      chainLabel: chainMeta.label,
+      ...(chainMeta.explorerUrl ? { originExplorerUrl: chainMeta.explorerUrl } : {}),
+      balanceAtomic: raw.toString(),
+      balanceFormatted: formatted,
+      balanceUsd: usd,
+      hasNativeGas,
+    });
+  }
+
+  return holdings;
+}
