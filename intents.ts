@@ -530,3 +530,77 @@ export async function discoverDynamicChains(
 
   return out;
 }
+
+export function formatChainLabel(blockchain: string): string {
+  const key = blockchain.toLowerCase();
+  const cachedMeta = latestChainCatalogByKey.get(key);
+  if (cachedMeta) return cachedMeta.label;
+  return humanizeChainKey(key);
+}
+
+function noFundedWalletError(): Error {
+  return Object.assign(new Error(NO_FUNDED_WALLET_MESSAGE), {
+    statusCode: 400,
+    code: NO_FUNDED_WALLET_CODE,
+  });
+}
+
+export function decimalToAtomic(amount: number, decimals: number): bigint {
+  if (!Number.isFinite(amount) || amount <= 0) return 0n;
+  const precision = Math.min(decimals, 12);
+  const fixed = amount.toFixed(precision);
+  const [whole, frac = ''] = fixed.split('.');
+  const padded = frac.padEnd(decimals, '0').slice(0, decimals);
+  return BigInt(whole || '0') * 10n ** BigInt(decimals) + BigInt(padded || '0');
+}
+
+export function atomicToDecimal(atomic: bigint, decimals: number): number {
+  if (atomic <= 0n) return 0;
+  const base = 10n ** BigInt(decimals);
+  const whole = Number(atomic / base);
+  const rem = Number(atomic % base) / Number(base);
+  return whole + rem;
+}
+
+export async function getLiveOneClickTokens(
+  network: 'mainnet' | 'testnet' = config.network,
+): Promise<OneClickToken[]> {
+  const base = configureOneClickBase(network);
+  const tokens = await cached<OneClickToken[]>(
+    `oneclick:tokens:v3:${network}:${base}`,
+    300,
+    async () => {
+      configureOneClickBase(network);
+      const raw = await OneClickService.getTokens();
+      if (!Array.isArray(raw)) return [];
+      return raw
+        .filter(
+          t =>
+            t &&
+            typeof t.assetId === 'string' &&
+            typeof t.blockchain === 'string' &&
+            typeof t.symbol === 'string' &&
+            !t.symbol.toUpperCase().includes('DEPRECATED'),
+        )
+        .map(t => {
+          const blockchain = String(t.blockchain).toLowerCase();
+          const crossChainAsset = normalizeCrossChainAsset({
+            assetId: t.assetId,
+            blockchain,
+            contractAddress: t.contractAddress,
+          });
+          return {
+            assetId: t.assetId,
+            decimals: Number(t.decimals) || 0,
+            blockchain,
+            symbol: t.symbol,
+            price: Number(t.price) || 0,
+            ...(t.contractAddress ? { contractAddress: t.contractAddress } : {}),
+            ...(crossChainAsset ? { crossChainAsset } : {}),
+          };
+        });
+    },
+  );
+  await discoverDynamicChains(tokens, network).catch(() => undefined);
+  return tokens;
+}
