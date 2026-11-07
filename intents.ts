@@ -953,3 +953,188 @@ async function scanSolanaBalances(
 
   return holdings;
 }
+
+async function scanIntentsMultiTokenBalances(input: {
+  nearRpc: string;
+  verifier: string;
+  intentsAccountId: string;
+  walletNetwork: 'evm' | 'svm' | 'near';
+  walletAddress: string;
+  tokens: OneClickToken[];
+  chainMap: Map<string, DynamicChainMeta>;
+}): Promise<WalletHolding[]> {
+  const out: WalletHolding[] = [];
+  const chunkSize = 100;
+  const batches: OneClickToken[][] = [];
+  for (let i = 0; i < input.tokens.length; i += chunkSize) {
+    batches.push(input.tokens.slice(i, i + chunkSize));
+  }
+
+  const batchResults = await Promise.all(
+    batches.map(batch =>
+      callViewFunction<string[]>(input.nearRpc, input.verifier, 'mt_batch_balance_of', {
+        account_id: input.intentsAccountId,
+        token_ids: batch.map(t => t.assetId),
+      }).catch(() => []),
+    ),
+  );
+
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b]!;
+    const balances = batchResults[b] ?? [];
+    if (!Array.isArray(balances)) continue;
+    for (let i = 0; i < batch.length; i++) {
+      const rawStr = balances[i];
+      if (!rawStr || !/^\d+$/.test(rawStr)) continue;
+      const raw = BigInt(rawStr);
+      if (raw <= 0n) continue;
+      const tok = batch[i]!;
+      const formatted = atomicToDecimal(raw, tok.decimals);
+      const usd =
+        formatted *
+        (tok.price > 0 ? tok.price : STABLE_SYMBOLS.has(tok.symbol.toUpperCase()) ? 1 : 0);
+      out.push({
+        source: 'intents',
+        walletNetwork: input.walletNetwork,
+        walletAddress: input.walletAddress,
+        intentsAccountId: input.intentsAccountId,
+        token: tok,
+        chainLabel: input.chainMap.get(tok.blockchain)?.label ?? formatChainLabel(tok.blockchain),
+        balanceAtomic: raw.toString(),
+        balanceFormatted: formatted,
+        balanceUsd: usd,
+        hasNativeGas: true,
+      });
+    }
+  }
+
+  return out;
+}
+
+export async function scanAllWalletHoldings(input: {
+  userAddress?: string;
+  externalWallets: ConnectedWalletInput[];
+  tokens: OneClickToken[];
+}): Promise<WalletHolding[]> {
+  const activeNet = config.network;
+  const nearRpc = rpcFor(activeNet);
+  const chainMap = await discoverDynamicChains(input.tokens, activeNet);
+  const intentsMeta = await discoverNearIntentsContracts(activeNet).catch(() => null);
+
+  const tasks: Array<Promise<WalletHolding[]>> = [];
+
+  const evmAddresses = [
+    ...new Set(
+      input.externalWallets
+        .filter(w => w.network === 'evm' && /^0x[0-9a-fA-F]{40}$/.test(w.address.trim()))
+        .map(w => w.address.trim().toLowerCase()),
+    ),
+  ];
+  const svmAddresses = [
+    ...new Set(
+      input.externalWallets
+        .filter(w => w.network === 'svm' && w.address.trim().length >= 32)
+        .map(w => w.address.trim()),
+    ),
+  ];
+
+  for (const evmAddr of evmAddresses) {
+    for (const [chainKey, chainMeta] of chainMap.entries()) {
+      if (chainMeta.walletFamily !== 'evm') continue;
+      const chainTokens = input.tokens.filter(t => t.blockchain === chainKey);
+      tasks.push(scanEvmChainBalances(chainMeta, evmAddr, chainTokens).catch(() => []));
+    }
+  }
+
+  for (const svmAddr of svmAddresses) {
+    for (const [chainKey, chainMeta] of chainMap.entries()) {
+      if (chainMeta.walletFamily !== 'svm') continue;
+      const solTokens = input.tokens.filter(t => t.blockchain === chainKey);
+      tasks.push(scanSolanaBalances(chainMeta, svmAddr, solTokens).catch(() => []));
+    }
+  }
+
+  if (input.userAddress) {
+    const canonicalUserAddr = input.userAddress;
+    tasks.push(
+      (async (): Promise<WalletHolding[]> => {
+        const rec = await ensureSpendingRecord(canonicalUserAddr).catch(() => null);
+        const activeNearAccount = rec?.activeMainAddress ?? canonicalUserAddr;
+        const nearMeta = chainMap.get('near');
+        const nearLabel = nearMeta?.label ?? formatChainLabel('near');
+        const out: WalletHolding[] = [];
+
+        const nearTokens = input.tokens.filter(t => t.blockchain === 'near');
+        const settlementUsdc = usdcFor(activeNet);
+        const ftChecks = await Promise.all(
+          nearTokens.map(async tok => {
+            const contractId =
+              tok.contractAddress?.trim() ||
+              (tok.assetId.startsWith('nep141:') ? tok.assetId.slice('nep141:'.length).trim() : '');
+            if (!contractId) return null;
+            const rawStr = await readFtBalanceWei(nearRpc, contractId, activeNearAccount);
+            let raw = BigInt(rawStr);
+            if (
+              activeNet === 'testnet' &&
+              intentsMeta?.intentsUsdcContract &&
+              intentsMeta.intentsUsdcContract !== settlementUsdc &&
+              contractId === intentsMeta.intentsUsdcContract
+            ) {
+              const circleRaw = BigInt(
+                await readFtBalanceWei(nearRpc, settlementUsdc, activeNearAccount),
+              );
+              if (circleRaw > 0n) {
+                const treasurySandboxRaw = BigInt(
+                  await readFtBalanceWei(nearRpc, contractId, treasuryFor('testnet')),
+                );
+                const bridged = circleRaw <= treasurySandboxRaw ? circleRaw : treasurySandboxRaw;
+                raw += bridged;
+              }
+            }
+            if (raw <= 0n) return null;
+            const formatted = atomicToDecimal(raw, tok.decimals);
+            const usd =
+              formatted *
+              (tok.price > 0 ? tok.price : STABLE_SYMBOLS.has(tok.symbol.toUpperCase()) ? 1 : 0);
+            return {
+              source: 'account' as const,
+              walletNetwork: 'near' as const,
+              walletAddress: activeNearAccount,
+              token: tok,
+              chainLabel: nearLabel,
+              ...(nearMeta?.explorerUrl ? { originExplorerUrl: nearMeta.explorerUrl } : {}),
+              balanceAtomic: raw.toString(),
+              balanceFormatted: formatted,
+              balanceUsd: usd,
+              hasNativeGas: true,
+            };
+          }),
+        );
+        for (const item of ftChecks) {
+          if (item) out.push(item);
+        }
+
+        if (intentsMeta?.verifier) {
+          const mtHoldings = await scanIntentsMultiTokenBalances({
+            nearRpc,
+            verifier: intentsMeta.verifier,
+            intentsAccountId: activeNearAccount,
+            walletNetwork: 'near',
+            walletAddress: activeNearAccount,
+            tokens: input.tokens,
+            chainMap,
+          });
+          out.push(...mtHoldings);
+        }
+
+        return out;
+      })().catch(() => []),
+    );
+  }
+
+  const settled = await Promise.all(tasks);
+  return settled
+    .flat()
+    .filter(h => BigInt(h.balanceAtomic) > 0n)
+    .sort((a, b) => b.balanceUsd - a.balanceUsd);
+}
