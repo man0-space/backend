@@ -293,3 +293,184 @@ export async function routes(app: FastifyInstance) {
     return listLinkedWallets(account.userAddress);
   });
 }
+
+const nearViewBody = z.object({
+  contractId: z.string().trim().min(1).max(128),
+  methodName: z.string().trim().min(1).max(128),
+  args: z.record(z.string(), z.unknown()).optional(),
+});
+
+const nearCallBody = z.object({
+  contractId: z.string().trim().min(1).max(128),
+  methodName: z.string().trim().min(1).max(128),
+  args: z.record(z.string(), z.unknown()).default({}),
+  deposit: z.string().regex(/^\d+$/).optional(),
+  gas: z.number().int().positive().max(300_000_000_000_000).optional(),
+});
+
+const spendingApproveBody = z.object({
+  amountWei: z.string().regex(/^[1-9]\d*$/, 'Enter a positive amount.'),
+});
+
+const spendingReclaimBody = z.object({
+  amountWei: z.string().regex(/^[1-9]\d*$/).optional(),
+});
+
+const intentsQuoteBody = z.object({
+  prompt: z.string().trim().min(1).max(2000),
+  dry: z.boolean().default(true),
+  connectedWallets: z
+    .array(
+      z.object({
+        network: z.enum(['evm', 'svm', 'near']),
+        address: z.string().trim().min(1).max(160),
+      }),
+    )
+    .max(20)
+    .optional(),
+});
+
+const intentsGenerateBody = z.object({
+  depositAddress: z.string().trim().min(1).max(256),
+});
+
+const intentsDepositBody = z.object({
+  txHash: z.string().trim().min(1).max(256),
+  depositAddress: z.string().trim().min(1).max(256),
+  nearSenderAccount: z.string().trim().min(1).max(160).optional(),
+  memo: z.string().trim().min(1).max(256).optional(),
+});
+
+const intentsStatusQuery = z.object({
+  depositAddress: z.string().trim().min(1).max(256),
+  depositMemo: z.string().trim().min(1).max(256).optional(),
+});
+
+const intentsSvmPrepareBody = z.object({
+  senderAddress: z.string().trim().min(32).max(64),
+  depositAddress: z.string().trim().min(32).max(64),
+  amountAtomic: z.string().regex(/^[1-9]\d*$/, 'Enter a positive amount.'),
+  tokenContract: z.string().trim().min(32).max(64).optional(),
+  decimals: z.number().int().min(0).max(18).optional(),
+  memo: z.string().trim().min(1).max(256).optional(),
+});
+
+const intentsSvmBroadcastBody = z.object({
+  signedTransactionBase64: z.string().trim().min(80).max(8192),
+  depositAddress: z.string().trim().min(32).max(64),
+  memo: z.string().trim().min(1).max(256).optional(),
+});
+
+export async function nearRoutes(app: FastifyInstance) {
+  app.get('/balance', async request => {
+    const account = await token.read(bearer(request.headers.authorization));
+    return getNearBalances(account.userAddress);
+  });
+
+  app.post('/intents/quote', async request => {
+    const account = await token.read(bearer(request.headers.authorization));
+    const body = intentsQuoteBody.parse(request.body);
+    return resolveUserIntentQuote({
+      userAddress: account.userAddress,
+      prompt: body.prompt,
+      dry: body.dry,
+      connectedWallets: body.connectedWallets,
+    });
+  });
+
+  app.post('/intents/generate', async request => {
+    const account = await token.authorize(bearer(request.headers.authorization));
+    const body = intentsGenerateBody.parse(request.body);
+    return generateUserIntent(account.userAddress, {
+      depositAddress: body.depositAddress,
+    });
+  });
+
+  app.post('/intents/deposit', async request => {
+    const account = await token.read(bearer(request.headers.authorization));
+    const body = intentsDepositBody.parse(request.body);
+    const submitted = await submitUserDepositTx({
+      txHash: body.txHash,
+      depositAddress: body.depositAddress,
+      nearSenderAccount: body.nearSenderAccount,
+      memo: body.memo,
+    });
+    await invalidateNearBalanceCache(account.userAddress);
+    return submitted;
+  });
+
+  app.post('/intents/svm-prepare', async request => {
+    await token.read(bearer(request.headers.authorization));
+    const body = intentsSvmPrepareBody.parse(request.body);
+    return prepareSolanaOriginTransfer({
+      senderAddress: body.senderAddress,
+      depositAddress: body.depositAddress,
+      amountAtomic: body.amountAtomic,
+      tokenContract: body.tokenContract,
+      decimals: body.decimals,
+      memo: body.memo,
+    });
+  });
+
+  app.post('/intents/svm-broadcast', async request => {
+    await token.read(bearer(request.headers.authorization));
+    const body = intentsSvmBroadcastBody.parse(request.body);
+    return broadcastSolanaOriginTransfer({
+      signedTransactionBase64: body.signedTransactionBase64,
+      depositAddress: body.depositAddress,
+      memo: body.memo,
+    });
+  });
+
+  app.get('/intents/status', async request => {
+    await token.read(bearer(request.headers.authorization));
+    const query = intentsStatusQuery.parse(request.query);
+    return getUserIntentStatus({
+      depositAddress: query.depositAddress,
+      depositMemo: query.depositMemo,
+    });
+  });
+
+  app.post('/deposit/ready', async request => {
+    const account = await token.authorize(bearer(request.headers.authorization));
+    return ensureDepositReady(account.userAddress);
+  });
+
+  app.post('/spending/approve', async request => {
+    const account = await token.authorize(bearer(request.headers.authorization));
+    const body = spendingApproveBody.parse(request.body);
+    return approveSpendingLimit(account.userAddress, {
+      amountWei: body.amountWei,
+    });
+  });
+
+  app.post('/spending/reclaim', async request => {
+    const account = await token.authorize(bearer(request.headers.authorization));
+    const body = spendingReclaimBody.parse(request.body ?? {});
+    return reclaimSpendingLimit(account.userAddress, {
+      amountWei: body.amountWei,
+    });
+  });
+
+  app.post('/view', async request => {
+    const body = nearViewBody.parse(request.body);
+    const result = await viewNearContract({
+      contractId: body.contractId,
+      methodName: body.methodName,
+      args: body.args,
+    });
+    return { result };
+  });
+
+  app.post('/execute', async request => {
+    const account = await token.authorize(bearer(request.headers.authorization));
+    const body = nearCallBody.parse(request.body);
+    return executeContractCall(account.userAddress, {
+      contractId: body.contractId,
+      methodName: body.methodName,
+      args: body.args,
+      deposit: body.deposit,
+      gas: body.gas,
+    });
+  });
+}
