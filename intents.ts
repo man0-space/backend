@@ -2058,3 +2058,70 @@ export async function getUserIntentStatus(input: {
   configureOneClickBase(config.network);
   return OneClickService.getExecutionStatus(input.depositAddress, input.depositMemo);
 }
+
+interface SolanaInstructionAccount {
+  pubkey: string;
+  isSigner: boolean;
+  isWritable: boolean;
+}
+
+interface SolanaRawInstruction {
+  programId: string;
+  accounts: SolanaInstructionAccount[];
+  data: Uint8Array;
+}
+
+function encodeCompactU16(len: number): Uint8Array {
+  if (len < 0x80) return Uint8Array.of(len);
+  if (len < 0x4000) return Uint8Array.of((len & 0x7f) | 0x80, len >> 7);
+  return Uint8Array.of((len & 0x7f) | 0x80, ((len >> 7) & 0x7f) | 0x80, len >> 14);
+}
+
+function decodeSolanaPubkey(addr: string, label: string): Uint8Array {
+  let bytes: Uint8Array;
+  try {
+    bytes = base58.decode(addr.trim());
+  } catch {
+    throw Object.assign(new Error(`Invalid Solana ${label} address.`), { statusCode: 400 });
+  }
+  if (bytes.length !== 32) {
+    throw Object.assign(new Error(`Invalid Solana ${label} address length.`), { statusCode: 400 });
+  }
+  return bytes;
+}
+
+function isEd25519OnCurve(bytes32: Uint8Array): boolean {
+  try {
+    ed25519.Point.fromBytes(bytes32, true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function deriveSolanaAssociatedTokenAddress(
+  ownerAddr: string,
+  mintAddr: string,
+  tokenProgramAddr: string = SPL_TOKEN_PROGRAM,
+): string {
+  const owner = decodeSolanaPubkey(ownerAddr, 'owner');
+  const mint = decodeSolanaPubkey(mintAddr, 'mint');
+  const tokenProg = decodeSolanaPubkey(tokenProgramAddr, 'token program');
+  const ataProg = decodeSolanaPubkey(SOLANA_ATA_PROGRAM, 'ATA program');
+  const marker = Buffer.from('ProgramDerivedAddress', 'utf8');
+
+  for (let bump = 255; bump >= 0; bump--) {
+    const h = createHash('sha256');
+    h.update(owner);
+    h.update(tokenProg);
+    h.update(mint);
+    h.update(Uint8Array.of(bump));
+    h.update(ataProg);
+    h.update(marker);
+    const candidate = new Uint8Array(h.digest());
+    if (!isEd25519OnCurve(candidate)) {
+      return base58.encode(candidate);
+    }
+  }
+  throw new Error('Failed to derive Solana Associated Token Account PDA.');
+}
