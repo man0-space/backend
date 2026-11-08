@@ -1984,3 +1984,77 @@ export async function resolveUserIntentQuote(input: {
     totalOutUsd,
   };
 }
+
+export async function generateUserIntent(
+  userAddress: string,
+  input: {
+    depositAddress: string;
+  },
+): Promise<{
+  mode: 'submitted';
+  intentHash: string;
+  correlationId: string;
+}> {
+  configureOneClickBase(config.network);
+  const rec = await ensureSpendingRecord(userAddress);
+  await ensureDepositReady(userAddress);
+  if (!derive(rec.seedId).equals(rec.ownerCompressedKey)) {
+    throw Object.assign(new Error('Account authorization mismatch.'), { statusCode: 401 });
+  }
+
+  const signerId = rec.activeMainAddress;
+  const generated = await OneClickService.generateIntent({
+    type: GenerateSwapTransferIntentRequest.type.SWAP_TRANSFER,
+    standard: IntentStandardEnum.WEBAUTHN,
+    signerId,
+    depositAddress: input.depositAddress,
+  });
+  const payload = String(generated.intent.payload);
+  const challenge32 = createHash('sha256').update(payload, 'utf8').digest();
+  const publicKey = intentsPublicKey('p256', rec.ownerCompressedKey);
+  const proof = signWebAuthnP256(
+    derivePrivate(rec.seedId),
+    challenge32,
+    'https://man0.space',
+    'man0.space',
+  );
+  const submitted = await OneClickService.submitIntent({
+    type: SubmitSwapTransferIntentRequest.type.SWAP_TRANSFER,
+    signedData: {
+      standard: 'webauthn' as MultiPayload.standard,
+      payload,
+      public_key: publicKey,
+      signature: proof.signature,
+      authenticator_data: proof.authenticator_data,
+      client_data_json: proof.client_data_json,
+    } as MultiPayload,
+  });
+  return {
+    mode: 'submitted',
+    intentHash: submitted.intentHash,
+    correlationId: submitted.correlationId,
+  };
+}
+
+export async function submitUserDepositTx(input: {
+  txHash: string;
+  depositAddress: string;
+  nearSenderAccount?: string;
+  memo?: string;
+}): Promise<SubmitDepositTxResponse> {
+  configureOneClickBase(config.network);
+  return OneClickService.submitDepositTx({
+    txHash: input.txHash,
+    depositAddress: input.depositAddress,
+    ...(input.nearSenderAccount ? { nearSenderAccount: input.nearSenderAccount } : {}),
+    ...(input.memo ? { memo: input.memo } : {}),
+  });
+}
+
+export async function getUserIntentStatus(input: {
+  depositAddress: string;
+  depositMemo?: string;
+}): Promise<GetExecutionStatusResponse> {
+  configureOneClickBase(config.network);
+  return OneClickService.getExecutionStatus(input.depositAddress, input.depositMemo);
+}
