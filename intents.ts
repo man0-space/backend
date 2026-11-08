@@ -2308,3 +2308,123 @@ export function encodeSolanaTransferTransaction(input: {
     transactionBase64: Buffer.from(wireBytes).toString('base64'),
   };
 }
+
+async function resolveSolanaChainMeta(
+  network: 'mainnet' | 'testnet' = config.network,
+): Promise<{ rpcUrls: string[]; explorerBase: string }> {
+  const tokens = await getLiveOneClickTokens(network).catch(() => []);
+  const chainMap =
+    tokens.length > 0 ? await discoverDynamicChains(tokens, network).catch(() => null) : null;
+  const solMeta = chainMap?.get('sol') ?? latestChainCatalogByKey.get('sol');
+  const customSolRpc = process.env.SOLANA_RPC_URL?.trim();
+  const fallbackRpcs = customSolRpc
+    ? [customSolRpc]
+    : network === 'testnet'
+      ? ['https://api.devnet.solana.com']
+      : ['https://solana-rpc.publicnode.com', 'https://api.mainnet-beta.solana.com'];
+  const rpcUrls = solMeta && solMeta.rpcUrls.length > 0 ? solMeta.rpcUrls : fallbackRpcs;
+  const explorerBase =
+    solMeta?.explorerUrl ||
+    (network === 'testnet'
+      ? 'https://explorer.solana.com?cluster=devnet'
+      : 'https://explorer.solana.com');
+  return { rpcUrls, explorerBase };
+}
+
+async function solanaRpcCall<T>(
+  rpcUrls: string[],
+  method: string,
+  params: unknown[],
+): Promise<T> {
+  let lastError = `Solana RPC ${method} failed.`;
+  for (const rpcUrl of rpcUrls) {
+    const res = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(8_000),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    }).catch(() => null);
+    if (!res?.ok) continue;
+    const json = (await res.json().catch(() => null)) as {
+      result?: T;
+      error?: { message?: string; data?: unknown };
+    } | null;
+    if (json?.error) {
+      lastError = json.error.message || lastError;
+      continue;
+    }
+    if (json && 'result' in json && json.result !== undefined) {
+      return json.result;
+    }
+  }
+  throw Object.assign(new Error(lastError), { statusCode: 502 });
+}
+
+export async function prepareSolanaOriginTransfer(input: {
+  senderAddress: string;
+  depositAddress: string;
+  amountAtomic: string;
+  tokenContract?: string;
+  decimals?: number;
+  memo?: string;
+  network?: 'mainnet' | 'testnet';
+}): Promise<{
+  messageBase58: string;
+  transactionBase64: string;
+  recentBlockhash: string;
+  lastValidBlockHeight: number;
+}> {
+  const activeNet = input.network ?? config.network;
+  const { rpcUrls } = await resolveSolanaChainMeta(activeNet);
+
+  const blockhashRes = await solanaRpcCall<{
+    value: { blockhash: string; lastValidBlockHeight: number };
+  }>(rpcUrls, 'getLatestBlockhash', [{ commitment: 'confirmed' }]);
+
+  const tokenContract = input.tokenContract?.trim();
+  let tokenProgramId = SPL_TOKEN_PROGRAM;
+  let decimals = input.decimals;
+  let destIsTokenAccount = false;
+
+  if (tokenContract) {
+    const accountsRes = await solanaRpcCall<{
+      value: Array<{ owner?: string; data?: [string, string] } | null>;
+    }>(rpcUrls, 'getMultipleAccounts', [
+      [tokenContract, input.depositAddress.trim()],
+      { encoding: 'base64', commitment: 'confirmed' },
+    ]);
+    const mintInfo = accountsRes.value?.[0];
+    const destInfo = accountsRes.value?.[1];
+    if (mintInfo?.owner === SPL_TOKEN_2022_PROGRAM) {
+      tokenProgramId = SPL_TOKEN_2022_PROGRAM;
+    }
+    if (decimals === undefined && mintInfo?.data?.[0]) {
+      const rawMint = Buffer.from(mintInfo.data[0], 'base64');
+      if (rawMint.length > 44) {
+        decimals = rawMint[44];
+      }
+    }
+    if (destInfo?.owner === tokenProgramId) {
+      destIsTokenAccount = true;
+    }
+  }
+
+  const encoded = encodeSolanaTransferTransaction({
+    senderAddress: input.senderAddress,
+    depositAddress: input.depositAddress,
+    amountAtomic: input.amountAtomic,
+    recentBlockhash: blockhashRes.value.blockhash,
+    tokenContract,
+    tokenProgramId,
+    decimals,
+    destIsTokenAccount,
+    memo: input.memo,
+  });
+
+  return {
+    messageBase58: encoded.messageBase58,
+    transactionBase64: encoded.transactionBase64,
+    recentBlockhash: blockhashRes.value.blockhash,
+    lastValidBlockHeight: blockhashRes.value.lastValidBlockHeight,
+  };
+}
