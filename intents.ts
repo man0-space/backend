@@ -1430,3 +1430,557 @@ async function quoteSingleLegWithRetry(input: {
     quote,
   };
 }
+
+export async function resolveUserIntentQuote(input: {
+  userAddress: string;
+  prompt: string;
+  dry: boolean;
+  network?: 'mainnet' | 'testnet';
+  connectedWallets?: ConnectedWalletInput[];
+  holdingsOverride?: WalletHolding[];
+  tokensOverride?: OneClickToken[];
+}): Promise<ResolvedIntentRoute> {
+  const activeNet = input.network ?? config.network;
+  const cleanPrompt = input.prompt.trim();
+  if (!cleanPrompt) {
+    throw Object.assign(new Error('Describe what you want to fund, swap, or withdraw.'), {
+      statusCode: 400,
+    });
+  }
+
+  const rec =
+    activeNet === config.network
+      ? await ensureSpendingRecord(input.userAddress).catch(() => null)
+      : null;
+  const depositAccountId = rec?.activeMainAddress ?? input.userAddress;
+
+  const linked = await listLinkedWallets(input.userAddress).catch(() => []);
+  const externalMap = new Map<string, ConnectedWalletInput>();
+  for (const item of linked) {
+    const key = `${item.network}:${item.address.toLowerCase()}`;
+    externalMap.set(key, { network: item.network, address: item.address });
+  }
+  for (const extra of input.connectedWallets ?? []) {
+    if (!extra?.address?.trim()) continue;
+    const key = `${extra.network}:${extra.address.trim().toLowerCase()}`;
+    if (!externalMap.has(key)) {
+      externalMap.set(key, { network: extra.network, address: extra.address.trim() });
+    }
+  }
+  const externalWallets = [...externalMap.values()];
+
+  const tokens = input.tokensOverride ?? (await getLiveOneClickTokens(activeNet));
+  const chainMap = await discoverDynamicChains(tokens, activeNet);
+
+  const preferredUsdcId = `nep141:${usdcFor(activeNet)}`;
+  const nearUsdcToken =
+    tokens.find(t => t.assetId === preferredUsdcId) ??
+    tokens.find(t => t.blockchain === 'near' && t.symbol.toUpperCase() === 'USDC');
+  if (!nearUsdcToken) {
+    throw Object.assign(new Error('NEAR USDC asset is unavailable in 1Click catalog.'), {
+      statusCode: 502,
+    });
+  }
+
+  const holdings =
+    input.holdingsOverride ??
+    (await scanAllWalletHoldings({
+      userAddress: input.userAddress,
+      externalWallets,
+      tokens,
+    }));
+
+  const lower = cleanPrompt.toLowerCase();
+  const isWithdraw = /\b(withdraw|cash\s*out|payout|transfer\s+out|move\s+out)\b/i.test(lower);
+  const splitArrow = cleanPrompt.split(/\s+(?:to|into|for)\s+|->|→/i);
+  const targetClause = splitArrow.length >= 2 ? splitArrow.slice(1).join(' ').trim() : '';
+  const targetIsSessionSelf =
+    !targetClause || /\b(my\s+session|session|my\s+account|account|balance|man0)\b/i.test(targetClause);
+
+  const action: 'deposit' | 'swap' | 'withdraw' = isWithdraw
+    ? 'withdraw'
+    : splitArrow.length >= 2 && !targetIsSessionSelf
+      ? 'swap'
+      : 'deposit';
+
+  const originSegment = splitArrow[0] ?? cleanPrompt;
+  const originChainHints = detectAllChainsInSegment(originSegment, tokens);
+  const originSymbolHint = detectSymbolInSegment(originSegment, tokens);
+  const parsedAmount = parsePromptAmount(originSegment, Boolean(originSymbolHint));
+
+  const allWalletAddresses = [
+    ...new Set([...externalWallets.map(w => w.address), depositAccountId]),
+  ];
+
+  if (action === 'withdraw') {
+    const withdrawable = holdings.filter(
+      h =>
+        (h.source === 'account' || h.source === 'intents') &&
+        h.token.assetId === nearUsdcToken.assetId,
+    );
+    const primaryHolding = withdrawable[0];
+    const availableAtomic = BigInt(primaryHolding?.balanceAtomic ?? '0');
+    const reqAtomic =
+      parsedAmount.mode === 'max'
+        ? availableAtomic
+        : decimalToAtomic(parsedAmount.value, nearUsdcToken.decimals);
+
+    if (!primaryHolding || availableAtomic < reqAtomic || reqAtomic <= 0n) {
+      const availUsd = atomicToDecimal(availableAtomic, nearUsdcToken.decimals).toFixed(2);
+      throw Object.assign(
+        new Error(`Insufficient available balance ($${availUsd}) for this withdrawal.`),
+        { statusCode: 400 },
+      );
+    }
+
+    const destSegment = targetClause || cleanPrompt;
+    const destChainHint = detectChainInSegment(destSegment, tokens);
+    const destSymbolHint = detectSymbolInSegment(destSegment, tokens);
+    const explicitRecipient = extractExplicitAddress(destSegment);
+
+    const externalHoldings = holdings.filter(h => h.source === 'external');
+    const fallbackFamily =
+      externalWallets.some(w => w.network === 'svm') && !externalWallets.some(w => w.network === 'evm')
+        ? 'svm'
+        : 'evm';
+    const fallbackChain = [...chainMap.values()].find(c => c.walletFamily === fallbackFamily)?.blockchain;
+
+    const inferredChain =
+      destChainHint ?? externalHoldings[0]?.token.blockchain ?? fallbackChain ?? tokens[0]!.blockchain;
+
+    const chainTokens = tokens.filter(t => t.blockchain === inferredChain);
+    const pickedDest =
+      selectPreferredTokenOnChain(chainTokens, destSymbolHint) ??
+      (destSymbolHint
+        ? tokens.find(t => t.symbol.toUpperCase() === destSymbolHint && t.blockchain !== 'near')
+        : undefined);
+    if (!pickedDest) {
+      throw Object.assign(
+        new Error(`No supported asset found on ${formatChainLabel(inferredChain)}.`),
+        { statusCode: 400 },
+      );
+    }
+
+    const destFamily = chainMap.get(pickedDest.blockchain)?.walletFamily ?? null;
+    const matchedExternal =
+      explicitRecipient ??
+      (destFamily === 'svm'
+        ? externalWallets.find(w => w.network === 'svm')?.address
+        : destFamily === 'evm'
+          ? externalWallets.find(w => w.network === 'evm')?.address
+          : null);
+
+    if (!matchedExternal) {
+      throw Object.assign(
+        new Error(
+          `Connect a ${formatChainLabel(pickedDest.blockchain)} wallet or include a recipient address in your request.`,
+        ),
+        { statusCode: 400 },
+      );
+    }
+
+    const destChainLabel = chainMap.get(pickedDest.blockchain)?.label ?? formatChainLabel(pickedDest.blockchain);
+    const leg = await quoteSingleLegWithRetry({
+      network: activeNet,
+      dry: input.dry,
+      holding: primaryHolding,
+      amountAtomic: reqAtomic,
+      destToken: pickedDest,
+      destChainLabel,
+      recipientAddress: matchedExternal,
+      connectedWallets: allWalletAddresses,
+    });
+
+    return {
+      action,
+      depositType: leg.depositType,
+      originToken: leg.originToken,
+      originChainLabel: leg.originChainLabel,
+      originWalletNetwork: leg.originWalletNetwork,
+      originWalletAddress: leg.originWalletAddress,
+      ...(leg.intentsAccountId ? { intentsAccountId: leg.intentsAccountId } : {}),
+      ...(leg.hexChainId ? { hexChainId: leg.hexChainId } : {}),
+      destinationToken: leg.destinationToken,
+      destinationChainLabel: leg.destinationChainLabel,
+      recipientAddress: leg.recipientAddress,
+      amountAtomic: leg.amountAtomic,
+      displayAmount: leg.displayAmount,
+      quote: leg.quote,
+      legs: [leg],
+      totalOutFormatted: leg.quote.amountOutFormatted,
+      totalOutUsd: leg.quote.amountOutUsd ?? leg.quote.amountOutFormatted,
+    };
+  }
+
+  let destToken: OneClickToken = nearUsdcToken;
+  let destChainLabel: string = chainMap.get('near')?.label ?? formatChainLabel('near');
+  let recipientAddress: string = depositAccountId;
+
+  if (action === 'swap') {
+    const destChainHint = detectChainInSegment(targetClause, tokens);
+    const destSymbolHint = detectSymbolInSegment(targetClause, tokens);
+    const explicitRecipient = extractExplicitAddress(targetClause);
+
+    let pickedDest: OneClickToken | undefined;
+    if (destChainHint) {
+      const chainTokens = tokens.filter(t => t.blockchain === destChainHint);
+      pickedDest = selectPreferredTokenOnChain(chainTokens, destSymbolHint);
+    } else if (destSymbolHint) {
+      pickedDest =
+        tokens.find(
+          t =>
+            t.symbol.toUpperCase() === destSymbolHint &&
+            (chainMap.get(t.blockchain)?.walletFamily ?? null) !== null,
+        ) ?? tokens.find(t => t.symbol.toUpperCase() === destSymbolHint);
+    }
+
+    pickedDest = pickedDest ?? nearUsdcToken;
+    const destFamily = chainMap.get(pickedDest.blockchain)?.walletFamily ?? null;
+    const matchedRecipient =
+      explicitRecipient ??
+      (destFamily === 'near'
+        ? depositAccountId
+        : destFamily === 'svm'
+          ? externalWallets.find(w => w.network === 'svm')?.address
+          : destFamily === 'evm'
+            ? externalWallets.find(w => w.network === 'evm')?.address
+            : null);
+
+    if (!matchedRecipient) {
+      throw Object.assign(
+        new Error(
+          `Include a ${formatChainLabel(pickedDest.blockchain)} destination address or connect a matching wallet.`,
+        ),
+        { statusCode: 400 },
+      );
+    }
+
+    destToken = pickedDest;
+    destChainLabel = chainMap.get(pickedDest.blockchain)?.label ?? formatChainLabel(pickedDest.blockchain);
+    recipientAddress = matchedRecipient;
+  }
+
+  const smartAccountHoldings = holdings.filter(
+    h => h.source === 'account' || h.source === 'intents',
+  );
+  const hasExplicitExternalOrigin =
+    originChainHints.some(ch => ch !== 'near') ||
+    Boolean(
+      originSymbolHint &&
+        !smartAccountHoldings.some(h => h.token.symbol.toUpperCase() === originSymbolHint),
+    );
+  const restrictToSmartAccount = action === 'swap' && !hasExplicitExternalOrigin;
+
+  const candidatePool = holdings.filter(h => {
+    if (restrictToSmartAccount && h.source !== 'account' && h.source !== 'intents') {
+      return false;
+    }
+    if (h.token.assetId === destToken.assetId && h.source === 'account') {
+      return false;
+    }
+    if (h.source === 'external' && Boolean(h.token.contractAddress) && h.hasNativeGas === false) {
+      return false;
+    }
+    return true;
+  });
+
+  if (candidatePool.length === 0) {
+    if (restrictToSmartAccount) {
+      throw Object.assign(
+        new Error(
+          'Your Smart Account has no available balance for this swap. Deposit funds first or specify an external origin chain.',
+        ),
+        { statusCode: 400 },
+      );
+    }
+    throw noFundedWalletError();
+  }
+
+  let filtered = candidatePool;
+  if (
+    originChainHints.length === 1 &&
+    originSymbolHint &&
+    originChainHints[0] === originSymbolHint.toLowerCase()
+  ) {
+    const bySymbolOrChain = candidatePool.filter(
+      h =>
+        h.token.symbol.toUpperCase() === originSymbolHint ||
+        h.token.blockchain === originChainHints[0],
+    );
+    if (bySymbolOrChain.length > 0) filtered = bySymbolOrChain;
+  } else {
+    if (originChainHints.length > 0) {
+      const hintSet = new Set(originChainHints);
+      const byChain = filtered.filter(h => hintSet.has(h.token.blockchain));
+      if (byChain.length > 0) {
+        filtered = byChain;
+      } else {
+        throw Object.assign(
+          new Error(
+            `No funded balance found on ${originChainHints.map(formatChainLabel).join(' or ')} in your connected wallets.`,
+          ),
+          { statusCode: 400 },
+        );
+      }
+    }
+    if (originSymbolHint) {
+      const bySym = filtered.filter(h => h.token.symbol.toUpperCase() === originSymbolHint);
+      if (bySym.length > 0) {
+        filtered = bySym;
+      } else {
+        throw Object.assign(
+          new Error(`No funded ${originSymbolHint} balance found in your connected wallets.`),
+          { statusCode: 400 },
+        );
+      }
+    }
+  }
+
+  const sourcePriority = (s: WalletHolding['source']): number =>
+    s === 'intents' ? 0 : s === 'account' ? 1 : 2;
+
+  const sortedCandidates = [...filtered]
+    .map(h => {
+      const spendable = maxSpendableAtomic(h, chainMap.get(h.token.blockchain));
+      const spendableUsd =
+        atomicToDecimal(spendable, h.token.decimals) * effectiveTokenUsdPrice(h.token);
+      return {
+        holding: h,
+        spendable,
+        spendableUsd,
+      };
+    })
+    .filter(x => x.spendable > 0n)
+    .sort((a, b) => {
+      const pDiff = sourcePriority(a.holding.source) - sourcePriority(b.holding.source);
+      if (pDiff !== 0) return pDiff;
+      if (!originSymbolHint) {
+        const aStable = STABLE_SYMBOLS.has(a.holding.token.symbol.toUpperCase()) ? 1 : 0;
+        const bStable = STABLE_SYMBOLS.has(b.holding.token.symbol.toUpperCase()) ? 1 : 0;
+        if (aStable !== bStable) return bStable - aStable;
+      }
+      if (Math.abs(b.spendableUsd - a.spendableUsd) > 1e-6) {
+        return b.spendableUsd - a.spendableUsd;
+      }
+      return b.holding.balanceUsd - a.holding.balanceUsd;
+    });
+
+  if (sortedCandidates.length === 0) {
+    throw noFundedWalletError();
+  }
+
+  if (!input.dry && recipientAddress === depositAccountId) {
+    await ensureDepositReady(input.userAddress);
+  }
+
+  const legs: ResolvedIntentLeg[] = [];
+  let lastQuoteError: unknown = null;
+
+  if (parsedAmount.mode === 'max') {
+    for (const cand of sortedCandidates.slice(0, 6)) {
+      try {
+        const leg = await quoteSingleLegWithRetry({
+          network: activeNet,
+          dry: input.dry,
+          holding: cand.holding,
+          amountAtomic: cand.spendable,
+          destToken,
+          destChainLabel,
+          recipientAddress,
+          connectedWallets: allWalletAddresses,
+        });
+        legs.push(leg);
+      } catch (err) {
+        lastQuoteError = err;
+      }
+    }
+    if (legs.length === 0) {
+      throw lastQuoteError ?? Object.assign(new Error('NEAR Intents quote failed.'), { statusCode: 400 });
+    }
+  } else if (parsedAmount.mode === 'token') {
+    const singleTokenCandidates =
+      originChainHints.length < 2
+        ? sortedCandidates.filter(
+            c => c.spendable >= decimalToAtomic(parsedAmount.value * 0.98, c.holding.token.decimals),
+          )
+        : [];
+    const orderedTokenCandidates =
+      singleTokenCandidates.length > 0
+        ? [
+            ...singleTokenCandidates,
+            ...sortedCandidates.filter(c => !singleTokenCandidates.includes(c)),
+          ]
+        : sortedCandidates;
+
+    let remainingTokens = parsedAmount.value;
+    for (const cand of orderedTokenCandidates) {
+      if (remainingTokens <= 1e-9 || legs.length >= 6) break;
+      const desiredAtomic = decimalToAtomic(remainingTokens, cand.holding.token.decimals);
+      const takeAtomic = desiredAtomic <= cand.spendable ? desiredAtomic : cand.spendable;
+      if (takeAtomic <= 0n) continue;
+      try {
+        const leg = await quoteSingleLegWithRetry({
+          network: activeNet,
+          dry: input.dry,
+          holding: cand.holding,
+          amountAtomic: takeAtomic,
+          destToken,
+          destChainLabel,
+          recipientAddress,
+          connectedWallets: allWalletAddresses,
+        });
+        legs.push(leg);
+        remainingTokens -= atomicToDecimal(BigInt(leg.amountAtomic), leg.originToken.decimals);
+      } catch (err) {
+        lastQuoteError = err;
+      }
+    }
+    if (legs.length === 0 && lastQuoteError) {
+      throw lastQuoteError;
+    }
+    if (remainingTokens > parsedAmount.value * 0.02) {
+      const best = sortedCandidates[0]!.holding;
+      throw Object.assign(
+        new Error(
+          `Insufficient funded balance: highest spendable balance is ${best.balanceFormatted.toFixed(
+            Math.min(4, best.token.decimals),
+          )} ${best.token.symbol} (~$${sortedCandidates[0]!.spendableUsd.toFixed(2)}) on ${best.chainLabel}.`,
+        ),
+        { statusCode: 400 },
+      );
+    }
+  } else {
+    const totalSpendableUsd = sortedCandidates.reduce((acc, c) => acc + c.spendableUsd, 0);
+    if (totalSpendableUsd < parsedAmount.value * 0.95) {
+      const best = sortedCandidates[0]!;
+      throw Object.assign(
+        new Error(
+          restrictToSmartAccount
+            ? `Insufficient Smart Account balance for this swap (~$${totalSpendableUsd.toFixed(2)} available). Deposit funds first or swap a smaller amount.`
+            : `Insufficient spendable balance: ~$${totalSpendableUsd.toFixed(2)} available across connected wallets (highest: ${best.holding.balanceFormatted.toFixed(
+                Math.min(4, best.holding.token.decimals),
+              )} ${best.holding.token.symbol} / ~$${best.spendableUsd.toFixed(2)} spendable on ${best.holding.chainLabel}).`,
+        ),
+        { statusCode: 400 },
+      );
+    }
+
+    const explicitMultiChainCount = originChainHints.length >= 2 ? originChainHints.length : 1;
+    const perChainCapUsd =
+      explicitMultiChainCount >= 2 ? parsedAmount.value / explicitMultiChainCount : Infinity;
+    const singleUsdCandidates =
+      explicitMultiChainCount === 1
+        ? sortedCandidates.filter(c => c.spendableUsd >= parsedAmount.value * 0.98)
+        : [];
+    const orderedUsdCandidates =
+      singleUsdCandidates.length > 0
+        ? [
+            ...singleUsdCandidates,
+            ...sortedCandidates.filter(c => !singleUsdCandidates.includes(c)),
+          ]
+        : sortedCandidates;
+
+    const usedChains = new Set<string>();
+    let remainingUsd = parsedAmount.value;
+
+    for (const cand of orderedUsdCandidates) {
+      if (remainingUsd <= 0.01 || legs.length >= 6) break;
+      if (explicitMultiChainCount >= 2 && usedChains.has(cand.holding.token.blockchain)) {
+        continue;
+      }
+      const price = effectiveTokenUsdPrice(cand.holding.token);
+      const legTargetUsd = Math.min(remainingUsd, perChainCapUsd);
+      const desiredAtomic = decimalToAtomic(legTargetUsd / price, cand.holding.token.decimals);
+      const takeAtomic = desiredAtomic <= cand.spendable ? desiredAtomic : cand.spendable;
+      if (takeAtomic <= 0n) continue;
+      try {
+        const leg = await quoteSingleLegWithRetry({
+          network: activeNet,
+          dry: input.dry,
+          holding: cand.holding,
+          amountAtomic: takeAtomic,
+          destToken,
+          destChainLabel,
+          recipientAddress,
+          connectedWallets: allWalletAddresses,
+        });
+        legs.push(leg);
+        usedChains.add(cand.holding.token.blockchain);
+        const outUsd = Number(leg.quote.amountOutUsd || leg.quote.amountOutFormatted || 0);
+        const inUsd = atomicToDecimal(BigInt(leg.amountAtomic), leg.originToken.decimals) * price;
+        // If we selected a single-leg candidate covering the full requested input USD, treat slight DEX slippage (<10%) as satisfied so it never spills a tiny dust remainder onto a second wallet
+        if (
+          explicitMultiChainCount === 1 &&
+          legs.length === 1 &&
+          takeAtomic === desiredAtomic &&
+          inUsd >= parsedAmount.value * 0.98
+        ) {
+          remainingUsd = 0;
+          break;
+        }
+        remainingUsd -= outUsd > 0 ? outUsd : inUsd;
+      } catch (err) {
+        lastQuoteError = err;
+      }
+    }
+
+    if (legs.length === 0 && lastQuoteError) {
+      throw lastQuoteError;
+    }
+    if (remainingUsd > Math.max(0.05, parsedAmount.value * 0.05)) {
+      const totalSpendableUsd = sortedCandidates.reduce((acc, c) => acc + c.spendableUsd, 0);
+      const best = sortedCandidates[0]!;
+      throw Object.assign(
+        new Error(
+          restrictToSmartAccount
+            ? `Insufficient Smart Account balance for this swap (~$${totalSpendableUsd.toFixed(2)} available). Deposit funds first or swap a smaller amount.`
+            : `Insufficient spendable balance: ~$${totalSpendableUsd.toFixed(2)} available across connected wallets (highest: ${best.holding.balanceFormatted.toFixed(
+                Math.min(4, best.holding.token.decimals),
+              )} ${best.holding.token.symbol} / ~$${best.spendableUsd.toFixed(2)} spendable on ${best.holding.chainLabel}).`,
+        ),
+        { statusCode: 400 },
+      );
+    }
+  }
+
+  const primary = legs[0]!;
+  const totalOutAtomic = legs.reduce((acc, l) => acc + BigInt(l.quote.amountOut || '0'), 0n);
+  const totalOutFormatted = atomicToDecimal(totalOutAtomic, destToken.decimals).toFixed(
+    Math.min(6, destToken.decimals),
+  );
+  const totalOutUsd = legs
+    .reduce((acc, l) => acc + Number(l.quote.amountOutUsd || l.quote.amountOutFormatted || 0), 0)
+    .toFixed(2);
+  const combinedDisplay =
+    legs.length === 1
+      ? primary.displayAmount
+      : legs.map(l => `${l.displayAmount} (${l.originChainLabel})`).join(' + ');
+
+  return {
+    action,
+    depositType: primary.depositType,
+    originToken: primary.originToken,
+    originChainLabel:
+      legs.length === 1
+        ? primary.originChainLabel
+        : legs.map(l => l.originChainLabel).join(' + '),
+    originWalletNetwork: primary.originWalletNetwork,
+    originWalletAddress: primary.originWalletAddress,
+    ...(primary.intentsAccountId ? { intentsAccountId: primary.intentsAccountId } : {}),
+    ...(primary.hexChainId ? { hexChainId: primary.hexChainId } : {}),
+    destinationToken: destToken,
+    destinationChainLabel: destChainLabel,
+    recipientAddress,
+    amountAtomic: primary.amountAtomic,
+    displayAmount: combinedDisplay,
+    quote: {
+      ...primary.quote,
+      amountOut: totalOutAtomic.toString(),
+      amountOutFormatted: Number(totalOutFormatted).toString(),
+      amountOutUsd: totalOutUsd,
+    },
+    legs,
+    totalOutFormatted: Number(totalOutFormatted).toString(),
+    totalOutUsd,
+  };
+}
