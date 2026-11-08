@@ -203,3 +203,59 @@ export function computeWorkflowServiceFees(
     totalChargedWei,
   };
 }
+
+export function usdcToWei(usdc: string | number): string {
+  const str = typeof usdc === 'number' ? usdc.toFixed(6) : usdc.trim();
+  if (!/^\d+(\.\d{1,6})?$/.test(str)) {
+    throw new Error(`Invalid USDC amount: ${usdc}`);
+  }
+  const [whole, fraction = ''] = str.split('.');
+  const paddedFraction = fraction.padEnd(6, '0').slice(0, 6);
+  return (BigInt(whole) * 1_000_000n + BigInt(paddedFraction)).toString();
+}
+
+export function weiToUsdc(amountWei: bigint | string): string {
+  const value = typeof amountWei === 'bigint' ? amountWei : BigInt(amountWei || '0');
+  const whole = value / 1_000_000n;
+  const fraction = (value % 1_000_000n).toString().padStart(6, '0');
+  return `${whole}.${fraction}`;
+}
+
+export function extractSessionToken(request: FastifyRequest): string | null {
+  const explicitKey = request.headers['x-compose-key'];
+  if (typeof explicitKey === 'string') {
+    const trimmed = explicitKey.trim().replace(/^Bearer\s+/i, '');
+    if (trimmed.startsWith('compose-')) return trimmed;
+  }
+  const auth = request.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return null;
+  const raw = auth.slice(7).trim();
+  return raw.startsWith('compose-') ? raw : null;
+}
+
+export function extractPaymentSignature(request: FastifyRequest): string | null {
+  const raw =
+    (request.headers['payment-signature'] as string | undefined) ??
+    (request.headers['x-payment'] as string | undefined);
+  return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : null;
+}
+
+export function parseComposeToken(
+  token: string,
+): { sub?: string; keyId?: string; exp?: number; network?: string } | null {
+  if (!token.startsWith('compose-')) return null;
+  const jwt = token.slice('compose-'.length);
+  const parts = jwt.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const decoded = Buffer.from(parts[1]!, 'base64url').toString('utf8');
+    return JSON.parse(decoded) as {
+      sub?: string;
+      keyId?: string;
+      exp?: number;
+      network?: string;
+    };
+  } catch {
+    return null;
+  }
+}
