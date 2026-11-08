@@ -1301,3 +1301,132 @@ function parsePromptAmount(
   }
   return { mode: hasExplicitSymbol ? 'token' : 'usd', value: v };
 }
+
+function formatLegDisplayAmount(amountAtomic: bigint, token: OneClickToken): string {
+  const humanIn = atomicToDecimal(amountAtomic, token.decimals);
+  return token.symbol.toUpperCase() === 'USDC'
+    ? `$${humanIn.toFixed(2)}`
+    : `${Number(humanIn.toFixed(Math.min(6, token.decimals)))} ${token.symbol}`;
+}
+
+function extractBridgeCapAtomicFromError(err: unknown, decimals: number): bigint | null {
+  if (!(err instanceof ApiError)) return null;
+  const body = err.body as { capWei?: string; capAtomic?: string; message?: string } | undefined;
+  const direct = body?.capWei ?? body?.capAtomic;
+  if (typeof direct === 'string' && /^\d+$/.test(direct) && BigInt(direct) > 0n) {
+    return BigInt(direct);
+  }
+  const msg = typeof body?.message === 'string' ? body.message : err.message;
+  const parenUnits = msg.match(/\((\d{4,})\s*[a-zA-Z]*\)/);
+  if (parenUnits?.[1]) {
+    const v = BigInt(parenUnits[1]);
+    if (v > 0n) return v;
+  }
+  const cappedDec = msg.match(/capped\s+at\s+(\d+(?:\.\d+)?)/i);
+  if (cappedDec?.[1]) {
+    const v = decimalToAtomic(Number(cappedDec[1]), decimals);
+    if (v > 0n) return v;
+  }
+  return null;
+}
+
+async function quoteSingleLegWithRetry(input: {
+  network?: 'mainnet' | 'testnet';
+  dry: boolean;
+  holding: WalletHolding;
+  amountAtomic: bigint;
+  destToken: OneClickToken;
+  destChainLabel: string;
+  recipientAddress: string;
+  connectedWallets: string[];
+}): Promise<ResolvedIntentLeg> {
+  configureOneClickBase(input.network ?? config.network);
+  const isIntentsDeposit = input.holding.source === 'intents' && Boolean(input.holding.intentsAccountId);
+  const depositType = isIntentsDeposit
+    ? QuoteRequest.depositType.INTENTS
+    : QuoteRequest.depositType.ORIGIN_CHAIN;
+  const refundType = isIntentsDeposit
+    ? QuoteRequest.refundType.INTENTS
+    : QuoteRequest.refundType.ORIGIN_CHAIN;
+  const refundTo = isIntentsDeposit
+    ? input.holding.intentsAccountId!
+    : input.holding.walletAddress;
+
+  const tryQuote = async (
+    amt: bigint,
+    depositMode: QuoteRequest.depositMode,
+  ): Promise<OneClickQuotePayload['quote']> => {
+    const res = await OneClickService.getQuote({
+      dry: input.dry,
+      swapType: QuoteRequest.swapType.EXACT_INPUT,
+      ...(depositType === QuoteRequest.depositType.ORIGIN_CHAIN ? { depositMode } : {}),
+      slippageTolerance: 100,
+      originAsset: input.holding.token.assetId,
+      depositType,
+      destinationAsset: input.destToken.assetId,
+      recipientType: QuoteRequest.recipientType.DESTINATION_CHAIN,
+      refundType,
+      amount: amt.toString(),
+      refundTo,
+      recipient: input.recipientAddress,
+      connectedWallets: input.connectedWallets,
+      referral: 'man0',
+      deadline: new Date(Date.now() + 30 * 60_000).toISOString(),
+    });
+    return {
+      ...res.quote,
+      depositMemo: res.quote.depositMemo ?? null,
+    };
+  };
+
+  let finalAmount = input.amountAtomic;
+  let initialMode =
+    input.holding.token.blockchain === 'stellar' || input.holding.token.blockchain === 'xrp'
+      ? QuoteRequest.depositMode.MEMO
+      : QuoteRequest.depositMode.SIMPLE;
+
+  let quote: OneClickQuotePayload['quote'];
+  try {
+    quote = await tryQuote(finalAmount, initialMode);
+  } catch (err) {
+    const errMsg =
+      err instanceof ApiError
+        ? ((err.body as { message?: string } | undefined)?.message ?? err.message)
+        : err instanceof Error
+          ? err.message
+          : String(err);
+
+    if (/memo/i.test(errMsg) && initialMode === QuoteRequest.depositMode.SIMPLE) {
+      initialMode = QuoteRequest.depositMode.MEMO;
+      quote = await tryQuote(finalAmount, initialMode);
+    } else {
+      const capAtomic = extractBridgeCapAtomicFromError(err, input.holding.token.decimals);
+      if (capAtomic && capAtomic < finalAmount) {
+        finalAmount = capAtomic;
+        quote = await tryQuote(finalAmount, initialMode);
+      } else {
+        throw Object.assign(new Error(errMsg || 'NEAR Intents quote failed.'), {
+          statusCode: 400,
+        });
+      }
+    }
+  }
+
+  return {
+    source: input.holding.source,
+    depositType: isIntentsDeposit ? 'INTENTS' : 'ORIGIN_CHAIN',
+    originToken: input.holding.token,
+    originChainLabel: input.holding.chainLabel,
+    originWalletNetwork: input.holding.walletNetwork,
+    originWalletAddress: input.holding.walletAddress,
+    ...(input.holding.intentsAccountId ? { intentsAccountId: input.holding.intentsAccountId } : {}),
+    ...(input.holding.hexChainId ? { hexChainId: input.holding.hexChainId } : {}),
+    ...(input.holding.originExplorerUrl ? { originExplorerUrl: input.holding.originExplorerUrl } : {}),
+    destinationToken: input.destToken,
+    destinationChainLabel: input.destChainLabel,
+    recipientAddress: input.recipientAddress,
+    amountAtomic: finalAmount.toString(),
+    displayAmount: formatLegDisplayAmount(finalAmount, input.holding.token),
+    quote,
+  };
+}
