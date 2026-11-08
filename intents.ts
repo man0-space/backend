@@ -2125,3 +2125,186 @@ export function deriveSolanaAssociatedTokenAddress(
   }
   throw new Error('Failed to derive Solana Associated Token Account PDA.');
 }
+
+function writeU64LE(buf: Buffer, value: bigint, offset: number): void {
+  buf.writeBigUInt64LE(value, offset);
+}
+
+export function encodeSolanaTransferTransaction(input: {
+  senderAddress: string;
+  depositAddress: string;
+  amountAtomic: string;
+  recentBlockhash: string;
+  tokenContract?: string;
+  tokenProgramId?: string;
+  decimals?: number;
+  destIsTokenAccount?: boolean;
+  memo?: string;
+}): {
+  wireBytes: Uint8Array;
+  messageBytes: Uint8Array;
+  messageBase58: string;
+  transactionBase64: string;
+} {
+  const amount = BigInt(input.amountAtomic);
+  if (amount <= 0n) {
+    throw Object.assign(new Error('Solana transfer amount must be positive.'), {
+      statusCode: 400,
+    });
+  }
+  const sender = input.senderAddress.trim();
+  const recipient = input.depositAddress.trim();
+  decodeSolanaPubkey(sender, 'sender');
+  decodeSolanaPubkey(recipient, 'recipient');
+  const blockhashBytes = decodeSolanaPubkey(input.recentBlockhash, 'blockhash');
+
+  const instructions: SolanaRawInstruction[] = [];
+  const tokenMint = input.tokenContract?.trim();
+
+  if (!tokenMint) {
+    const data = Buffer.alloc(12);
+    data.writeUInt32LE(2, 0); // SystemProgram.transfer = 2
+    writeU64LE(data, amount, 4);
+    instructions.push({
+      programId: SOLANA_SYSTEM_PROGRAM,
+      accounts: [
+        { pubkey: sender, isSigner: true, isWritable: true },
+        { pubkey: recipient, isSigner: false, isWritable: true },
+      ],
+      data,
+    });
+  } else {
+    const tokenProg = input.tokenProgramId ?? SPL_TOKEN_PROGRAM;
+    const decimals = input.decimals ?? 6;
+    const senderAta = deriveSolanaAssociatedTokenAddress(sender, tokenMint, tokenProg);
+    const destTokenAccount = input.destIsTokenAccount
+      ? recipient
+      : deriveSolanaAssociatedTokenAddress(recipient, tokenMint, tokenProg);
+
+    if (!input.destIsTokenAccount) {
+      instructions.push({
+        programId: SOLANA_ATA_PROGRAM,
+        accounts: [
+          { pubkey: sender, isSigner: true, isWritable: true },
+          { pubkey: destTokenAccount, isSigner: false, isWritable: true },
+          { pubkey: recipient, isSigner: false, isWritable: false },
+          { pubkey: tokenMint, isSigner: false, isWritable: false },
+          { pubkey: SOLANA_SYSTEM_PROGRAM, isSigner: false, isWritable: false },
+          { pubkey: tokenProg, isSigner: false, isWritable: false },
+        ],
+        data: Uint8Array.of(1), // AssociatedTokenAccountInstruction::CreateIdempotent
+      });
+    }
+
+    const transferData = Buffer.alloc(10);
+    transferData.writeUInt8(12, 0); // TokenInstruction::TransferChecked = 12
+    writeU64LE(transferData, amount, 1);
+    transferData.writeUInt8(decimals & 0xff, 9);
+
+    instructions.push({
+      programId: tokenProg,
+      accounts: [
+        { pubkey: senderAta, isSigner: false, isWritable: true },
+        { pubkey: tokenMint, isSigner: false, isWritable: false },
+        { pubkey: destTokenAccount, isSigner: false, isWritable: true },
+        { pubkey: sender, isSigner: true, isWritable: false },
+      ],
+      data: transferData,
+    });
+  }
+
+  if (input.memo?.trim()) {
+    instructions.push({
+      programId: SOLANA_MEMO_PROGRAM,
+      accounts: [{ pubkey: sender, isSigner: true, isWritable: false }],
+      data: Buffer.from(input.memo.trim(), 'utf8'),
+    });
+  }
+
+  const metaMap = new Map<
+    string,
+    { pubkey: string; bytes: Uint8Array; isSigner: boolean; isWritable: boolean }
+  >();
+  const upsertAccount = (pubkey: string, isSigner: boolean, isWritable: boolean) => {
+    const clean = pubkey.trim();
+    const existing = metaMap.get(clean);
+    if (existing) {
+      existing.isSigner = existing.isSigner || isSigner;
+      existing.isWritable = existing.isWritable || isWritable;
+    } else {
+      metaMap.set(clean, {
+        pubkey: clean,
+        bytes: decodeSolanaPubkey(clean, 'account'),
+        isSigner,
+        isWritable,
+      });
+    }
+  };
+
+  // Fee payer must always be index 0 (writable signer)
+  upsertAccount(sender, true, true);
+  for (const ix of instructions) {
+    for (const acc of ix.accounts) {
+      upsertAccount(acc.pubkey, acc.isSigner, acc.isWritable);
+    }
+    upsertAccount(ix.programId, false, false);
+  }
+
+  const feePayerEntry = metaMap.get(sender)!;
+  const rest = [...metaMap.values()].filter(a => a.pubkey !== sender);
+  const rank = (a: { isSigner: boolean; isWritable: boolean }): number => {
+    if (a.isSigner && a.isWritable) return 0;
+    if (a.isSigner && !a.isWritable) return 1;
+    if (!a.isSigner && a.isWritable) return 2;
+    return 3;
+  };
+  rest.sort((a, b) => rank(a) - rank(b));
+
+  const orderedAccounts = [feePayerEntry, ...rest];
+  const indexByPubkey = new Map<string, number>();
+  orderedAccounts.forEach((acc, idx) => indexByPubkey.set(acc.pubkey, idx));
+
+  const numRequiredSignatures = orderedAccounts.filter(a => a.isSigner).length;
+  const numReadonlySignedAccounts = orderedAccounts.filter(a => a.isSigner && !a.isWritable).length;
+  const numReadonlyUnsignedAccounts = orderedAccounts.filter(
+    a => !a.isSigner && !a.isWritable,
+  ).length;
+
+  const messageChunks: Uint8Array[] = [
+    Uint8Array.of(
+      numRequiredSignatures,
+      numReadonlySignedAccounts,
+      numReadonlyUnsignedAccounts,
+    ),
+    encodeCompactU16(orderedAccounts.length),
+    ...orderedAccounts.map(a => a.bytes),
+    blockhashBytes,
+    encodeCompactU16(instructions.length),
+  ];
+
+  for (const ix of instructions) {
+    const progIdx = indexByPubkey.get(ix.programId)!;
+    const accIndices = Uint8Array.from(ix.accounts.map(a => indexByPubkey.get(a.pubkey)!));
+    messageChunks.push(
+      Uint8Array.of(progIdx),
+      encodeCompactU16(accIndices.length),
+      accIndices,
+      encodeCompactU16(ix.data.length),
+      ix.data,
+    );
+  }
+
+  const messageBytes = new Uint8Array(Buffer.concat(messageChunks));
+  const sigCountBytes = encodeCompactU16(numRequiredSignatures);
+  const blankSignatures = new Uint8Array(64 * numRequiredSignatures);
+  const wireBytes = new Uint8Array(
+    Buffer.concat([sigCountBytes, blankSignatures, messageBytes]),
+  );
+
+  return {
+    wireBytes,
+    messageBytes,
+    messageBase58: base58.encode(wireBytes),
+    transactionBase64: Buffer.from(wireBytes).toString('base64'),
+  };
+}
