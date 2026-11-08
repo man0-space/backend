@@ -2428,3 +2428,85 @@ export async function prepareSolanaOriginTransfer(input: {
     lastValidBlockHeight: blockhashRes.value.lastValidBlockHeight,
   };
 }
+
+function buildSolanaExplorerTxUrl(explorerBase: string, txHash: string): string {
+  try {
+    const parsed = new URL(explorerBase);
+    const cleanPath = parsed.pathname.replace(/\/+$/, '');
+    parsed.pathname = `${cleanPath}/tx/${txHash}`;
+    return parsed.toString();
+  } catch {
+    return `https://explorer.solana.com/tx/${txHash}`;
+  }
+}
+
+export async function broadcastSolanaOriginTransfer(input: {
+  signedTransactionBase64: string;
+  depositAddress: string;
+  memo?: string;
+  network?: 'mainnet' | 'testnet';
+}): Promise<{
+  txHash: string;
+  explorerUrl: string;
+}> {
+  const activeNet = input.network ?? config.network;
+  const rawBytes = Buffer.from(input.signedTransactionBase64, 'base64');
+  if (rawBytes.length < 66 || rawBytes[0] === 0) {
+    throw Object.assign(new Error('Invalid signed Solana transaction payload.'), {
+      statusCode: 400,
+    });
+  }
+  const sigSlice = rawBytes.subarray(1, 65);
+  if (sigSlice.every(b => b === 0)) {
+    throw Object.assign(new Error('Solana transaction is missing wallet signature.'), {
+      statusCode: 400,
+    });
+  }
+
+  const { rpcUrls, explorerBase } = await resolveSolanaChainMeta(activeNet);
+  const txHash = await solanaRpcCall<string>(rpcUrls, 'sendTransaction', [
+    input.signedTransactionBase64,
+    {
+      encoding: 'base64',
+      preflightCommitment: 'confirmed',
+      maxRetries: 3,
+    },
+  ]);
+
+  for (let i = 0; i < 6; i++) {
+    const statusRes = await solanaRpcCall<{
+      value: Array<{
+        confirmationStatus?: string | null;
+        err?: unknown;
+      } | null>;
+    }>(rpcUrls, 'getSignatureStatuses', [[txHash], { searchTransactionHistory: false }]).catch(
+      () => null,
+    );
+    const st = statusRes?.value?.[0];
+    if (st?.err) {
+      throw Object.assign(
+        new Error(`Solana transaction failed on-chain: ${JSON.stringify(st.err)}`),
+        { statusCode: 400 },
+      );
+    }
+    if (
+      st?.confirmationStatus === 'confirmed' ||
+      st?.confirmationStatus === 'finalized' ||
+      st?.confirmationStatus === 'processed'
+    ) {
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  await submitUserDepositTx({
+    txHash,
+    depositAddress: input.depositAddress,
+    memo: input.memo,
+  }).catch(() => undefined);
+
+  return {
+    txHash,
+    explorerUrl: buildSolanaExplorerTxUrl(explorerBase, txHash),
+  };
+}
