@@ -1138,3 +1138,166 @@ export async function scanAllWalletHoldings(input: {
     .filter(h => BigInt(h.balanceAtomic) > 0n)
     .sort((a, b) => b.balanceUsd - a.balanceUsd);
 }
+
+function buildDynamicKeywordIndex(tokens: OneClickToken[]): Map<string, string> {
+  const index = new Map<string, string>();
+  const knownChains = new Set(tokens.map(t => t.blockchain.toLowerCase()));
+
+  for (const chainKey of knownChains) {
+    index.set(chainKey, chainKey);
+    const cachedMeta = latestChainCatalogByKey.get(chainKey);
+    if (cachedMeta) {
+      for (const kw of cachedMeta.keywords) {
+        if (!index.has(kw)) index.set(kw, chainKey);
+      }
+    }
+  }
+
+  for (const tok of tokens) {
+    const chainKey = tok.blockchain.toLowerCase();
+    const parsed = tryParseIntentsAsset(tok.assetId);
+    const sdkName = parsed?.blockchain ? CAIP2_TO_CHAIN_NAME.get(parsed.blockchain) : undefined;
+    if (sdkName) {
+      for (const kw of extractChainKeywords(chainKey, sdkName)) {
+        if (!index.has(kw)) index.set(kw, chainKey);
+      }
+    }
+  }
+
+  return index;
+}
+
+export function detectAllChainsInSegment(segment: string, tokens: OneClickToken[]): string[] {
+  const index = buildDynamicKeywordIndex(tokens);
+  const words = segment.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  const found: string[] = [];
+  for (const w of words) {
+    const matched = index.get(w);
+    if (matched && !found.includes(matched)) {
+      found.push(matched);
+    }
+  }
+  return found;
+}
+
+export function detectChainInSegment(segment: string, tokens: OneClickToken[]): string | null {
+  return detectAllChainsInSegment(segment, tokens)[0] ?? null;
+}
+
+export function detectSymbolInSegment(segment: string, tokens: OneClickToken[]): string | null {
+  const knownSymbols = new Map<string, string>();
+  for (const t of tokens) {
+    knownSymbols.set(t.symbol.toUpperCase(), t.symbol.toUpperCase());
+  }
+  if (knownSymbols.has('WNEAR') && !knownSymbols.has('NEAR')) {
+    knownSymbols.set('NEAR', 'WNEAR');
+  }
+
+  const ignore = new Set(['USD', 'DOLLAR', 'DOLLARS', 'TO', 'IN', 'ON', 'FROM', 'AND', 'FOR']);
+  const words = segment.match(/[A-Za-z0-9_]+/g) ?? [];
+  for (const rawWord of words) {
+    const upper = rawWord.toUpperCase();
+    if (ignore.has(upper)) continue;
+    if (knownSymbols.has(upper)) {
+      return knownSymbols.get(upper)!;
+    }
+  }
+  return null;
+}
+
+function extractExplicitAddress(text: string): string | null {
+  const evmMatch = text.match(/\b(0x[a-fA-F0-9]{40})\b/);
+  if (evmMatch) return evmMatch[1]!;
+  const btcMatch = text.match(/\b((?:bc1|tb1)[a-zA-HJ-NP-Z0-9]{25,62})\b/);
+  if (btcMatch) return btcMatch[1]!;
+  const nearNamed = text.match(/\b([a-z0-9_-]{2,64}\.(?:near|testnet))\b/i);
+  if (nearNamed) return nearNamed[1]!.toLowerCase();
+  const universalMatch = text.match(/\b(0u[0-9a-z]{52})\b/);
+  if (universalMatch) return universalMatch[1]!;
+  const base58Match = text.match(/\b([1-9A-HJ-NP-Za-km-z]{32,44})\b/);
+  if (base58Match) return base58Match[1]!;
+  return null;
+}
+
+function selectPreferredTokenOnChain(
+  chainTokens: OneClickToken[],
+  desiredSymbol?: string | null,
+): OneClickToken | undefined {
+  if (desiredSymbol) {
+    const exact = chainTokens.find(t => t.symbol.toUpperCase() === desiredSymbol.toUpperCase());
+    if (exact) return exact;
+  }
+  return (
+    chainTokens.find(t => t.symbol.toUpperCase() === 'USDC') ??
+    chainTokens.find(t => t.symbol.toUpperCase() === 'USDT') ??
+    chainTokens.find(t => !t.contractAddress) ??
+    chainTokens.find(t => t.symbol.toUpperCase() === t.blockchain.toUpperCase()) ??
+    chainTokens[0]
+  );
+}
+
+function effectiveTokenUsdPrice(token: OneClickToken): number {
+  if (
+    STABLE_SYMBOLS.has(token.symbol.toUpperCase()) &&
+    (!token.price || Math.abs(token.price - 1) < 0.05)
+  ) {
+    return 1;
+  }
+  return token.price > 0 ? token.price : 1;
+}
+
+function maxSpendableAtomic(
+  holding: WalletHolding,
+  chainMeta?: DynamicChainMeta,
+): bigint {
+  const bal = BigInt(holding.balanceAtomic);
+  if (bal <= 0n) return 0n;
+  let usable = bal;
+
+  if (holding.source === 'external' && !holding.token.contractAddress) {
+    const price = effectiveTokenUsdPrice(holding.token);
+    const fixedReserve = decimalToAtomic(0.15 / price, holding.token.decimals);
+    const pctReserve = bal / 20n;
+    const gasReserve = fixedReserve > pctReserve ? fixedReserve : pctReserve;
+    usable = bal > gasReserve ? bal - gasReserve : 0n;
+  }
+
+  if (chainMeta?.maxSwapCapDecimal && !holding.token.contractAddress) {
+    const capAtomic = decimalToAtomic(chainMeta.maxSwapCapDecimal, holding.token.decimals);
+    if (capAtomic > 0n && usable > capAtomic) {
+      usable = capAtomic;
+    }
+  }
+
+  return usable;
+}
+
+function parsePromptAmount(
+  prompt: string,
+  hasExplicitSymbol: boolean,
+): { mode: 'usd' | 'token' | 'max'; value: number } {
+  if (/\b(all|max|everything|entire\s+balance)\b/i.test(prompt)) {
+    return { mode: 'max', value: 0 };
+  }
+  const usdPrefix = prompt.match(/\$\s*(\d+(?:\.\d+)?)/);
+  const usdSuffix = prompt.match(/(\d+(?:\.\d+)?)\s*(?:usd|dollars?)\b/i);
+  if (usdPrefix || usdSuffix) {
+    const v = Number((usdPrefix ?? usdSuffix)![1]);
+    if (!Number.isFinite(v) || v <= 0) {
+      throw Object.assign(new Error('Enter an amount greater than zero.'), { statusCode: 400 });
+    }
+    return { mode: 'usd', value: v };
+  }
+  const numMatch = prompt.match(/(\d+(?:\.\d+)?)/);
+  if (!numMatch) {
+    throw Object.assign(
+      new Error('Include an amount in your request, e.g. "Fund $20" or "Swap 0.1 SOL".'),
+      { statusCode: 400 },
+    );
+  }
+  const v = Number(numMatch[1]);
+  if (!Number.isFinite(v) || v <= 0) {
+    throw Object.assign(new Error('Enter an amount greater than zero.'), { statusCode: 400 });
+  }
+  return { mode: hasExplicitSymbol ? 'token' : 'usd', value: v };
+}
