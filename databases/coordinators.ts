@@ -84,3 +84,39 @@ export async function get(id: string, userAddress?: string): Promise<Coordinator
     );
   return rows[0] ? hydrate(rows[0]) : null;
 }
+
+export async function create(
+  input: Omit<Coordinator, 'id' | 'created'> & { id?: string },
+): Promise<Coordinator> {
+  await ensureCoordinatorsTable();
+  const id = input.id?.trim() || randomUUID();
+  const rows = await workflow.query(
+    `INSERT INTO coordinators (id, "userAddress", "agentId", "walletAddress", name, image, personality, model, cid, "txHash", "contractId", network)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+     ON CONFLICT ("walletAddress") DO UPDATE SET
+       name = EXCLUDED.name,
+       image = EXCLUDED.image,
+       personality = EXCLUDED.personality,
+       model = EXCLUDED.model,
+       cid = EXCLUDED.cid,
+       "txHash" = EXCLUDED."txHash"
+     RETURNING id, "userAddress", "agentId", "walletAddress", name, image, personality, model, cid, "txHash", "contractId", network, created`,
+    [
+      id,
+      input.userAddress,
+      input.agentId,
+      input.walletAddress,
+      input.name,
+      input.image,
+      input.personality,
+      input.model,
+      input.cid,
+      input.txHash,
+      input.contractId,
+      input.network,
+    ],
+  );
+  await cacheDel(userCoordinatorsCacheKey(input.userAddress));
+  await cacheDel(ALL_COORDINATORS_CACHE_KEY);
+  return hydrate(rows[0]!);
+}
