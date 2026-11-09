@@ -470,3 +470,334 @@ export function extractReceiptBillWei(
 ): bigint {
   return extractReceiptMeta(response, body).billWei;
 }
+
+function buildPaymentRequiredHeader(input: {
+  resource: string;
+  targetChain: FacilitatorChain;
+  maxAmountWei: string;
+  treasuryAddress: string;
+  creatorRecipientAddress: string;
+  description: string;
+}): string {
+  const payload = {
+    x402Version: 2,
+    error: 'Payment Required',
+    resource: {
+      url: input.resource,
+      description: input.description,
+      mimeType: 'application/json',
+    },
+    accepts: [
+      {
+        scheme: 'upto',
+        network: input.targetChain.network,
+        amount: input.maxAmountWei,
+        maxAmountRequired: input.maxAmountWei,
+        asset: input.targetChain.assetAddress,
+        payTo: input.treasuryAddress,
+        maxTimeoutSeconds: 300,
+        extra: {
+          royalties: {
+            creator: input.creatorRecipientAddress,
+            treasury: input.treasuryAddress,
+          },
+        },
+      },
+    ],
+  };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+}
+
+function resolveRequestResourceUrl(request: FastifyRequest): string {
+  const proto =
+    (request.headers['x-forwarded-proto'] as string | undefined) ?? request.protocol ?? 'https';
+  const host = request.headers.host ?? 'localhost';
+  return `${proto}://${host}${request.url}`;
+}
+
+export function getPaymentContext(request: FastifyRequest): Payer | null {
+  return (request as unknown as { paymentContext?: Payer }).paymentContext ?? null;
+}
+
+export function requireSessionPayment(
+  resolveConfig: (request: FastifyRequest) => Promise<Charge | null> | Charge | null,
+  options: { fetchImpl?: typeof fetch } = {},
+) {
+  const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    const paymentConfig = await resolveConfig(request);
+    if (!paymentConfig) {
+      return;
+    }
+
+    const composeUrl = config.composeApiUrl;
+    const requestedNetwork =
+      (request.headers['x-network-id'] as string | undefined)?.trim() ||
+      (request.headers['x-network'] as string | undefined)?.trim() ||
+      (request.headers['x-chain-id'] as string | undefined)?.trim();
+
+    const maxAmountWei = paymentConfig.maxAmountWei ?? DEFAULT_AUTHORIZATION_BUDGET_WEI;
+    const resourceUrl = resolveRequestResourceUrl(request);
+    const runId = (request.headers['x-run-id'] as string | undefined)?.trim() || randomUUID();
+
+    const sessionToken = extractSessionToken(request);
+    const paymentSignature = extractPaymentSignature(request);
+
+    if (!sessionToken && !paymentSignature) {
+      const challengeNetworkId = requestedNetwork || `near:${config.network}`;
+      const targetChain = await chain(challengeNetworkId, fetchFn);
+      const treasuryAddress = treasury(targetChain);
+      const creatorRecipientAddress = await creator(paymentConfig.creatorUserAddress, targetChain);
+      const paymentRequiredB64 = buildPaymentRequiredHeader({
+        resource: resourceUrl,
+        targetChain,
+        maxAmountWei,
+        treasuryAddress,
+        creatorRecipientAddress,
+        description: `man0 ${paymentConfig.action}`,
+      });
+      reply.header('PAYMENT-REQUIRED', paymentRequiredB64);
+      reply.code(402).send({
+        error:
+          'Payment Required: Active session or x402 PAYMENT-SIGNATURE header is required.',
+      });
+      return;
+    }
+
+    if (sessionToken) {
+      const parsed = parseComposeToken(sessionToken);
+      if (!parsed || !parsed.sub) {
+        reply.code(401).send({ error: 'Invalid session token format.' });
+        return;
+      }
+      if (parsed.exp && parsed.exp * 1000 < Date.now()) {
+        reply.code(401).send({ error: 'session token has expired.' });
+        return;
+      }
+
+      const tokenNetworkId = parsed.network?.trim() || requestedNetwork;
+      if (!tokenNetworkId) {
+        reply.code(400).send({ error: 'session token is missing network identifier.' });
+        return;
+      }
+      const targetChain = await chain(tokenNetworkId, fetchFn);
+      const network = targetChain.network;
+      const treasuryAddress = treasury(targetChain);
+      const creatorRecipientAddress = await creator(paymentConfig.creatorUserAddress, targetChain);
+
+      let canonicalUserAddress = await resolveMainUserAddress(parsed.sub);
+      if (canonicalUserAddress === parsed.sub) {
+        const rawAuth = request.headers.authorization?.startsWith('Bearer ')
+          ? request.headers.authorization.slice(7).trim()
+          : '';
+        if (rawAuth && !rawAuth.startsWith('compose-')) {
+          const verified = await authToken.read(rawAuth).catch(() => null);
+          if (verified?.userAddress) {
+            canonicalUserAddress = verified.userAddress;
+          }
+        }
+      }
+      const callerHeader = (
+        request.headers['x-session-user-address'] as string | undefined
+      )?.trim();
+      if (callerHeader && callerHeader !== parsed.sub && callerHeader !== canonicalUserAddress) {
+        reply.code(403).send({
+          error: 'x-session-user-address does not match session token subject.',
+        });
+        return;
+      }
+
+      if (
+        canonicalUserAddress === paymentConfig.creatorUserAddress &&
+        paymentConfig.creatorFeePercent === 0
+      ) {
+        request.headers['x-session-user-address'] = parsed.sub;
+        request.headers['x-network-id'] = network;
+        request.headers['x-run-id'] = runId;
+        (request as unknown as { paymentContext: Payer }).paymentContext = {
+          mode: 'session',
+          userAddress: canonicalUserAddress,
+          sessionSubject: parsed.sub,
+          network,
+          token: sessionToken,
+          creatorUserAddress: paymentConfig.creatorUserAddress,
+          creatorRecipientAddress,
+          creatorFeePercent: paymentConfig.creatorFeePercent,
+          treasuryAddress,
+          action: paymentConfig.action,
+          runId,
+        };
+        return;
+      }
+
+      const idempotencyKey = `${paymentConfig.action}:${parsed.keyId ?? parsed.sub}:${runId}`;
+      const prepareRes = await fetchFn(`${composeUrl}/api/payments/prepare`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${sessionToken}`,
+          'content-type': 'application/json',
+          'x-network-id': network,
+          'x-session-user-address': parsed.sub,
+        },
+        body: JSON.stringify({
+          service: 'man0',
+          action: paymentConfig.action,
+          resource: resourceUrl,
+          method: request.method,
+          maxAmountWei,
+          payTo: treasuryAddress,
+          royalties: {
+            creator: creatorRecipientAddress,
+            treasury: treasuryAddress,
+          },
+          runId,
+          idempotencyKey,
+        }),
+      });
+
+      const preparePayload = (await prepareRes.json().catch(() => ({}))) as {
+        paymentIntentId?: string;
+        userAddress?: string;
+        error?: string;
+      };
+
+      const requiredHeader =
+        prepareRes.headers.get('payment-required') ?? prepareRes.headers.get('PAYMENT-REQUIRED');
+      if (requiredHeader) {
+        reply.header('PAYMENT-REQUIRED', requiredHeader);
+      }
+
+      if (!prepareRes.ok || !preparePayload.paymentIntentId) {
+        reply.code(prepareRes.status || 402).send({
+          error: preparePayload.error || 'Payment preparation failed.',
+        });
+        return;
+      }
+
+      const sessionSubject = preparePayload.userAddress ?? parsed.sub;
+      let resolvedCanonical = await resolveMainUserAddress(sessionSubject);
+      if (resolvedCanonical === sessionSubject && canonicalUserAddress !== parsed.sub) {
+        resolvedCanonical = canonicalUserAddress;
+      }
+      request.headers['x-session-user-address'] = sessionSubject;
+      request.headers['x-network-id'] = network;
+      request.headers['x-run-id'] = runId;
+
+      (request as unknown as { paymentContext: Payer }).paymentContext = {
+        mode: 'session',
+        paymentIntentId: preparePayload.paymentIntentId,
+        userAddress: resolvedCanonical,
+        sessionSubject,
+        network,
+        token: sessionToken,
+        creatorUserAddress: paymentConfig.creatorUserAddress,
+        creatorRecipientAddress,
+        creatorFeePercent: paymentConfig.creatorFeePercent,
+        treasuryAddress,
+        action: paymentConfig.action,
+        runId,
+      };
+      return;
+    }
+
+    let paymentPayload: Record<string, unknown>;
+    try {
+      const decoded = Buffer.from(paymentSignature!, 'base64').toString('utf8');
+      paymentPayload = JSON.parse(decoded) as Record<string, unknown>;
+    } catch {
+      reply.code(400).send({ error: 'Invalid base64 PAYMENT-SIGNATURE header.' });
+      return;
+    }
+
+    const acceptedObj = paymentPayload.accepted as { network?: string } | undefined;
+    const x402NetworkId =
+      acceptedObj?.network?.trim() ||
+      (typeof paymentPayload.network === 'string' ? paymentPayload.network.trim() : '') ||
+      requestedNetwork;
+    if (!x402NetworkId) {
+      reply.code(400).send({ error: 'x402 payment payload is missing network identifier.' });
+      return;
+    }
+
+    const targetChain = await chain(x402NetworkId, fetchFn);
+    const network = targetChain.network;
+    const treasuryAddress = treasury(targetChain);
+    const creatorRecipientAddress = await creator(paymentConfig.creatorUserAddress, targetChain);
+
+    const paymentRequirements: Record<string, unknown> = {
+      scheme: 'upto',
+      network,
+      amount: maxAmountWei,
+      maxAmountRequired: maxAmountWei,
+      resource: resourceUrl,
+      description: `man0 ${paymentConfig.action}`,
+      mimeType: 'application/json',
+      payTo: treasuryAddress,
+      maxTimeoutSeconds: 300,
+      asset: targetChain.assetAddress,
+      extra: {
+        royalties: {
+          creator: creatorRecipientAddress,
+          treasury: treasuryAddress,
+        },
+      },
+    };
+
+    const verifyRes = await fetchFn(`${composeUrl}/api/x402/facilitator/verify`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-network-id': network,
+      },
+      body: JSON.stringify({
+        x402Version: 2,
+        paymentPayload,
+        paymentRequirements,
+      }),
+    });
+
+    const verifyBody = (await verifyRes.json().catch(() => ({}))) as {
+      isValid?: boolean;
+      invalidReason?: string;
+      payer?: string;
+      error?: string;
+    };
+
+    if (!verifyRes.ok || !verifyBody.isValid || !verifyBody.payer) {
+      const paymentRequiredB64 = buildPaymentRequiredHeader({
+        resource: resourceUrl,
+        targetChain,
+        maxAmountWei,
+        treasuryAddress,
+        creatorRecipientAddress,
+        description: `man0 ${paymentConfig.action}`,
+      });
+      reply.header('PAYMENT-REQUIRED', paymentRequiredB64);
+      reply.code(402).send({
+        error:
+          verifyBody.invalidReason ?? verifyBody.error ?? 'x402 payment verification failed.',
+      });
+      return;
+    }
+
+    const canonicalPayer = await resolveMainUserAddress(verifyBody.payer);
+    request.headers['x-session-user-address'] = verifyBody.payer;
+    request.headers['x-network-id'] = network;
+    request.headers['x-run-id'] = runId;
+
+    (request as unknown as { paymentContext: Payer }).paymentContext = {
+      mode: 'x402',
+      paymentPayload,
+      paymentRequirements,
+      userAddress: canonicalPayer,
+      sessionSubject: verifyBody.payer,
+      network,
+      creatorUserAddress: paymentConfig.creatorUserAddress,
+      creatorRecipientAddress,
+      creatorFeePercent: paymentConfig.creatorFeePercent,
+      treasuryAddress,
+      action: paymentConfig.action,
+      runId,
+    };
+  };
+}
