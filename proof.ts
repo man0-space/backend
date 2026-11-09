@@ -120,3 +120,49 @@ export class ProofAccumulator {
     };
   }
 }
+
+export async function pinProofBundleToIPFS(
+  bundle: ProofBundle,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<{ proofCid: string; proofUrl: string; planHash: string }> {
+  const res = await fetchImpl('https://api.pinata.cloud/pinning/pinJSONToIPFS', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${config.pinataJwt}`,
+      'content-type': 'application/json',
+    },
+    signal: AbortSignal.timeout(25_000),
+    body: JSON.stringify({
+      pinataOptions: { cidVersion: 1 },
+      pinataMetadata: {
+        name: `man0-proof-${bundle.runId}`,
+        keyvalues: {
+          app: 'man0',
+          schemaVersion: bundle.schemaVersion,
+          workflowId: bundle.workflowId,
+          runId: bundle.runId,
+        },
+      },
+      pinataContent: JSON.parse(canonicalJson(bundle)) as Record<string, unknown>,
+    }),
+  });
+
+  if (!res.ok) {
+    throw Object.assign(new Error(`Failed to pin proof bundle to IPFS (${res.status}).`), {
+      statusCode: 502,
+    });
+  }
+
+  const pinned = (await res.json()) as { IpfsHash?: string };
+  if (!pinned.IpfsHash) {
+    throw Object.assign(new Error('Pinata returned no IpfsHash for proof bundle.'), {
+      statusCode: 502,
+    });
+  }
+
+  return {
+    proofCid: pinned.IpfsHash,
+    proofUrl: `https://${config.pinataGateway}/ipfs/${pinned.IpfsHash}`,
+    planHash: bundle.planHash,
+  };
+}
