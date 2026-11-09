@@ -801,3 +801,200 @@ export function requireSessionPayment(
     };
   };
 }
+
+export async function abortWorkflowPayment(
+  request: FastifyRequest,
+  reason: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const ctx = getPaymentContext(request);
+  if (!ctx || ctx.mode !== 'session' || !ctx.paymentIntentId) {
+    return;
+  }
+  await fetchImpl(`${config.composeApiUrl}/api/payments/abort`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-network-id': ctx.network,
+    },
+    body: JSON.stringify({
+      paymentIntentId: ctx.paymentIntentId,
+      reason,
+    }),
+  }).catch(() => undefined);
+}
+
+export async function settleWorkflowPayment(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  composeBillWei: bigint,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Settlement> {
+  const ctx = getPaymentContext(request);
+  if (!ctx) {
+    throw Object.assign(new Error('Missing prepared workflow payment context.'), {
+      statusCode: 402,
+    });
+  }
+
+  const isCreator = ctx.userAddress === ctx.creatorUserAddress;
+  const fees = computeWorkflowServiceFees(composeBillWei, ctx.creatorFeePercent, isCreator);
+
+  if (fees.serviceFeeWei === 0n || (!ctx.paymentIntentId && ctx.mode === 'session')) {
+    if (ctx.mode === 'session' && ctx.paymentIntentId) {
+      await abortWorkflowPayment(request, 'zero_service_fee', fetchImpl);
+    }
+    return {
+      settled: true,
+      status: 'exempt',
+      txHash: null,
+      paymentIntentId: ctx.paymentIntentId ?? null,
+      composeBillWei: fees.composeBillWei.toString(),
+      creatorFeePercent: fees.creatorFeePercent,
+      creatorFeeWei: fees.creatorFeeWei.toString(),
+      platformFeePercent: fees.platformFeePercent,
+      platformFeeWei: fees.platformFeeWei.toString(),
+      serviceFeeWei: fees.serviceFeeWei.toString(),
+      totalChargedWei: fees.totalChargedWei.toString(),
+    };
+  }
+
+  if (
+    fetchImpl === globalThis.fetch &&
+    ctx.network.startsWith('near:') &&
+    fees.creatorFeeWei > 0n &&
+    ctx.creatorRecipientAddress &&
+    ctx.creatorRecipientAddress !== ctx.treasuryAddress
+  ) {
+    const nearNet = ctx.network === 'near:testnet' ? 'testnet' : 'mainnet';
+    await ensureFtStorageDeposit(
+      rpcFor(nearNet),
+      usdcFor(nearNet),
+      ctx.creatorRecipientAddress,
+      nearNet,
+    ).catch(() => undefined);
+  }
+
+  if (ctx.mode === 'session') {
+    const settleRes = await fetchImpl(`${config.composeApiUrl}/api/payments/settle`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-network-id': ctx.network,
+        ...(ctx.token ? { authorization: `Bearer ${ctx.token}` } : {}),
+      },
+      body: JSON.stringify({
+        paymentIntentId: ctx.paymentIntentId,
+        finalAmountWei: fees.serviceFeeWei.toString(),
+        ...(fees.creatorFeeWei > 0n ? { providerAmountWei: fees.creatorFeeWei.toString() } : {}),
+        ...(fees.platformFeeWei > 0n ? { platformFeeWei: fees.platformFeeWei.toString() } : {}),
+        executeImmediately: true,
+        royalties: {
+          ...(fees.creatorFeeWei > 0n && ctx.creatorRecipientAddress
+            ? { creator: ctx.creatorRecipientAddress }
+            : {}),
+          treasury: ctx.treasuryAddress,
+        },
+      }),
+    });
+
+    const settlePayload = (await settleRes.json().catch(() => ({}))) as {
+      status?: string;
+      txHash?: string;
+      paymentIntentId?: string;
+      error?: string;
+    };
+
+    if (!settleRes.ok) {
+      throw Object.assign(
+        new Error(settlePayload.error || 'Workflow fee settlement failed.'),
+        { statusCode: settleRes.status || 402 },
+      );
+    }
+
+    if (settlePayload.txHash) {
+      reply.header('X-Transaction-Hash', settlePayload.txHash);
+    }
+
+    return {
+      settled: true,
+      status: settlePayload.status ?? 'confirmed',
+      txHash: settlePayload.txHash ?? null,
+      paymentIntentId: settlePayload.paymentIntentId ?? ctx.paymentIntentId ?? null,
+      composeBillWei: fees.composeBillWei.toString(),
+      creatorFeePercent: fees.creatorFeePercent,
+      creatorFeeWei: fees.creatorFeeWei.toString(),
+      platformFeePercent: fees.platformFeePercent,
+      platformFeeWei: fees.platformFeeWei.toString(),
+      serviceFeeWei: fees.serviceFeeWei.toString(),
+      totalChargedWei: fees.totalChargedWei.toString(),
+    };
+  }
+
+  const updatedRequirements: Record<string, unknown> = {
+    ...(ctx.paymentRequirements ?? {}),
+    amount: fees.serviceFeeWei.toString(),
+    maxAmountRequired: fees.serviceFeeWei.toString(),
+    extra: {
+      ...(fees.creatorFeeWei > 0n ? { providerAmountWei: fees.creatorFeeWei.toString() } : {}),
+      ...(fees.platformFeeWei > 0n ? { platformFeeWei: fees.platformFeeWei.toString() } : {}),
+      royalties: {
+        ...(fees.creatorFeeWei > 0n && ctx.creatorRecipientAddress
+          ? { creator: ctx.creatorRecipientAddress }
+          : {}),
+        treasury: ctx.treasuryAddress,
+      },
+    },
+  };
+
+  const settleRes = await fetchImpl(`${config.composeApiUrl}/api/x402/facilitator/settle`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-network-id': ctx.network,
+    },
+    body: JSON.stringify({
+      x402Version: 2,
+      paymentPayload: ctx.paymentPayload,
+      paymentRequirements: updatedRequirements,
+    }),
+  });
+
+  const settleBody = (await settleRes.json().catch(() => ({}))) as {
+    success?: boolean;
+    transaction?: string;
+    network?: string;
+    payer?: string;
+    errorReason?: string;
+    error?: string;
+  };
+
+  if (!settleRes.ok || !settleBody.success) {
+    throw Object.assign(
+      new Error(
+        settleBody.errorReason ?? settleBody.error ?? 'x402 facilitator settlement failed.',
+      ),
+      { statusCode: 402 },
+    );
+  }
+
+  const paymentResponseB64 = Buffer.from(JSON.stringify(settleBody), 'utf8').toString('base64');
+  reply.header('PAYMENT-RESPONSE', paymentResponseB64);
+  if (settleBody.transaction) {
+    reply.header('X-Transaction-Hash', settleBody.transaction);
+  }
+
+  return {
+    settled: true,
+    status: 'confirmed',
+    txHash: settleBody.transaction ?? null,
+    paymentIntentId: null,
+    composeBillWei: fees.composeBillWei.toString(),
+    creatorFeePercent: fees.creatorFeePercent,
+    creatorFeeWei: fees.creatorFeeWei.toString(),
+    platformFeePercent: fees.platformFeePercent,
+    platformFeeWei: fees.platformFeeWei.toString(),
+    serviceFeeWei: fees.serviceFeeWei.toString(),
+    totalChargedWei: fees.totalChargedWei.toString(),
+  };
+}
