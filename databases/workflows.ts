@@ -208,3 +208,62 @@ export async function remove(id: string, userAddress: string, match: string) {
     ),
   ]);
 }
+
+export async function draft(flow: Flow, userAddress: string, match?: string) {
+  const key = flowDraftKey(userAddress, flow.id);
+  const activeKey = activeDraftKey(userAddress);
+  const canonicalTasks = resolveCanonicalTasks(flow.tasks);
+  const stored = JSON.stringify({
+    ...flow,
+    ...(canonicalTasks.length > 0 ? { tasks: canonicalTasks } : { tasks: undefined }),
+    modified: new Date().toISOString(),
+  });
+  const result = await composer.eval(
+    `if ARGV[1]~='' then local previous=redis.call('GET',KEYS[1]); if not previous or cjson.decode(previous).modified~=ARGV[1] then return 0 end end; local prevActive=redis.call('GET',KEYS[2]); if prevActive and prevActive~=KEYS[1] then redis.call('DEL',prevActive) end; redis.call('SET',KEYS[1],ARGV[2],'EX',tonumber(ARGV[3])); redis.call('SET',KEYS[2],KEYS[1],'EX',tonumber(ARGV[3])); return 1`,
+    2,
+    key,
+    activeKey,
+    match ?? '',
+    stored,
+    String(WIP_TTL_SECONDS),
+  );
+  if (result !== 1)
+    throw Object.assign(new Error('The draft changed in another tab. Reload before editing.'), {
+      statusCode: 409,
+    });
+  return JSON.parse(stored) as Flow;
+}
+
+export async function current(userAddress: string) {
+  const prefix = `draft:${digest(userAddress)}:`;
+  const activeKey = `${prefix}active`;
+  const key = await composer.get(activeKey);
+  if (!key || !key.startsWith(prefix)) return null;
+  const value = await composer.get(key);
+  if (!value) return null;
+  const parsed = graph.parse(JSON.parse(value));
+  const existing = await workflow.query(
+    'SELECT published FROM workflows WHERE id=$1 AND "userAddress"=$2 AND deleted IS NULL LIMIT 1',
+    [parsed.id, userAddress],
+  );
+  if (existing[0]?.published) {
+    await deleteFlowDraftFromComposer(userAddress, parsed.id);
+    return null;
+  }
+  const ttl = await composer.ttl(key);
+  if (ttl < 0 || ttl > WIP_TTL_SECONDS) {
+    await Promise.all([
+      composer.expire(key, WIP_TTL_SECONDS),
+      composer.expire(activeKey, WIP_TTL_SECONDS),
+    ]);
+  }
+  return parsed;
+}
+
+export async function clearDraft(userAddress: string) {
+  const prefix = `draft:${digest(userAddress)}:`;
+  const activeKey = `${prefix}active`;
+  const currentKey = await composer.get(activeKey);
+  const keys = currentKey && currentKey.startsWith(prefix) ? [activeKey, currentKey] : [activeKey];
+  await composer.del(...keys);
+}
