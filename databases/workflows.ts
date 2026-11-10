@@ -755,3 +755,220 @@ export async function creatorEarnings(input: {
     events,
   };
 }
+
+export const THREAD_TTL_SECONDS = 7 * 86_400;
+
+export function workflowThreadScopeKey(userAddress: string, workflowId: string): string {
+  return `${userAddress.trim().toLowerCase()}:${workflowId.trim()}`;
+}
+
+function threadValkeyKey(userAddress: string, workflowId: string, threadId: string): string {
+  return `wfthread:${workflowThreadScopeKey(userAddress, workflowId)}:${threadId.trim()}`;
+}
+
+function threadIndexValkeyKey(userAddress: string, workflowId: string): string {
+  return `wfthreads:${workflowThreadScopeKey(userAddress, workflowId)}`;
+}
+
+let threadsInitialized = false;
+async function ensureThreadsTable() {
+  if (threadsInitialized) return;
+  await workflow.query(
+    `CREATE TABLE IF NOT EXISTS threads (
+      "threadId" text NOT NULL,
+      "workflowId" text NOT NULL,
+      "userAddress" text NOT NULL,
+      scope text NOT NULL,
+      title text NOT NULL DEFAULT '',
+      status text NOT NULL,
+      "runId" text NOT NULL,
+      dry boolean NOT NULL DEFAULT false,
+      prompt text NOT NULL DEFAULT '',
+      attachments jsonb NOT NULL DEFAULT '[]'::jsonb,
+      coordinator jsonb,
+      "runningStepId" text,
+      "stepOutputs" jsonb NOT NULL DEFAULT '{}'::jsonb,
+      "missingInputs" jsonb NOT NULL DEFAULT '[]'::jsonb,
+      "missingConnectors" jsonb NOT NULL DEFAULT '[]'::jsonb,
+      error text,
+      billing jsonb,
+      execution jsonb,
+      created timestamptz NOT NULL DEFAULT now(),
+      updated timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (scope, "threadId")
+    )`,
+  );
+  await workflow.query(`ALTER TABLE threads ADD COLUMN IF NOT EXISTS billing jsonb`);
+  await workflow.query(
+    `CREATE INDEX IF NOT EXISTS threads_scope_updated_idx ON threads (scope, updated DESC)`,
+  );
+  threadsInitialized = true;
+}
+
+function rowToThread(row: Record<string, unknown>): Thread {
+  return {
+    threadId: String(row.threadId),
+    workflowId: String(row.workflowId),
+    userAddress: String(row.userAddress),
+    title: String(row.title ?? ''),
+    status: (row.status as Thread['status']) ?? 'running',
+    runId: String(row.runId ?? ''),
+    dry: Boolean(row.dry),
+    prompt: String(row.prompt ?? ''),
+    attachments: Array.isArray(row.attachments)
+      ? (row.attachments as Array<Record<string, unknown>>)
+      : [],
+    coordinator: (row.coordinator as Thread['coordinator']) ?? null,
+    runningStepId:
+      typeof row.runningStepId === 'string' && row.runningStepId ? row.runningStepId : null,
+    stepOutputs:
+      row.stepOutputs && typeof row.stepOutputs === 'object'
+        ? (row.stepOutputs as Record<string, string>)
+        : {},
+    missingInputs: Array.isArray(row.missingInputs)
+      ? (row.missingInputs as Array<Record<string, unknown>>)
+      : [],
+    missingConnectors: Array.isArray(row.missingConnectors)
+      ? (row.missingConnectors as Array<Record<string, unknown>>)
+      : [],
+    error: typeof row.error === 'string' && row.error ? row.error : null,
+    billing:
+      row.billing && typeof row.billing === 'object'
+        ? (row.billing as Record<string, unknown>)
+        : null,
+    execution:
+      row.execution && typeof row.execution === 'object'
+        ? (row.execution as Record<string, unknown>)
+        : null,
+    created: row.created ? new Date(String(row.created)).toISOString() : new Date().toISOString(),
+    updated: row.updated ? new Date(String(row.updated)).toISOString() : new Date().toISOString(),
+  };
+}
+
+export async function upsertThread(input: {
+  threadId: string;
+  workflowId: string;
+  userAddress: string;
+  title?: string;
+  status: Thread['status'];
+  runId: string;
+  dry: boolean;
+  prompt?: string;
+  attachments?: Array<Record<string, unknown>>;
+  coordinator?: Thread['coordinator'];
+  runningStepId?: string | null;
+  stepOutputs?: Record<string, string>;
+  missingInputs?: Array<Record<string, unknown>>;
+  missingConnectors?: Array<Record<string, unknown>>;
+  error?: string | null;
+  billing?: Record<string, unknown> | null;
+  execution?: Record<string, unknown> | null;
+  persistDb?: boolean;
+}): Promise<Thread> {
+  const existing = await getThread(input.userAddress, input.workflowId, input.threadId);
+  const nowIso = new Date().toISOString();
+  const prompt = input.prompt !== undefined ? input.prompt : (existing?.prompt ?? '');
+  const derivedTitle =
+    input.title?.trim() ||
+    existing?.title?.trim() ||
+    prompt.trim().slice(0, 72) ||
+    `Run ${new Date(nowIso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+
+  const merged: Thread = {
+    threadId: input.threadId.trim(),
+    workflowId: input.workflowId,
+    userAddress: existing?.userAddress || input.userAddress,
+    title: derivedTitle,
+    status: input.status,
+    runId: input.runId,
+    dry: input.dry,
+    prompt,
+    attachments: input.attachments ?? existing?.attachments ?? [],
+    coordinator:
+      input.coordinator !== undefined ? input.coordinator : (existing?.coordinator ?? null),
+    runningStepId:
+      input.runningStepId !== undefined ? input.runningStepId : (existing?.runningStepId ?? null),
+    stepOutputs: {
+      ...(existing?.stepOutputs ?? {}),
+      ...(input.stepOutputs ?? {}),
+    },
+    missingInputs:
+      input.missingInputs !== undefined ? input.missingInputs : (existing?.missingInputs ?? []),
+    missingConnectors:
+      input.missingConnectors !== undefined
+        ? input.missingConnectors
+        : (existing?.missingConnectors ?? []),
+    error: input.error !== undefined ? input.error : (existing?.error ?? null),
+    billing: input.billing !== undefined ? input.billing : (existing?.billing ?? null),
+    execution: input.execution !== undefined ? input.execution : (existing?.execution ?? null),
+    created: existing?.created ?? nowIso,
+    updated: nowIso,
+  };
+
+  const vKey = threadValkeyKey(input.userAddress, input.workflowId, merged.threadId);
+  const idxKey = threadIndexValkeyKey(input.userAddress, input.workflowId);
+  const rawList = await composer.get(idxKey).catch(() => null);
+  const parsedIds = rawList ? (JSON.parse(rawList) as string[]) : [];
+  const nextIds = [merged.threadId, ...parsedIds.filter(id => id !== merged.threadId)].slice(0, 50);
+
+  await Promise.all([
+    composer.set(vKey, JSON.stringify(merged), 'EX', THREAD_TTL_SECONDS).catch(() => undefined),
+    composer.set(idxKey, JSON.stringify(nextIds), 'EX', THREAD_TTL_SECONDS).catch(() => undefined),
+  ]);
+
+  if (input.persistDb !== false) {
+    await ensureThreadsTable();
+    const scope = workflowThreadScopeKey(input.userAddress, input.workflowId);
+    await workflow.query(
+      `INSERT INTO threads (
+        "threadId", "workflowId", "userAddress", scope, title, status, "runId", dry, prompt,
+        attachments, coordinator, "runningStepId", "stepOutputs", "missingInputs", "missingConnectors",
+        error, billing, execution, created, updated
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9,
+        $10::jsonb, $11::jsonb, $12, $13::jsonb, $14::jsonb, $15::jsonb,
+        $16, $17::jsonb, $18::jsonb, $19::timestamptz, $20::timestamptz
+      )
+      ON CONFLICT (scope, "threadId") DO UPDATE SET
+        title = EXCLUDED.title,
+        status = EXCLUDED.status,
+        "runId" = EXCLUDED."runId",
+        dry = EXCLUDED.dry,
+        prompt = EXCLUDED.prompt,
+        attachments = EXCLUDED.attachments,
+        coordinator = EXCLUDED.coordinator,
+        "runningStepId" = EXCLUDED."runningStepId",
+        "stepOutputs" = EXCLUDED."stepOutputs",
+        "missingInputs" = EXCLUDED."missingInputs",
+        "missingConnectors" = EXCLUDED."missingConnectors",
+        error = EXCLUDED.error,
+        billing = EXCLUDED.billing,
+        execution = EXCLUDED.execution,
+        updated = EXCLUDED.updated`,
+      [
+        merged.threadId,
+        merged.workflowId,
+        merged.userAddress,
+        scope,
+        merged.title,
+        merged.status,
+        merged.runId,
+        merged.dry,
+        merged.prompt,
+        JSON.stringify(merged.attachments),
+        merged.coordinator ? JSON.stringify(merged.coordinator) : null,
+        merged.runningStepId ?? null,
+        JSON.stringify(merged.stepOutputs),
+        JSON.stringify(merged.missingInputs),
+        JSON.stringify(merged.missingConnectors),
+        merged.error ?? null,
+        merged.billing ? JSON.stringify(merged.billing) : null,
+        merged.execution ? JSON.stringify(merged.execution) : null,
+        merged.created,
+        merged.updated,
+      ],
+    );
+  }
+
+  return merged;
+}
