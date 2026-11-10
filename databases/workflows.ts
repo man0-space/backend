@@ -972,3 +972,71 @@ export async function upsertThread(input: {
 
   return merged;
 }
+
+export async function getThread(
+  userAddress: string,
+  workflowId: string,
+  threadId: string,
+): Promise<Thread | null> {
+  const vKey = threadValkeyKey(userAddress, workflowId, threadId);
+  const cachedVal = await composer.get(vKey).catch(() => null);
+  if (cachedVal) {
+    try {
+      return JSON.parse(cachedVal) as Thread;
+    } catch {
+      // Fall through to Postgres
+    }
+  }
+  await ensureThreadsTable();
+  const scope = workflowThreadScopeKey(userAddress, workflowId);
+  const rows = await workflow.query(
+    `SELECT * FROM threads WHERE scope = $1 AND "threadId" = $2 LIMIT 1`,
+    [scope, threadId.trim()],
+  );
+  if (!rows[0]) return null;
+  const loaded = rowToThread(rows[0]);
+  await composer
+    .set(vKey, JSON.stringify(loaded), 'EX', THREAD_TTL_SECONDS)
+    .catch(() => undefined);
+  return loaded;
+}
+
+export async function listThreads(
+  userAddress: string,
+  workflowId: string,
+  limit = 25,
+): Promise<Thread[]> {
+  await ensureThreadsTable();
+  const scope = workflowThreadScopeKey(userAddress, workflowId);
+  const rows = await workflow.query(
+    `SELECT * FROM threads WHERE scope = $1 ORDER BY updated DESC LIMIT $2`,
+    [scope, limit],
+  );
+  const dbThreads = rows.map(rowToThread);
+  const byId = new Map<string, Thread>();
+  for (const item of dbThreads) {
+    byId.set(item.threadId, item);
+  }
+
+  const idxKey = threadIndexValkeyKey(userAddress, workflowId);
+  const rawIdx = await composer.get(idxKey).catch(() => null);
+  const cachedIds = rawIdx ? (JSON.parse(rawIdx) as string[]) : [];
+  for (const id of cachedIds) {
+    const vKey = threadValkeyKey(userAddress, workflowId, id);
+    const raw = await composer.get(vKey).catch(() => null);
+    if (!raw) continue;
+    try {
+      const live = JSON.parse(raw) as Thread;
+      const existing = byId.get(live.threadId);
+      if (!existing || Date.parse(live.updated) >= Date.parse(existing.updated)) {
+        byId.set(live.threadId, live);
+      }
+    } catch {
+      // Ignore malformed cache entry
+    }
+  }
+
+  return [...byId.values()]
+    .sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated))
+    .slice(0, limit);
+}
