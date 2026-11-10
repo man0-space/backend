@@ -517,3 +517,241 @@ export async function analytics(input: {
     },
   };
 }
+
+export interface CreatorWorkflowEarningSummary {
+  workflowId: string;
+  name: string;
+  banner: string | null;
+  tasks: string[];
+  published: string | null;
+  modified: string;
+  creatorFee: number;
+  stepsCount: number;
+  runs: number;
+  paidRuns: number;
+  succeededRuns: number;
+  failedRuns: number;
+  earnedAtomic: string;
+  totalChargedAtomic: string;
+  avgDurationMs: number;
+  totalDurationMs: number;
+  lastRunAt: string | null;
+}
+
+export interface CreatorEarningEvent {
+  id: string;
+  workflowId: string;
+  workflowName: string;
+  tasks: string[];
+  runnerAddress: string;
+  status: string;
+  network: string;
+  earnedAtomic: string;
+  composeBillAtomic: string;
+  totalChargedAtomic: string;
+  durationMs: number;
+  stepsCount: number;
+  txHash: string | null;
+  proofCid: string | null;
+  timestamp: string;
+}
+
+export async function creatorEarnings(input: {
+  creatorAddress: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+}): Promise<{
+  filters: { from: string; to: string };
+  workflows: CreatorWorkflowEarningSummary[];
+  events: CreatorEarningEvent[];
+}> {
+  await ensureRunsTable();
+  const [clockRow] = await workflow.query(`SELECT now() AS now`);
+  const dbNow = clockRow?.now ? new Date(String(clockRow.now)) : new Date();
+  const toDate = input.to ? new Date(input.to) : dbNow;
+  const fromDate = input.from
+    ? new Date(input.from)
+    : new Date(toDate.getTime() - 7 * 24 * 3600 * 1000);
+  const limit = input.limit ?? 500;
+
+  const [wfRows, runRows] = await Promise.all([
+    workflow.query(
+      `SELECT id, name, graph, terms, published, modified
+       FROM workflows
+       WHERE LOWER("userAddress") = LOWER($1) AND deleted IS NULL
+       ORDER BY COALESCE(published, modified) DESC`,
+      [input.creatorAddress],
+    ),
+    workflow.query(
+      `SELECT id, "workflowId", "workflowName", "userAddress", "creatorAddress", network, status,
+              "durationMs", "composeBillWei", "creatorFeeWei", "platformFeeWei", "totalChargedWei",
+              "txHash", "proofCid", steps, created
+       FROM runs
+       WHERE LOWER("creatorAddress") = LOWER($1)
+         AND created >= $2::timestamptz
+         AND created <= $3::timestamptz
+       ORDER BY created DESC
+       LIMIT $4`,
+      [input.creatorAddress, fromDate.toISOString(), toDate.toISOString(), limit],
+    ),
+  ]);
+
+  type Accum = {
+    workflowId: string;
+    name: string;
+    banner: string | null;
+    tasks: string[];
+    published: string | null;
+    modified: string;
+    creatorFee: number;
+    stepsCount: number;
+    runs: number;
+    paidRuns: number;
+    succeededRuns: number;
+    failedRuns: number;
+    earnedAtomic: bigint;
+    totalChargedAtomic: bigint;
+    durationSumMs: number;
+    durationCount: number;
+    lastRunAt: string | null;
+  };
+
+  const byWorkflowId = new Map<string, Accum>();
+
+  for (const r of wfRows) {
+    const id = String(r.id);
+    const graphObj = (r.graph ?? {}) as {
+      banner?: string | null;
+      tasks?: string[];
+      nodes?: unknown[];
+    };
+    const termsObj = (r.terms ?? null) as {
+      creatorFee?: number;
+      tasks?: string[];
+    } | null;
+    const tasks = Array.isArray(termsObj?.tasks) && termsObj.tasks.length > 0
+      ? termsObj.tasks.map(String)
+      : Array.isArray(graphObj.tasks)
+        ? graphObj.tasks.map(String)
+        : [];
+    byWorkflowId.set(id, {
+      workflowId: id,
+      name: String(r.name || 'Untitled Workflow'),
+      banner: graphObj.banner ? String(graphObj.banner) : null,
+      tasks,
+      published: r.published ? new Date(String(r.published)).toISOString() : null,
+      modified: new Date(String(r.modified)).toISOString(),
+      creatorFee: typeof termsObj?.creatorFee === 'number' ? termsObj.creatorFee : 0,
+      stepsCount: Array.isArray(graphObj.nodes) ? graphObj.nodes.length : 0,
+      runs: 0,
+      paidRuns: 0,
+      succeededRuns: 0,
+      failedRuns: 0,
+      earnedAtomic: 0n,
+      totalChargedAtomic: 0n,
+      durationSumMs: 0,
+      durationCount: 0,
+      lastRunAt: null,
+    });
+  }
+
+  const events: CreatorEarningEvent[] = [];
+
+  for (const r of runRows) {
+    const wfId = String(r.workflowId);
+    const wfName = String(r.workflowName || 'Workflow');
+    const createdIso = new Date(String(r.created)).toISOString();
+    const status = String(r.status || 'succeeded');
+    const durationMs = Math.max(0, Number(r.durationMs ?? 0));
+    const earned = BigInt(String(r.creatorFeeWei ?? '0'));
+    const composeBill = BigInt(String(r.composeBillWei ?? '0'));
+    const charged = BigInt(String(r.totalChargedWei ?? '0'));
+    const stepsArr = Array.isArray(r.steps) ? r.steps : [];
+
+    let acc = byWorkflowId.get(wfId);
+    if (!acc) {
+      acc = {
+        workflowId: wfId,
+        name: wfName,
+        banner: null,
+        tasks: [],
+        published: null,
+        modified: createdIso,
+        creatorFee: 0,
+        stepsCount: stepsArr.length,
+        runs: 0,
+        paidRuns: 0,
+        succeededRuns: 0,
+        failedRuns: 0,
+        earnedAtomic: 0n,
+        totalChargedAtomic: 0n,
+        durationSumMs: 0,
+        durationCount: 0,
+        lastRunAt: null,
+      };
+      byWorkflowId.set(wfId, acc);
+    }
+
+    acc.runs += 1;
+    if (earned > 0n) acc.paidRuns += 1;
+    if (status === 'succeeded') acc.succeededRuns += 1;
+    else acc.failedRuns += 1;
+    acc.earnedAtomic += earned;
+    acc.totalChargedAtomic += charged;
+    if (durationMs > 0) {
+      acc.durationSumMs += durationMs;
+      acc.durationCount += 1;
+    }
+    if (!acc.lastRunAt || createdIso > acc.lastRunAt) {
+      acc.lastRunAt = createdIso;
+    }
+
+    events.push({
+      id: String(r.id),
+      workflowId: wfId,
+      workflowName: acc.name || wfName,
+      tasks: acc.tasks,
+      runnerAddress: String(r.userAddress || ''),
+      status,
+      network: String(r.network || ''),
+      earnedAtomic: earned.toString(),
+      composeBillAtomic: composeBill.toString(),
+      totalChargedAtomic: charged.toString(),
+      durationMs,
+      stepsCount: stepsArr.length || acc.stepsCount,
+      txHash: r.txHash ? String(r.txHash) : null,
+      proofCid: r.proofCid ? String(r.proofCid) : null,
+      timestamp: createdIso,
+    });
+  }
+
+  const summaries: CreatorWorkflowEarningSummary[] = [...byWorkflowId.values()].map(acc => ({
+    workflowId: acc.workflowId,
+    name: acc.name,
+    banner: acc.banner,
+    tasks: acc.tasks,
+    published: acc.published,
+    modified: acc.modified,
+    creatorFee: acc.creatorFee,
+    stepsCount: acc.stepsCount,
+    runs: acc.runs,
+    paidRuns: acc.paidRuns,
+    succeededRuns: acc.succeededRuns,
+    failedRuns: acc.failedRuns,
+    earnedAtomic: acc.earnedAtomic.toString(),
+    totalChargedAtomic: acc.totalChargedAtomic.toString(),
+    avgDurationMs: acc.durationCount > 0 ? Math.round(acc.durationSumMs / acc.durationCount) : 0,
+    totalDurationMs: acc.durationSumMs,
+    lastRunAt: acc.lastRunAt,
+  }));
+
+  return {
+    filters: {
+      from: fromDate.toISOString(),
+      to: toDate.toISOString(),
+    },
+    workflows: summaries,
+    events,
+  };
+}
