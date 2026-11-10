@@ -267,3 +267,45 @@ export async function clearDraft(userAddress: string) {
   const keys = currentKey && currentKey.startsWith(prefix) ? [activeKey, currentKey] : [activeKey];
   await composer.del(...keys);
 }
+
+export interface Run {
+  id: string;
+  workflowId: string;
+  workflowName: string;
+  userAddress: string;
+  creatorAddress: string;
+  network: string;
+  status: 'succeeded' | 'failed';
+  durationMs: number;
+  composeBillWei: string;
+  creatorFeeWei: string;
+  platformFeeWei: string;
+  totalChargedWei: string;
+  txHash: string | null;
+  proofCid?: string | null;
+  steps: Array<Record<string, unknown>>;
+}
+
+export async function recordRun(input: Run): Promise<void> {
+  await ensureRunsTable();
+  await workflow.query(
+    `INSERT INTO runs (id, "workflowId", "workflowName", "userAddress", "creatorAddress", network, status, "durationMs", "composeBillWei", "creatorFeeWei", "platformFeeWei", "totalChargedWei", "txHash", "proofCid", steps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb) ON CONFLICT (id) DO NOTHING`,
+    [
+      input.id,
+      input.workflowId,
+      input.workflowName,
+      input.userAddress,
+      input.creatorAddress,
+      input.network,
+      input.status,
+      Math.max(0, Math.round(input.durationMs)),
+      input.composeBillWei,
+      input.creatorFeeWei,
+      input.platformFeeWei,
+      input.totalChargedWei,
+      input.txHash,
+      input.proofCid ?? null,
+      JSON.stringify(input.steps),
+    ],
+  );
+}
