@@ -309,3 +309,211 @@ export async function recordRun(input: Run): Promise<void> {
     ],
   );
 }
+
+export async function analytics(input: {
+  userAddress: string;
+  from?: string;
+  to?: string;
+  interval?: 'minute' | 'hour' | 'day';
+  networks?: string[];
+  limit?: number;
+}) {
+  await ensureRunsTable();
+  const [clockRow] = await workflow.query(`SELECT now() AS now`);
+  const dbNow = clockRow?.now ? new Date(String(clockRow.now)) : new Date();
+  const toDate = input.to ? new Date(input.to) : dbNow;
+  const fromDate = input.from
+    ? new Date(input.from)
+    : new Date(toDate.getTime() - 7 * 24 * 3600 * 1000);
+  const interval = input.interval ?? 'day';
+  const limit = input.limit ?? 100;
+
+  const rows = await workflow.query(
+    `SELECT id, "workflowId", "workflowName", "userAddress", "creatorAddress", network, status, "durationMs", "composeBillWei", "creatorFeeWei", "platformFeeWei", "totalChargedWei", "txHash", steps, created FROM runs WHERE LOWER("userAddress") = LOWER($1) AND created >= $2::timestamptz AND created <= $3::timestamptz ORDER BY created DESC LIMIT $4`,
+    [input.userAddress, fromDate.toISOString(), toDate.toISOString(), limit],
+  );
+
+  const filtered = input.networks?.length
+    ? rows.filter(r => input.networks!.includes(String(r.network)))
+    : rows;
+
+  let succeeded = 0;
+  let failed = 0;
+  let latencySum = 0;
+  let latencyCount = 0;
+  let finalAmountAtomic = 0n;
+  let composeBillAtomic = 0n;
+  let creatorFeeAtomic = 0n;
+
+  const buckets = new Map<
+    string,
+    {
+      total: number;
+      succeeded: number;
+      failed: number;
+      latencySum: number;
+      latencyCount: number;
+      finalAmountAtomic: bigint;
+      composeBillAtomic: bigint;
+      creatorFeeAtomic: bigint;
+    }
+  >();
+
+  const requestRows = [];
+  const settlementRows = [];
+
+  for (const row of filtered) {
+    const status = String(row.status);
+    const durationMs = Number(row.durationMs ?? 0);
+    const charged = BigInt(String(row.totalChargedWei ?? '0'));
+    const composeBill = BigInt(String(row.composeBillWei ?? '0'));
+    const creatorFee =
+      String(row.creatorAddress) === input.userAddress
+        ? BigInt(String(row.creatorFeeWei ?? '0'))
+        : 0n;
+    const createdIso = new Date(row.created as string).toISOString();
+    const stepsArr = Array.isArray(row.steps) ? row.steps : [];
+
+    if (status === 'succeeded') succeeded += 1;
+    else failed += 1;
+    if (durationMs > 0) {
+      latencySum += durationMs;
+      latencyCount += 1;
+    }
+    finalAmountAtomic += charged;
+    composeBillAtomic += composeBill;
+    creatorFeeAtomic += creatorFee;
+
+    const d = new Date(createdIso);
+    if (interval === 'day') d.setUTCHours(0, 0, 0, 0);
+    else if (interval === 'hour') d.setUTCMinutes(0, 0, 0);
+    else d.setUTCSeconds(0, 0);
+    const bucketKey = d.toISOString();
+    const bucket = buckets.get(bucketKey) ?? {
+      total: 0,
+      succeeded: 0,
+      failed: 0,
+      latencySum: 0,
+      latencyCount: 0,
+      finalAmountAtomic: 0n,
+      composeBillAtomic: 0n,
+      creatorFeeAtomic: 0n,
+    };
+    bucket.total += 1;
+    if (status === 'succeeded') bucket.succeeded += 1;
+    else bucket.failed += 1;
+    if (durationMs > 0) {
+      bucket.latencySum += durationMs;
+      bucket.latencyCount += 1;
+    }
+    bucket.finalAmountAtomic += charged;
+    bucket.composeBillAtomic += composeBill;
+    bucket.creatorFeeAtomic += creatorFee;
+    buckets.set(bucketKey, bucket);
+
+    requestRows.push({
+      id: String(row.id),
+      workflowId: String(row.workflowId),
+      model: String(row.workflowName),
+      status,
+      network: String(row.network),
+      startedAt: createdIso,
+      completedAt: createdIso,
+      latencyMs: durationMs,
+      composeBillAtomic: String(row.composeBillWei ?? '0'),
+      creatorFeeAtomic: String(row.creatorFeeWei ?? '0'),
+      billing: {
+        quotedAmountAtomic: String(row.totalChargedWei ?? '0'),
+        finalAmountAtomic: String(row.totalChargedWei ?? '0'),
+        composeBillAtomic: String(row.composeBillWei ?? '0'),
+        creatorFeeAtomic: String(row.creatorFeeWei ?? '0'),
+        currency: 'USDC',
+      },
+      usage: {
+        units: [{ key: 'steps', quantity: stepsArr.length, unit: 'steps' }],
+      },
+    });
+
+    if (charged > 0n || row.txHash) {
+      settlementRows.push({
+        id: String(row.id),
+        workflowId: String(row.workflowId),
+        model: String(row.workflowName),
+        status: row.txHash ? 'settled' : status,
+        network: String(row.network),
+        createdAt: createdIso,
+        composeBillAtomic: String(row.composeBillWei ?? '0'),
+        creatorFeeAtomic: String(row.creatorFeeWei ?? '0'),
+        billing: {
+          quotedAmountAtomic: String(row.totalChargedWei ?? '0'),
+          finalAmountAtomic: String(row.totalChargedWei ?? '0'),
+          composeBillAtomic: String(row.composeBillWei ?? '0'),
+          creatorFeeAtomic: String(row.creatorFeeWei ?? '0'),
+          currency: 'USDC',
+        },
+        settleTransactionHash: (row.txHash as string | null) ?? undefined,
+        transactionHash: (row.txHash as string | null) ?? undefined,
+      });
+    }
+  }
+
+  const timeline = [...buckets.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([start, b]) => ({
+      start,
+      totals: {
+        requests: {
+          total: b.total,
+          succeeded: b.succeeded,
+          failed: b.failed,
+        },
+        latency: {
+          count: b.latencyCount,
+          averageMs: b.latencyCount ? b.latencySum / b.latencyCount : 0,
+        },
+        billing: {
+          quotedAmountAtomic: b.finalAmountAtomic.toString(),
+          finalAmountAtomic: b.finalAmountAtomic.toString(),
+          composeBillAtomic: b.composeBillAtomic.toString(),
+          creatorFeeAtomic: b.creatorFeeAtomic.toString(),
+          currency: 'USDC',
+        },
+      },
+    }));
+
+  return {
+    filters: {
+      from: fromDate.toISOString(),
+      to: toDate.toISOString(),
+      interval,
+      networks: input.networks ?? [],
+    },
+    totals: {
+      requests: {
+        total: succeeded + failed,
+        succeeded,
+        failed,
+      },
+      latency: {
+        count: latencyCount,
+        averageMs: latencyCount ? latencySum / latencyCount : 0,
+      },
+      billing: {
+        quotedAmountAtomic: finalAmountAtomic.toString(),
+        finalAmountAtomic: finalAmountAtomic.toString(),
+        composeBillAtomic: composeBillAtomic.toString(),
+        creatorFeeAtomic: creatorFeeAtomic.toString(),
+        currency: 'USDC',
+      },
+    },
+    timeline,
+    requests: {
+      data: requestRows,
+      nextCursor: null,
+    },
+    settlements: {
+      data: settlementRows,
+      nextCursor: null,
+    },
+  };
+}
