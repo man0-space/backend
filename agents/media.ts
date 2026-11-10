@@ -226,3 +226,36 @@ export async function generateAvatar(
 
   return { imageUrl: pinned.imageUrl, cid: pinned.cid };
 }
+
+export async function generateBanner(
+  input: MediaInput,
+  deps: MediaDeps = {},
+): Promise<{ imageUrl: string; cid: string }> {
+  const title = input.title?.trim() ?? '';
+  const description = input.description?.trim() ?? '';
+  if (!title || !description) {
+    throw Object.assign(
+      new Error('You should add Title + Description before generating a banner'),
+      { statusCode: 400 },
+    );
+  }
+
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const referenceParts = await fetchRasterLogoParts(input.logos, fetchImpl);
+  const prompt = buildBannerPrompt(title, description, input.logos);
+  const { bytes, mimeType } = await generateImageBuffer(prompt, fetchImpl, referenceParts);
+  const ext = mimeType.includes('jpeg') || mimeType.includes('jpg') ? 'jpg' : 'png';
+  const safeSlug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'banner';
+  const pinned = await pinBufferToIpfs(
+    {
+      bytes,
+      mimeType,
+      fileName: `man0-banner-${safeSlug}.${ext}`,
+      name: `man0-banner-${safeSlug}`,
+      keyvalues: { app: 'man0', kind: 'workflow-banner' },
+    },
+    fetchImpl,
+  );
+
+  return { imageUrl: pinned.imageUrl, cid: pinned.cid };
+}
