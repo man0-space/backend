@@ -1026,3 +1026,58 @@ async function searchConnectorsWorker(
     description: item.description.slice(0, 180),
   }));
 }
+
+async function searchAgentsWorker(
+  query: string,
+  role: 'executor' | 'coordinator',
+  limit: number,
+  loadCatalog: (role: string) => Promise<CatalogEntry[]>,
+  discoveredEntries: Map<string, CatalogEntry>,
+  fetchImpl: typeof fetch,
+): Promise<Array<Record<string, unknown>>> {
+  const catalogEntries = await loadCatalog('agent').catch(() => [] as CatalogEntry[]);
+  const catalogById = new Map(catalogEntries.map(item => [item.id.toLowerCase(), item]));
+
+  const agentUrl = new URL(`${COMPOSE_AGENTS_ORIGIN}/agents/search`);
+  agentUrl.searchParams.set('q', query);
+  agentUrl.searchParams.set('limit', String(limit));
+  agentUrl.searchParams.set('role', role);
+
+  const res = await fetchImpl(agentUrl, {
+    method: 'GET',
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(8_000),
+  }).catch(() => null);
+
+  const out: Array<Record<string, unknown>> = [];
+  if (res?.ok) {
+    const body = (await res.json().catch(() => ({}))) as { agents?: Array<Record<string, unknown>> };
+    for (const hit of body.agents ?? []) {
+      const wallet = typeof hit.walletAddress === 'string' ? hit.walletAddress.trim() : '';
+      if (!wallet) continue;
+      const catEntry =
+        catalogById.get(wallet.toLowerCase()) ??
+        entry.parse({
+          id: wallet,
+          name: typeof hit.name === 'string' && hit.name.trim() ? hit.name.trim() : wallet,
+          description: typeof hit.description === 'string' ? hit.description.slice(0, 10000) : '',
+          kind: 'agent',
+          ...(typeof hit.avatarUrl === 'string' && /^https?:\/\//i.test(hit.avatarUrl)
+            ? { logo: hit.avatarUrl }
+            : {}),
+        });
+      discoveredEntries.set(`agent:${wallet.toLowerCase()}`, catEntry);
+      out.push({
+        id: catEntry.id,
+        name: catEntry.name,
+        kind: 'agent',
+        role: typeof hit.role === 'string' ? hit.role : role,
+        skills: Array.isArray(hit.skills) ? hit.skills.slice(0, 5) : [],
+        score: typeof hit.score === 'number' ? Number(hit.score.toFixed(3)) : undefined,
+        description: catEntry.description.slice(0, 180),
+      });
+    }
+  }
+
+  return out.slice(0, limit);
+}
