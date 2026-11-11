@@ -874,3 +874,155 @@ async function searchModelsWorker(
     description: item.description.slice(0, 180),
   }));
 }
+
+async function searchConnectorsWorker(
+  query: string,
+  limit: number,
+  loadCatalog: (role: string) => Promise<CatalogEntry[]>,
+  discoveredEntries: Map<string, CatalogEntry>,
+  fetchImpl: typeof fetch,
+): Promise<Array<Record<string, unknown>>> {
+  const catalogEntries = await loadCatalog('connector').catch(() => [] as CatalogEntry[]);
+  const catalogById = new Map(catalogEntries.map(item => [item.id.toLowerCase(), item]));
+
+  const out: Array<{ entry: CatalogEntry; score: number; authType: string }> = [];
+  const seen = new Set<string>();
+
+  const pushCandidate = (catEntry: CatalogEntry, score: number, authType: string) => {
+    const key = catEntry.id.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    discoveredEntries.set(`connector:${key}`, catEntry);
+    out.push({ entry: catEntry, score, authType });
+  };
+
+  if (isNearIntentsQuery(query)) {
+    const intentsEntry =
+      catalogById.get('near-intents') ??
+      entry.parse({
+        id: 'near-intents',
+        name: 'NEAR Intents',
+        description:
+          'Cross-chain token quotes, swaps, and multi-chain settlements across all NEAR Intents networks.',
+        kind: 'connector',
+        groups: ['onchain'],
+      });
+    pushCandidate(intentsEntry, 0.99, 'session');
+  }
+
+  const workerUrl = new URL(`${COMPOSE_CONNECTORS_ORIGIN}/`);
+  workerUrl.searchParams.set('q', query);
+  workerUrl.searchParams.set('limit', String(Math.max(8, limit * 2)));
+
+  const res = await fetchImpl(workerUrl, {
+    method: 'GET',
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(8_000),
+  }).catch(() => null);
+
+  if (res?.ok) {
+    const body = (await res.json().catch(() => ({}))) as {
+      accounts?: { toolkits?: Array<Record<string, unknown>> };
+      onchain?: { connectors?: Array<Record<string, unknown>> };
+      mcps?: { servers?: Array<Record<string, unknown>> };
+    };
+
+    const qWords = new Set(query.trim().toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    for (const item of catalogEntries) {
+      if (item.id.startsWith('account:') && !item.id.endsWith('_mcp')) {
+        const baseSlug = item.id.slice(8).toLowerCase();
+        if (baseSlug.length >= 3 && qWords.has(baseSlug)) {
+          pushCandidate(item, 0.98, 'composio_oauth');
+        }
+      }
+    }
+
+    for (const tk of body.accounts?.toolkits ?? []) {
+      const slug = typeof tk.slug === 'string' ? tk.slug.trim().toLowerCase() : '';
+      if (!slug) continue;
+      if (slug.endsWith('_mcp')) {
+        const canonical = catalogById.get(`account:${slug.slice(0, -4)}`);
+        if (canonical) pushCandidate(canonical, 0.98, 'composio_oauth');
+      }
+      const id = `account:${slug}`;
+      const catEntry =
+        catalogById.get(id) ??
+        entry.parse({
+          id,
+          name: typeof tk.name === 'string' && tk.name.trim() ? tk.name.trim() : slug,
+          description: typeof tk.description === 'string' ? tk.description.slice(0, 10000) : '',
+          kind: 'connector',
+          groups: ['accounts'],
+          ...(typeof tk.logo === 'string' && /^https?:\/\//i.test(tk.logo) ? { logo: tk.logo } : {}),
+        });
+      const qLowerClean = query.trim().toLowerCase();
+      const isMcpWrapperToolkit = slug.endsWith('_mcp');
+      const score = isMcpWrapperToolkit
+        ? 0.72
+        : slug === qLowerClean
+          ? 0.98
+          : qLowerClean.includes(slug)
+            ? 0.95
+            : 0.86;
+      pushCandidate(catEntry, score, 'composio_oauth');
+    }
+
+    for (const oc of body.onchain?.connectors ?? []) {
+      const rawId = typeof oc.id === 'string' ? oc.id.trim().toLowerCase() : '';
+      if (!rawId) continue;
+      const id = `onchain:${rawId}`;
+      const catEntry =
+        catalogById.get(id) ??
+        entry.parse({
+          id,
+          name: typeof oc.name === 'string' && oc.name.trim() ? oc.name.trim() : rawId,
+          description: typeof oc.description === 'string' ? oc.description.slice(0, 10000) : '',
+          kind: 'connector',
+          groups: ['onchain'],
+        });
+      pushCandidate(catEntry, 0.88, 'onchain');
+    }
+
+    const servers = body.mcps?.servers ?? [];
+    servers.forEach((srv, idx) => {
+      const slug = typeof srv.slug === 'string' ? srv.slug.trim() : '';
+      if (!slug) return;
+      const catEntry =
+        catalogById.get(slug.toLowerCase()) ??
+        entry.parse({
+          id: slug,
+          name: typeof srv.name === 'string' && srv.name.trim() ? srv.name.trim() : slug,
+          description: typeof srv.description === 'string' ? srv.description.slice(0, 10000) : '',
+          kind: 'connector',
+          groups: ['mcps'],
+        });
+      const srvScore =
+        typeof srv.score === 'number' && Number.isFinite(srv.score)
+          ? srv.score
+          : Math.max(0.4, 0.84 - idx * 0.04);
+      const authType = srv.status === 'credential_gated' ? 'mcp_credentials' : 'mcp_live';
+      pushCandidate(catEntry, srvScore, authType);
+    });
+  }
+
+  if (out.length === 0) {
+    const qLower = query.trim().toLowerCase();
+    for (const item of catalogEntries) {
+      const hay = `${item.id} ${item.name} ${item.description}`.toLowerCase();
+      if (qLower.split(/\s+/).some(t => t.length >= 2 && hay.includes(t))) {
+        pushCandidate(item, item.id.toLowerCase().includes(qLower) ? 0.8 : 0.5, 'catalog');
+      }
+    }
+  }
+
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, limit).map(({ entry: item, score, authType }) => ({
+    id: item.id,
+    name: item.name,
+    kind: 'connector',
+    authType,
+    ...(item.groups?.length ? { groups: item.groups } : {}),
+    score: Number(score.toFixed(3)),
+    description: item.description.slice(0, 180),
+  }));
+}
