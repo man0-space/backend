@@ -611,3 +611,70 @@ function computeWaveLayout(nodes: FlowBlock[], edges: FlowLink[]): Record<string
   }
   return positions;
 }
+
+function normalizeConnectorEntryId(raw: string): string {
+  const trimmed = raw.trim();
+  if (/^mcp:/i.test(trimmed)) return trimmed.slice(4).trim();
+  if (/^account:/i.test(trimmed)) return `account:${trimmed.slice(8).trim().toLowerCase()}`;
+  if (/^onchain:/i.test(trimmed)) return `onchain:${trimmed.slice(8).trim().toLowerCase()}`;
+  return trimmed;
+}
+
+function isNearIntentsQuery(query: string): boolean {
+  return /\b(near\s*intents?|1click|cross[-\s]?chain|swap|bridge|defi|usdc|token\s+swap)\b/i.test(query);
+}
+
+function inferRequestedModality(query: string, explicitModality?: string): string | undefined {
+  if (explicitModality && explicitModality.trim()) return explicitModality.trim().toLowerCase();
+  const q = query.toLowerCase();
+  if (/\b(transcrib|speech[-\s]?to[-\s]?text|asr|voice\s+note|audio\s+to\s+text|whisper|dictat)\b/.test(q)) {
+    return 'speech';
+  }
+  if (/\b(embed|embedding|vector\s+index)\b/.test(q)) {
+    return 'embeddings';
+  }
+  if (/\b(cover\s+art|book\s+cover|illustration|generate\s+image|image\s+generation|text[-\s]?to[-\s]?image|poster|artwork|thumbnail|visual)\b/.test(q)) {
+    return 'image-generation';
+  }
+  if (/\b(generate\s+video|video\s+generation|text[-\s]?to[-\s]?video|image[-\s]?to[-\s]?video|animation\s+clip)\b/.test(q)) {
+    return 'video-generation';
+  }
+  if (/\b(generate\s+music|music\s+generation|song\s+generation|soundtrack|text[-\s]?to[-\s]?audio)\b/.test(q)) {
+    return 'music-generation';
+  }
+  return undefined;
+}
+
+function buildModelCatalogEntryFromWorkerRow(
+  row: Record<string, unknown>,
+  existing?: CatalogEntry,
+): CatalogEntry | null {
+  if (existing) return existing;
+  const modelId = typeof row.modelId === 'string' ? row.modelId.trim() : '';
+  if (!modelId) return null;
+  const rawTypes = Array.isArray(row.type)
+    ? row.type.filter((t): t is string => typeof t === 'string').map(t => t.trim().toLowerCase())
+    : typeof row.type === 'string'
+      ? [row.type.trim().toLowerCase()]
+      : [];
+  const modality = rawTypes[0];
+  const primaryGroup = MODALITY_TO_GROUP[modality] ?? 'others';
+  const subgroups = primaryGroup === 'others' ? [`others/${modality}`] : undefined;
+  const family =
+    typeof row.family === 'string' && row.family.trim()
+      ? row.family.trim().toLowerCase()
+      : undefined;
+  const parsed = entry.safeParse({
+    id: modelId,
+    name: typeof row.name === 'string' && row.name.trim() ? row.name.trim().slice(0, 200) : modelId,
+    description: typeof row.description === 'string' ? row.description.slice(0, 10000) : '',
+    kind: 'model',
+    groups: [primaryGroup],
+    ...(subgroups ? { subgroups } : {}),
+    modality,
+    ...(family ? { family } : {}),
+    ...(row.isFrontier === true ? { isFrontier: true } : {}),
+    ...(row.isLatest === true ? { isLatest: true } : {}),
+  });
+  return parsed.success ? parsed.data : null;
+}
