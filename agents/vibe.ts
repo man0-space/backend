@@ -1081,3 +1081,187 @@ async function searchAgentsWorker(
 
   return out.slice(0, limit);
 }
+
+async function queryCatalogRoutes(
+  query: string,
+  kindFilter: 'model' | 'connector' | 'agent' | undefined,
+  limit: number,
+  loadCatalog: (role: string) => Promise<CatalogEntry[]>,
+  discoveredEntries: Map<string, CatalogEntry>,
+  fetchImpl: typeof fetch,
+): Promise<Record<string, unknown>> {
+  // If caller explicitly specified kind, run the dedicated worker semantic search directly
+  // so the agent immediately gets ranked, frontier-prioritized domain entries!
+  if (kindFilter === 'model') {
+    const entries = await searchModelsWorker(query, { limit }, loadCatalog, discoveredEntries, fetchImpl);
+    return { ok: true, domain: 'models', count: entries.length, entries };
+  }
+  if (kindFilter === 'connector') {
+    const entries = await searchConnectorsWorker(query, limit, loadCatalog, discoveredEntries, fetchImpl);
+    return { ok: true, domain: 'connectors', count: entries.length, entries };
+  }
+  if (kindFilter === 'agent') {
+    const entries = await searchAgentsWorker(query, 'executor', limit, loadCatalog, discoveredEntries, fetchImpl);
+    return { ok: true, domain: 'agents', count: entries.length, entries };
+  }
+
+  // Otherwise hit the real routes.compose.market/query cross-domain Vectorize + Voyage rerank router
+  const res = await fetchImpl(COMPOSE_ROUTES_QUERY_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    signal: AbortSignal.timeout(8_000),
+    body: JSON.stringify({ query }),
+  }).catch(() => null);
+
+  if (res?.ok) {
+    const body = (await res.json().catch(() => ({}))) as {
+      matches?: Array<Record<string, unknown>>;
+      results?: Array<Record<string, unknown>>;
+      next?: string[];
+    };
+    if (Array.isArray(body.matches) && body.matches.length > 0) {
+      const matches = body.matches.map(m => {
+        const domain = typeof m.domain === 'string' ? m.domain : 'models';
+        const rawRef = typeof m.ref === 'string' ? m.ref : '';
+        const entryId = domain === 'connectors' ? normalizeConnectorEntryId(rawRef) : rawRef;
+        const rawNext = typeof m.nextTool === 'string' ? m.nextTool : '';
+        const nextTool =
+          rawNext === 'models_call' || domain === 'models'
+            ? 'models_find'
+            : rawNext === 'swarm_find' || domain === 'agents'
+              ? 'agent_find'
+              : 'connectors_find';
+        return {
+          domain,
+          entryId,
+          label: m.label,
+          score: typeof m.score === 'number' ? Number(m.score.toFixed(3)) : 0,
+          nextTool,
+          ...(typeof m.evidence === 'string' ? { evidence: m.evidence.slice(0, 200) } : {}),
+        };
+      });
+      const topDomain = matches[0]?.domain;
+      let domainEntries: Array<Record<string, unknown>> = [];
+      if (topDomain === 'models') {
+        domainEntries = await searchModelsWorker(
+          query,
+          { limit },
+          loadCatalog,
+          discoveredEntries,
+          fetchImpl,
+        );
+      } else if (topDomain === 'connectors') {
+        domainEntries = await searchConnectorsWorker(
+          query,
+          limit,
+          loadCatalog,
+          discoveredEntries,
+          fetchImpl,
+        );
+      } else if (topDomain === 'agents') {
+        domainEntries = await searchAgentsWorker(
+          query,
+          'executor',
+          limit,
+          loadCatalog,
+          discoveredEntries,
+          fetchImpl,
+        );
+      }
+      return {
+        ok: true,
+        query,
+        routedDomain: topDomain,
+        ...(domainEntries.length > 0 ? { entries: domainEntries } : {}),
+        routeHints: matches.slice(0, 4),
+        guidance:
+          'Prefer entries from `entries` (already ranked by isFrontier > isLatest > semantic score).',
+      };
+    }
+  }
+
+  // Fallback: run models_find + connectors_find in parallel
+  const [models, connectors] = await Promise.all([
+    searchModelsWorker(query, { limit: Math.ceil(limit / 2) }, loadCatalog, discoveredEntries, fetchImpl),
+    searchConnectorsWorker(query, Math.ceil(limit / 2), loadCatalog, discoveredEntries, fetchImpl),
+  ]);
+  const combined = [...connectors, ...models].slice(0, limit);
+  return { ok: true, count: combined.length, entries: combined };
+}
+
+async function resolveCatalogEntryForStep(
+  stepKind: 'model' | 'connector' | 'agent',
+  rawEntryId: string,
+  loadCatalog: (role: string) => Promise<CatalogEntry[]>,
+  discoveredEntries: Map<string, CatalogEntry>,
+  fetchImpl: typeof fetch,
+): Promise<CatalogEntry | undefined> {
+  const trimmed = rawEntryId.trim();
+  if (!trimmed) return undefined;
+
+  const candidateIds: string[] = [trimmed];
+  if (stepKind === 'connector') {
+    const norm = normalizeConnectorEntryId(trimmed);
+    if (!candidateIds.includes(norm)) candidateIds.push(norm);
+    if (!norm.includes(':')) {
+      candidateIds.push(`account:${norm.toLowerCase()}`);
+      candidateIds.push(`onchain:${norm.toLowerCase()}`);
+    }
+  } else if (stepKind === 'model' && trimmed.includes(':')) {
+    const afterColon = trimmed.slice(trimmed.indexOf(':') + 1).trim();
+    if (afterColon) candidateIds.push(afterColon);
+  }
+
+  for (const cid of candidateIds) {
+    const hit = discoveredEntries.get(`${stepKind}:${cid.toLowerCase()}`);
+    if (hit) return hit;
+  }
+
+  const entries = await loadCatalog(stepKind).catch(() => [] as CatalogEntry[]);
+  for (const cid of candidateIds) {
+    const exact =
+      entries.find(e => e.id === cid) ??
+      entries.find(e => e.id.toLowerCase() === cid.toLowerCase()) ??
+      entries.find(e => e.name.toLowerCase() === cid.toLowerCase());
+    if (exact) return exact;
+  }
+
+  // Live worker lookup fallback if not yet in cached catalog
+  if (stepKind === 'model') {
+    const targetId = candidateIds[candidateIds.length - 1]!;
+    const lookupUrl = new URL(`${COMPOSE_MODELS_ORIGIN}/lookup`);
+    lookupUrl.searchParams.set('modelId', targetId);
+    const res = await fetchImpl(lookupUrl, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(6_000),
+    }).catch(() => null);
+    if (res?.ok) {
+      const body = (await res.json().catch(() => ({}))) as {
+        found?: boolean;
+        model?: Record<string, unknown>;
+      };
+      if (body.found && body.model) {
+        const built = buildModelCatalogEntryFromWorkerRow(body.model);
+        if (built) {
+          discoveredEntries.set(`model:${built.id.toLowerCase()}`, built);
+          return built;
+        }
+      }
+    }
+  } else if (stepKind === 'connector') {
+    const found = await searchConnectorsWorker(trimmed, 4, loadCatalog, discoveredEntries, fetchImpl);
+    for (const cid of candidateIds) {
+      const hit = discoveredEntries.get(`connector:${cid.toLowerCase()}`);
+      if (hit) return hit;
+    }
+    if (found[0] && typeof found[0].id === 'string') {
+      const topId = found[0].id.toLowerCase();
+      const norm = normalizeConnectorEntryId(trimmed).toLowerCase();
+      if (topId === norm || topId === `account:${norm}` || topId === `onchain:${norm}`) {
+        return discoveredEntries.get(`connector:${topId}`);
+      }
+    }
+  }
+
+  return undefined;
+}
