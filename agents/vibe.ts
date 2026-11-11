@@ -678,3 +678,199 @@ function buildModelCatalogEntryFromWorkerRow(
   });
   return parsed.success ? parsed.data : null;
 }
+
+async function searchModelsWorker(
+  query: string,
+  options: { modality?: string; limit: number },
+  loadCatalog: (role: string) => Promise<CatalogEntry[]>,
+  discoveredEntries: Map<string, CatalogEntry>,
+  fetchImpl: typeof fetch,
+): Promise<Array<Record<string, unknown>>> {
+  const inferredModality = inferRequestedModality(query, options.modality);
+  const catalogEntries = await loadCatalog('model').catch(() => [] as CatalogEntry[]);
+  const catalogById = new Map(catalogEntries.map(item => [item.id.toLowerCase(), item]));
+
+  const searchUrl = new URL(`${COMPOSE_MODELS_ORIGIN}/search`);
+  searchUrl.searchParams.set('q', query);
+  searchUrl.searchParams.set('limit', String(Math.max(20, options.limit * 4)));
+  if (inferredModality && FRONTIER_MODALITIES.has(inferredModality)) {
+    searchUrl.searchParams.set('modality', inferredModality);
+  }
+
+  const frontierUrl = new URL(`${COMPOSE_MODELS_ORIGIN}/models`);
+  frontierUrl.searchParams.set('frontier', '1');
+  frontierUrl.searchParams.set('limit', '50');
+
+  const [searchRes, frontierRes] = await Promise.all([
+    fetchImpl(searchUrl, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(8_000),
+    }).catch(() => null),
+    fetchImpl(frontierUrl, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(8_000),
+    }).catch(() => null),
+  ]);
+
+  const searchBody = searchRes?.ok
+    ? ((await searchRes.json().catch(() => ({}))) as {
+      data?: Array<Record<string, unknown>>;
+      results?: Array<Record<string, unknown>>;
+    })
+    : {};
+  const frontierBody = frontierRes?.ok
+    ? ((await frontierRes.json().catch(() => ({}))) as { data?: Array<Record<string, unknown>> })
+    : {};
+
+  const rawSearchRows = Array.isArray(searchBody.data)
+    ? searchBody.data
+    : Array.isArray(searchBody.results)
+      ? searchBody.results
+      : [];
+  const rawFrontierRows = Array.isArray(frontierBody.data) ? frontierBody.data : [];
+
+  // Determine dominant modality if not explicitly known
+  let targetModality = inferredModality;
+  if (!targetModality && rawSearchRows.length > 0) {
+    const topRow = rawSearchRows[0]!;
+    const topTypes = Array.isArray(topRow.type)
+      ? topRow.type.filter((t): t is string => typeof t === 'string')
+      : typeof topRow.type === 'string'
+        ? [topRow.type]
+        : [];
+    targetModality = topTypes[0]?.toLowerCase() || 'text-generation';
+  }
+  if (!targetModality) targetModality = 'text-generation';
+
+  interface Candidate {
+    entry: CatalogEntry;
+    score: number;
+    isFrontier: boolean;
+    isLatest: boolean;
+    exactNameMatch: boolean;
+  }
+
+  const byModelId = new Map<string, Candidate>();
+  const qNorm = query.trim().toLowerCase();
+
+  const upsertCandidate = (row: Record<string, unknown>, baseScore: number) => {
+    if (row.available === false) return;
+    const rawId = typeof row.modelId === 'string' ? row.modelId.trim() : typeof row.id === 'string' ? row.id.trim() : '';
+    if (!rawId) return;
+    const existingCatalog = catalogById.get(rawId.toLowerCase());
+    const catEntry = buildModelCatalogEntryFromWorkerRow(row, existingCatalog);
+    if (!catEntry) return;
+
+    const isFrontier = Boolean(row.isFrontier || catEntry.isFrontier);
+    const isLatest = Boolean(row.isLatest || catEntry.isLatest);
+    const enriched: CatalogEntry = {
+      ...catEntry,
+      ...(isFrontier ? { isFrontier: true } : {}),
+      ...(isLatest ? { isLatest: true } : {}),
+    };
+    discoveredEntries.set(`model:${enriched.id.toLowerCase()}`, enriched);
+
+    const exactNameMatch =
+      qNorm.length >= 3 &&
+      (enriched.id.toLowerCase() === qNorm ||
+        enriched.name.toLowerCase() === qNorm ||
+        qNorm.includes(enriched.id.toLowerCase()));
+
+    const prev = byModelId.get(enriched.id.toLowerCase());
+    if (!prev || baseScore > prev.score || (isFrontier && !prev.isFrontier)) {
+      byModelId.set(enriched.id.toLowerCase(), {
+        entry: enriched,
+        score: Math.max(prev?.score ?? 0, baseScore),
+        isFrontier: Boolean(isFrontier || prev?.isFrontier),
+        isLatest: Boolean(isLatest || prev?.isLatest),
+        exactNameMatch: Boolean(exactNameMatch || prev?.exactNameMatch),
+      });
+    }
+  };
+
+  for (const row of rawSearchRows) {
+    const s = typeof row.score === 'number' && Number.isFinite(row.score) ? row.score : 0.5;
+    upsertCandidate(row, s);
+  }
+
+  // For modalities covered by Frontier models (text, image, video, music), guarantee Frontier models
+  // for that exact modality are included and prioritized above generic/obscure non-frontier finetunes.
+  if (FRONTIER_MODALITIES.has(targetModality)) {
+    const targetGroup = MODALITY_TO_GROUP[targetModality];
+    for (const row of rawFrontierRows) {
+      const rowTypes = Array.isArray(row.type)
+        ? row.type.filter((t): t is string => typeof t === 'string').map(t => t.toLowerCase())
+        : [];
+      if (rowTypes.includes(targetModality)) {
+        upsertCandidate(row, 0.72);
+      }
+    }
+    // Also fallback to catalogLoader's own frontier entries for that group (e.g. in offline/mocked tests)
+    for (const item of catalogEntries) {
+      if (item.isFrontier && (!targetGroup || item.groups?.includes(targetGroup) || !item.groups)) {
+        discoveredEntries.set(`model:${item.id.toLowerCase()}`, item);
+        if (!byModelId.has(item.id.toLowerCase())) {
+          byModelId.set(item.id.toLowerCase(), {
+            entry: item,
+            score: 0.7,
+            isFrontier: true,
+            isLatest: Boolean(item.isLatest),
+            exactNameMatch: qNorm.includes(item.id.toLowerCase()),
+          });
+        }
+      }
+    }
+  } else if (byModelId.size === 0) {
+    // Fallback to catalogEntries lexical match only if worker was unreachable
+    for (const item of catalogEntries) {
+      const text = `${item.id} ${item.name} ${item.description} ${item.modality ?? ''}`.toLowerCase();
+      if (qNorm.split(/\s+/).some(term => term.length >= 2 && text.includes(term))) {
+        discoveredEntries.set(`model:${item.id.toLowerCase()}`, item);
+        byModelId.set(item.id.toLowerCase(), {
+          entry: item,
+          score: 0.5,
+          isFrontier: Boolean(item.isFrontier),
+          isLatest: Boolean(item.isLatest),
+          exactNameMatch: item.id.toLowerCase() === qNorm,
+        });
+      }
+    }
+  }
+
+  const ranked = [...byModelId.values()].sort((a, b) => {
+    if (a.exactNameMatch !== b.exactNameMatch) return a.exactNameMatch ? -1 : 1;
+    if (a.isFrontier !== b.isFrontier) return a.isFrontier ? -1 : 1;
+    if (a.isLatest !== b.isLatest) return a.isLatest ? -1 : 1;
+    return b.score - a.score;
+  });
+
+  // Diversify top frontier picks across families when scores are tied so the agent sees top options
+  const diversified: Candidate[] = [];
+  const seenFrontierFamily = new Set<string>();
+  const deferredSameFamily: Candidate[] = [];
+  for (const cand of ranked) {
+    const fam = cand.entry.family || '';
+    if (cand.isFrontier && !cand.exactNameMatch && fam && seenFrontierFamily.has(fam)) {
+      deferredSameFamily.push(cand);
+    } else {
+      if (cand.isFrontier && fam) seenFrontierFamily.add(fam);
+      diversified.push(cand);
+    }
+  }
+  const finalList = [...diversified, ...deferredSameFamily].slice(0, options.limit);
+
+  return finalList.map(({ entry: item, score, isFrontier, isLatest }) => ({
+    id: item.id,
+    name: item.name,
+    kind: 'model',
+    ...(item.family ? { family: item.family } : {}),
+    ...(item.modality ? { modality: item.modality } : {}),
+    ...(item.groups?.length ? { groups: item.groups } : {}),
+    isFrontier,
+    isLatest,
+    score: Number(score.toFixed(3)),
+    description: item.description.slice(0, 180),
+  }));
+}
