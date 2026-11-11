@@ -1265,3 +1265,109 @@ async function resolveCatalogEntryForStep(
 
   return undefined;
 }
+
+async function streamNebiusTurn(
+  messages: Array<Record<string, unknown>>,
+  onDelta: (delta: string) => void,
+  fetchImpl: typeof fetch,
+  signal?: AbortSignal,
+): Promise<{ content: string; toolCalls: StreamToolCall[] }> {
+  const response = await fetchImpl(NEBIUS_CHAT_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${config.nebiusApiKey}`,
+    },
+    signal,
+    body: JSON.stringify({
+      model: VIBE_MODEL,
+      messages,
+      tools: VIBE_TOOLS,
+      tool_choice: 'auto',
+      temperature: 0.35,
+      max_tokens: 4096,
+      stream: true,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    const errText = await response.text().catch(() => '');
+    throw Object.assign(
+      new Error(`Vibe Nemotron request failed (${response.status}): ${errText.slice(0, 240)}`),
+      { statusCode: 502 },
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  const toolCallsByIndex = new Map<number, StreamToolCall>();
+
+  const processLine = (rawLine: string) => {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let parsed: {
+      choices?: Array<{
+        delta?: {
+          content?: string | null;
+          tool_calls?: Array<{
+            index?: number;
+            id?: string;
+            function?: { name?: string; arguments?: string };
+          }>;
+        };
+      }>;
+    };
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    const delta = parsed.choices?.[0]?.delta;
+    if (!delta) return;
+    if (typeof delta.content === 'string' && delta.content.length > 0) {
+      content += delta.content;
+      onDelta(delta.content);
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = typeof tc.index === 'number' ? tc.index : 0;
+        const existing = toolCallsByIndex.get(idx) ?? {
+          id: tc.id || `call_${idx}_${randomUUID().slice(0, 6)}`,
+          name: '',
+          arguments: '',
+        };
+        if (tc.id) existing.id = tc.id;
+        if (tc.function?.name) existing.name += tc.function.name;
+        if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+        toolCallsByIndex.set(idx, existing);
+      }
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const rawLine of lines) {
+      processLine(rawLine);
+    }
+  }
+  if (buffer.trim()) {
+    processLine(buffer);
+  }
+
+  return {
+    content,
+    toolCalls: [...toolCallsByIndex.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, call]) => call)
+      .filter(call => call.name.length > 0),
+  };
+}
