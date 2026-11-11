@@ -487,3 +487,127 @@ const VIBE_TOOLS = [
     },
   },
 ] as const;
+
+function makeWireEdge(source: string, target: string): FlowLink {
+  return {
+    id: `wire-${source}-${target}`,
+    source,
+    target,
+    sourceHandle: 'out',
+    targetHandle: 'in',
+    type: 'wire',
+  };
+}
+
+function wouldCreateCycle(nodes: FlowBlock[], edges: FlowLink[], source: string, target: string): boolean {
+  if (source === target) return true;
+  const adj = new Map<string, string[]>(nodes.map(n => [n.id, []]));
+  for (const e of edges) {
+    adj.get(e.source)?.push(e.target);
+  }
+  adj.get(source)?.push(target);
+
+  const visited = new Set<string>();
+  const stack = [target];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (cur === source) return true;
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    for (const next of adj.get(cur) ?? []) {
+      stack.push(next);
+    }
+  }
+  return false;
+}
+
+function computeDirectionalPosition(
+  nodes: FlowBlock[],
+  anchorId?: string,
+  direction: Direction = 'right',
+): { x: number; y: number } {
+  const anchor = anchorId ? nodes.find(n => n.id === anchorId) : nodes[nodes.length - 1];
+  let x = 100;
+  let y = 140;
+  if (anchor) {
+    switch (direction) {
+      case 'right':
+        x = anchor.position.x + STEP_DX;
+        y = anchor.position.y;
+        break;
+      case 'left':
+        x = Math.max(20, anchor.position.x - STEP_DX);
+        y = anchor.position.y;
+        break;
+      case 'down':
+        x = anchor.position.x;
+        y = anchor.position.y + STEP_DY;
+        break;
+      case 'up':
+        x = anchor.position.x;
+        y = anchor.position.y - STEP_DY;
+        break;
+    }
+  }
+
+  const dy = direction === 'up' ? -STEP_DY : STEP_DY;
+  while (
+    nodes.some(
+      n => Math.abs(n.position.x - x) < STEP_DX * 0.75 && Math.abs(n.position.y - y) < STEP_DY * 0.75,
+    )
+  ) {
+    y += dy;
+  }
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+function computeWaveLayout(nodes: FlowBlock[], edges: FlowLink[]): Record<string, { x: number; y: number }> {
+  const inDeg = new Map<string, number>(nodes.map(n => [n.id, 0]));
+  const adj = new Map<string, string[]>(nodes.map(n => [n.id, []]));
+  for (const e of edges) {
+    if (adj.has(e.source) && inDeg.has(e.target)) {
+      adj.get(e.source)!.push(e.target);
+      inDeg.set(e.target, (inDeg.get(e.target) ?? 0) + 1);
+    }
+  }
+
+  const waveOf = new Map<string, number>();
+  const queue: string[] = [];
+  for (const n of nodes) {
+    if ((inDeg.get(n.id) ?? 0) === 0) {
+      waveOf.set(n.id, 0);
+      queue.push(n.id);
+    }
+  }
+
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    const curWave = waveOf.get(cur) ?? 0;
+    for (const next of adj.get(cur) ?? []) {
+      waveOf.set(next, Math.max(waveOf.get(next) ?? 0, curWave + 1));
+      const d = (inDeg.get(next) ?? 1) - 1;
+      inDeg.set(next, d);
+      if (d === 0) queue.push(next);
+    }
+  }
+
+  const byWave = new Map<number, FlowBlock[]>();
+  for (const n of nodes) {
+    const w = waveOf.get(n.id) ?? 0;
+    const list = byWave.get(w) ?? [];
+    list.push(n);
+    byWave.set(w, list);
+  }
+
+  const positions: Record<string, { x: number; y: number }> = {};
+  for (const [wave, waveNodes] of [...byWave.entries()].sort(([a], [b]) => a - b)) {
+    const offsetY = -((waveNodes.length - 1) * STEP_DY) / 2;
+    waveNodes.forEach((n, idx) => {
+      positions[n.id] = {
+        x: Math.round(100 + wave * STEP_DX),
+        y: Math.round(180 + offsetY + idx * STEP_DY),
+      };
+    });
+  }
+  return positions;
+}
