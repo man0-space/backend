@@ -1371,3 +1371,810 @@ async function streamNebiusTurn(
       .filter(call => call.name.length > 0),
   };
 }
+
+export function createVibeStream(
+  input: {
+    prompt: string;
+    flow: Flow;
+    userAddress: string;
+    history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    signal?: AbortSignal;
+  },
+  deps: VibeDeps = {},
+): PassThrough {
+  const stream = new PassThrough();
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const loadCatalog = deps.catalogLoader ?? (role => catalog(role));
+  const makeBanner = deps.bannerGenerator ?? (args => generateBanner(args, { fetchImpl }));
+  const loadCoordinators = deps.coordinatorsLoader ?? (addr => coordinators.list(addr));
+  const log = deps.logger;
+
+  const emit = (event: VibeStreamEvent) => {
+    if (!stream.destroyed) {
+      stream.write(`${JSON.stringify(event)}\n`);
+    }
+  };
+
+  void (async () => {
+    try {
+      const hadInitialBanner = Boolean(input.flow.banner);
+      const working: Flow = {
+        ...input.flow,
+        nodes: input.flow.nodes.map(n => ({ ...n, position: { ...n.position }, data: { ...n.data } })),
+        edges: input.flow.edges.map(e => ({ ...e })),
+        tasks: input.flow.tasks ? [...input.flow.tasks] : undefined,
+      };
+
+      const discoveredEntries = new Map<string, CatalogEntry>();
+      const stepAliases = new Map<string, string>();
+      for (const existingNode of working.nodes) {
+        stepAliases.set(existingNode.id, existingNode.id);
+        stepAliases.set(existingNode.data.label.trim().toLowerCase(), existingNode.id);
+      }
+      let lastAddedNodeId: string | undefined = working.nodes[working.nodes.length - 1]?.id;
+
+      const resolveNodeRef = (ref?: string): string | undefined => {
+        if (!ref || !ref.trim()) return undefined;
+        const clean = ref.trim();
+        const aliased = stepAliases.get(clean) ?? stepAliases.get(clean.toLowerCase());
+        if (aliased && working.nodes.some(n => n.id === aliased)) return aliased;
+        const exact = working.nodes.find(
+          n => n.id === clean || n.data.label.trim().toLowerCase() === clean.toLowerCase(),
+        );
+        return exact?.id;
+      };
+
+      const applyPatch = (patch: VibePatch) => {
+        working.modified = new Date().toISOString();
+        emit({ type: 'patch', patch });
+      };
+
+      const extractBannerLogosFromNodes = (nodes: FlowBlock[]): MediaLogoHint[] => {
+        const seen = new Set<string>();
+        const logos: MediaLogoHint[] = [];
+        const FAMILY_BRAND_LABELS: Record<string, string> = {
+          claude: 'Claude',
+          anthropic: 'Claude',
+          openai: 'OpenAI',
+          gpt: 'OpenAI',
+          gemini: 'Gemini',
+          google: 'Gemini',
+          deepseek: 'DeepSeek',
+          qwen: 'Qwen',
+          flux: 'FLUX',
+          bfl: 'FLUX',
+          deepgram: 'Deepgram',
+          nova: 'Deepgram',
+          llama: 'Meta Llama',
+          meta: 'Meta Llama',
+          mistral: 'Mistral',
+          kimi: 'Kimi',
+          moonshot: 'Kimi',
+          grok: 'Grok',
+          xai: 'Grok',
+          elevenlabs: 'ElevenLabs',
+          minimax: 'MiniMax',
+        };
+        const pushLogo = (name: string, url?: string) => {
+          const clean = name.trim();
+          if (!clean) return;
+          const key = clean.toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          logos.push({ name: clean, ...(url ? { url } : {}) });
+        };
+
+        for (const node of nodes) {
+          const ent = node.data.entry;
+          if (!ent) continue;
+          if (node.data.kind === 'connector') {
+            if (ent.id === 'near-intents') {
+              pushLogo('NEAR Protocol', ent.logo);
+            } else {
+              const cleanConnBrand = ent.name.replace(/\s+(mcp|server)$/i, '').trim() || ent.name;
+              pushLogo(cleanConnBrand, ent.logo);
+            }
+          } else if (node.data.kind === 'model') {
+            const famKey = (ent.family || ent.id.split(/[-:/]/)[0] || '').toLowerCase();
+            const brand =
+              FAMILY_BRAND_LABELS[famKey] ||
+              Object.entries(FAMILY_BRAND_LABELS).find(([k]) => ent.id.toLowerCase().includes(k))?.[1] ||
+              (ent.family ? ent.family.charAt(0).toUpperCase() + ent.family.slice(1) : ent.name);
+            pushLogo(brand, ent.logo);
+          } else if (node.data.kind === 'agent') {
+            pushLogo(ent.name, ent.logo);
+          }
+        }
+        return logos.slice(0, 6);
+      };
+
+      let bannerPromise: Promise<string | null> | null = null;
+      const startBannerGeneration = (opts?: {
+        title?: string;
+        description?: string;
+        force?: boolean;
+      }): Promise<string | null> => {
+        if (bannerPromise && !opts?.force) return bannerPromise;
+        const resolvedTitle =
+          (opts?.title ?? working.name ?? '').trim().replace(/^unknown(?:\s*#\d+)?$/i, '').trim() ||
+          'man0 Workflow';
+        const resolvedDescription =
+          (opts?.description ?? working.brief ?? '').trim() || input.prompt.trim();
+        const logos = extractBannerLogosFromNodes(working.nodes);
+
+        emit({ type: 'banner_start' });
+        const job = (async () => {
+          try {
+            const generated = await makeBanner({
+              title: resolvedTitle,
+              description: resolvedDescription,
+              ...(logos.length > 0 ? { logos } : {}),
+            });
+            working.banner = generated.imageUrl;
+            applyPatch({ op: 'set_banner', banner: generated.imageUrl });
+            log?.info(
+              { workflowId: working.id, imageUrl: generated.imageUrl, logos: logos.map(l => l.name) },
+              'vibe banner generated',
+            );
+            return generated.imageUrl;
+          } catch (bannerErr) {
+            log?.warn(
+              {
+                workflowId: working.id,
+                err: bannerErr instanceof Error ? bannerErr.message : String(bannerErr),
+              },
+              'vibe banner generation warning',
+            );
+            return null;
+          }
+        })();
+        bannerPromise = job;
+        return job;
+      };
+
+      const flowSummary = {
+        id: working.id,
+        name: working.name,
+        brief: working.brief ?? '',
+        tasks: working.tasks ?? [],
+        hasBanner: Boolean(working.banner),
+        coordinator: working.coordinator
+          ? { id: working.coordinator.id, name: working.coordinator.name, model: working.coordinator.model }
+          : null,
+        steps: working.nodes.map(n => ({
+          id: n.id,
+          label: n.data.label,
+          kind: n.data.kind,
+          entryId: n.data.entry?.id ?? null,
+          position: n.position,
+          notePreview: n.data.note.slice(0, 140),
+        })),
+        edges: working.edges.map(e => ({ source: e.source, target: e.target })),
+      };
+
+      const messages: Array<Record<string, unknown>> = [
+        { role: 'system', content: VIBE_SYSTEM_PROMPT },
+        ...(input.history ?? []).slice(-6).map(m => ({ role: m.role, content: m.content })),
+        {
+          role: 'user',
+          content: `Current Studio Workflow State:\n${JSON.stringify(flowSummary)}\n\nCreator Request:\n${input.prompt}`,
+        },
+      ];
+
+      emit({ type: 'status', text: 'Planning workflow architecture...' });
+
+      let finalAssistantText = '';
+      const maxTurns = 16;
+
+      for (let turn = 0; turn < maxTurns; turn += 1) {
+        const { content, toolCalls } = await streamNebiusTurn(
+          messages,
+          delta => emit({ type: 'delta', text: delta }),
+          fetchImpl,
+          input.signal,
+        );
+
+        if (content.trim()) {
+          finalAssistantText = content.trim();
+        }
+
+        log?.info(
+          {
+            workflowId: working.id,
+            turn: turn + 1,
+            toolCalls: toolCalls.map(tc => tc.name),
+          },
+          'vibe turn received',
+        );
+
+        if (toolCalls.length === 0) {
+          break;
+        }
+
+        messages.push({
+          role: 'assistant',
+          content: content || null,
+          tool_calls: toolCalls.map(tc => ({
+            id: tc.id,
+            type: 'function',
+            function: {
+              name: tc.name,
+              arguments: tc.arguments || '{}',
+            },
+          })),
+        });
+
+        let siblingTitleHint: string | undefined;
+        for (const candidateCall of toolCalls) {
+          if (candidateCall.name === 'set_title' && candidateCall.arguments) {
+            try {
+              const parsedTitleArgs = JSON.parse(candidateCall.arguments) as Record<string, unknown>;
+              if (typeof parsedTitleArgs.title === 'string' && parsedTitleArgs.title.trim()) {
+                siblingTitleHint = parsedTitleArgs.title.trim().slice(0, 200);
+              }
+            } catch {
+              // Ignore malformed sibling args here; handled in main loop
+            }
+          }
+        }
+
+        for (const call of toolCalls) {
+          let args: Record<string, unknown> = {};
+          let parseErr: string | null = null;
+          try {
+            args = call.arguments ? (JSON.parse(call.arguments) as Record<string, unknown>) : {};
+          } catch (err) {
+            parseErr = err instanceof Error ? err.message : 'Malformed JSON arguments';
+            args = {};
+          }
+
+          let toolResult: Record<string, unknown>;
+          if (parseErr) {
+            log?.warn({ workflowId: working.id, tool: call.name, parseErr }, 'vibe malformed tool args');
+            toolResult = {
+              ok: false,
+              error: `Malformed JSON tool arguments (${parseErr}). Retry ${call.name} with valid JSON.`,
+            };
+            messages.push({
+              role: 'tool',
+              tool_call_id: call.id,
+              content: JSON.stringify(toolResult),
+            });
+            continue;
+          }
+
+          try {
+            switch (call.name) {
+              case 'read_categories_library': {
+                emit({ type: 'status', text: 'Reading categories library...' });
+                toolResult = { ok: true, library: getCategoriesLibraryContext() };
+                break;
+              }
+              case 'read_dag_library': {
+                emit({ type: 'status', text: 'Reading DAG architecture library...' });
+                toolResult = { ok: true, library: getDagLibraryContext() };
+                break;
+              }
+              case 'query_catalog': {
+                const q = String(args.query ?? '').trim() || 'reasoning';
+                const kindArg =
+                  args.kind === 'model' || args.kind === 'connector' || args.kind === 'agent'
+                    ? args.kind
+                    : undefined;
+                const lim = Math.min(8, Math.max(1, Number(args.limit ?? 6) || 6));
+                emit({ type: 'status', text: `Routing "${q}" across catalog...` });
+                toolResult = await queryCatalogRoutes(
+                  q,
+                  kindArg,
+                  lim,
+                  loadCatalog,
+                  discoveredEntries,
+                  fetchImpl,
+                );
+                break;
+              }
+              case 'models_find': {
+                const q = String(args.query ?? '').trim() || 'frontier reasoning';
+                const modality = typeof args.modality === 'string' ? args.modality : undefined;
+                const lim = Math.min(8, Math.max(1, Number(args.limit ?? 6) || 6));
+                emit({ type: 'status', text: `Searching models for "${q}"...` });
+                const matches = await searchModelsWorker(
+                  q,
+                  { modality, limit: lim },
+                  loadCatalog,
+                  discoveredEntries,
+                  fetchImpl,
+                );
+                toolResult = {
+                  ok: true,
+                  count: matches.length,
+                  models: matches,
+                  guidance: 'Prefer isFrontier: true (or isLatest: true) entries when calling add_step.',
+                };
+                break;
+              }
+              case 'connectors_find': {
+                const q = String(args.query ?? '').trim();
+                const lim = Math.min(8, Math.max(1, Number(args.limit ?? 6) || 6));
+                emit({ type: 'status', text: `Searching connectors for "${q}"...` });
+                const matches = await searchConnectorsWorker(
+                  q,
+                  lim,
+                  loadCatalog,
+                  discoveredEntries,
+                  fetchImpl,
+                );
+                toolResult = { ok: true, count: matches.length, connectors: matches };
+                break;
+              }
+              case 'agent_find': {
+                const q = String(args.query ?? '').trim();
+                const roleArg = args.role === 'coordinator' ? 'coordinator' : 'executor';
+                const lim = Math.min(6, Math.max(1, Number(args.limit ?? 5) || 5));
+                emit({ type: 'status', text: `Searching specialist agents for "${q}"...` });
+                const matches = await searchAgentsWorker(
+                  q,
+                  roleArg,
+                  lim,
+                  loadCatalog,
+                  discoveredEntries,
+                  fetchImpl,
+                );
+                toolResult = { ok: true, count: matches.length, agents: matches };
+                break;
+              }
+              case 'inspect_connector': {
+                const targetId = normalizeConnectorEntryId(String(args.id ?? ''));
+                emit({ type: 'status', text: `Inspecting connector ${targetId}...` });
+                if (targetId === 'near-intents') {
+                  toolResult = {
+                    ok: true,
+                    id: 'near-intents',
+                    authRequired: false,
+                    capabilities:
+                      'Cross-chain 1Click swaps, deposits, and quotes across NEAR, EVM, Solana, Bitcoin, TON, Stellar, and Tron.',
+                  };
+                } else if (targetId.startsWith('account:')) {
+                  const toolkit = targetId.slice('account:'.length);
+                  const actionsRes = await sdk.connectors.accounts.toolkits
+                    .actions(toolkit, { limit: 12 })
+                    .catch(() => ({ toolkit, actions: [] }));
+                  toolResult = {
+                    ok: true,
+                    id: targetId,
+                    type: 'account',
+                    toolkit,
+                    actions: actionsRes.actions.slice(0, 10).map(a => ({
+                      slug: a.slug,
+                      name: a.name,
+                      description: a.description?.slice(0, 120),
+                    })),
+                  };
+                } else if (targetId.startsWith('onchain:')) {
+                  const slug = targetId.slice('onchain:'.length);
+                  const card = await sdk.connectors.onchain.get(slug).catch(() => null);
+                  toolResult = card
+                    ? {
+                      ok: true,
+                      id: targetId,
+                      type: 'onchain',
+                      chains: card.chains ?? [],
+                      tools: (card.tools ?? []).slice(0, 10).map(t => ({
+                        name: t.name,
+                        description: t.description?.slice(0, 120),
+                      })),
+                    }
+                    : { ok: false, error: `Connector "${targetId}" not found.` };
+                } else {
+                  const slug = targetId.replace(/^mcp:/, '');
+                  const card = await sdk.connectors.mcps.get(slug).catch(() => null);
+                  toolResult = card
+                    ? {
+                      ok: true,
+                      id: slug,
+                      type: 'mcp',
+                      requiresCredentials: Boolean(card.requiresCredentials),
+                      credentials: (card.credentials ?? []).map(c => c.varName),
+                      tools: (card.tools ?? []).slice(0, 10).map(t => ({
+                        name: t.name,
+                        description: t.description?.slice(0, 120),
+                      })),
+                    }
+                    : { ok: false, error: `Connector "${targetId}" not found.` };
+                }
+                break;
+              }
+              case 'list_coordinators': {
+                emit({ type: 'status', text: 'Checking saved Coordinator Personas...' });
+                const list = await loadCoordinators(input.userAddress);
+                toolResult = {
+                  ok: true,
+                  coordinators: list.map(c => ({
+                    id: c.id,
+                    name: c.name,
+                    model: c.model,
+                    personality: c.personality.slice(0, 160),
+                    walletAddress: c.walletAddress,
+                  })),
+                };
+                break;
+              }
+              case 'set_title': {
+                const title = String(args.title ?? '').trim().slice(0, 200);
+                if (!title) {
+                  toolResult = { ok: false, error: 'Title cannot be empty.' };
+                  break;
+                }
+                working.name = title;
+                applyPatch({ op: 'set_title', name: title });
+                toolResult = { ok: true, title };
+                break;
+              }
+              case 'set_description': {
+                const description = String(args.description ?? '').trim().slice(0, 8000);
+                working.brief = description;
+                applyPatch({ op: 'set_description', brief: description });
+                toolResult = { ok: true, descriptionLength: description.length };
+                break;
+              }
+              case 'set_categories': {
+                const rawCats = Array.isArray(args.categories)
+                  ? args.categories.map(c => String(c))
+                  : [];
+                const canonical = resolveCanonicalTasks(rawCats);
+                if (canonical.length === 0) {
+                  toolResult = {
+                    ok: false,
+                    error: `Choose 1-${MAX_TASK_TAGS} valid categories from read_categories_library.`,
+                  };
+                  break;
+                }
+                working.tasks = canonical;
+                applyPatch({ op: 'set_categories', tasks: canonical });
+                toolResult = { ok: true, categories: canonical };
+                break;
+              }
+              case 'set_coordinator': {
+                const cid = args.coordinatorId === null ? null : String(args.coordinatorId ?? '').trim();
+                if (!cid) {
+                  working.coordinator = null;
+                  applyPatch({ op: 'set_coordinator', coordinator: null });
+                  toolResult = { ok: true, coordinator: null };
+                  break;
+                }
+                const list = await loadCoordinators(input.userAddress);
+                const found = list.find(c => c.id === cid || c.walletAddress === cid);
+                if (!found) {
+                  toolResult = { ok: false, error: `Coordinator "${cid}" not found.` };
+                  break;
+                }
+                working.coordinator = found;
+                applyPatch({ op: 'set_coordinator', coordinator: found });
+                toolResult = { ok: true, coordinator: { id: found.id, name: found.name } };
+                break;
+              }
+              case 'generate_banner': {
+                const bannerTitle = String(args.title ?? siblingTitleHint ?? working.name ?? '').trim();
+                const bannerDesc =
+                  String(args.description ?? working.brief ?? '').trim() || input.prompt.trim();
+                if (bannerPromise && !hadInitialBanner) {
+                  toolResult = { ok: true, status: 'generating_in_parallel' };
+                  break;
+                }
+                void startBannerGeneration({
+                  title: bannerTitle,
+                  description: bannerDesc,
+                  force: true,
+                });
+                toolResult = { ok: true, status: 'generating_in_parallel' };
+                break;
+              }
+              case 'add_step': {
+                const stepKind =
+                  args.kind === 'connector' || args.kind === 'agent' ? args.kind : 'model';
+                const requestedId = String(args.entryId ?? '').trim();
+                const symbolicStepId =
+                  typeof args.stepId === 'string' && args.stepId.trim() ? args.stepId.trim() : undefined;
+                const label = String(args.label ?? '').trim().slice(0, 120) || 'Workflow Step';
+                const note = String(args.note ?? '').trim().slice(0, 12000);
+                const rawAnchor =
+                  typeof args.anchorId === 'string' && args.anchorId.trim() ? args.anchorId.trim() : undefined;
+                const direction: Direction =
+                  args.direction === 'left' || args.direction === 'up' || args.direction === 'down'
+                    ? args.direction
+                    : 'right';
+
+                const matched = await resolveCatalogEntryForStep(
+                  stepKind,
+                  requestedId,
+                  loadCatalog,
+                  discoveredEntries,
+                  fetchImpl,
+                );
+
+                if (!matched) {
+                  log?.warn(
+                    { workflowId: working.id, stepKind, requestedId, label },
+                    'vibe add_step entry not found',
+                  );
+                  const finderName =
+                    stepKind === 'model'
+                      ? 'models_find'
+                      : stepKind === 'connector'
+                        ? 'connectors_find'
+                        : 'agent_find';
+                  toolResult = {
+                    ok: false,
+                    error: `Entry "${requestedId}" not found in ${stepKind} catalog. Call ${finderName} first and pass an exact id.`,
+                  };
+                  break;
+                }
+
+                // Resolve anchorId via symbolic alias / UUID / label, or default to chaining right
+                // from the previous added step when connectFromAnchor is not explicitly false.
+                const explicitAnchorNodeId = resolveNodeRef(rawAnchor);
+                const autoChainFromPrev =
+                  !rawAnchor && args.connectFromAnchor !== false && lastAddedNodeId
+                    ? lastAddedNodeId
+                    : undefined;
+                const effectiveAnchorId = explicitAnchorNodeId ?? autoChainFromPrev;
+                const connectFromAnchor =
+                  args.connectFromAnchor === undefined
+                    ? Boolean(effectiveAnchorId)
+                    : Boolean(args.connectFromAnchor);
+
+                emit({ type: 'status', text: `Adding step "${label}"...` });
+                const position = computeDirectionalPosition(working.nodes, effectiveAnchorId, direction);
+                const newNodeId = randomUUID();
+                const newNode: FlowBlock = {
+                  id: newNodeId,
+                  type: 'step',
+                  position,
+                  data: {
+                    label,
+                    kind: stepKind,
+                    entry: matched,
+                    note,
+                  },
+                };
+                working.nodes.push(newNode);
+                lastAddedNodeId = newNodeId;
+
+                stepAliases.set(newNodeId, newNodeId);
+                stepAliases.set(label.toLowerCase(), newNodeId);
+                if (symbolicStepId) {
+                  stepAliases.set(symbolicStepId, newNodeId);
+                  stepAliases.set(symbolicStepId.toLowerCase(), newNodeId);
+                }
+
+                let addedEdge: FlowLink | undefined;
+                if (
+                  connectFromAnchor &&
+                  effectiveAnchorId &&
+                  working.nodes.some(n => n.id === effectiveAnchorId) &&
+                  !working.edges.some(e => e.source === effectiveAnchorId && e.target === newNodeId) &&
+                  !wouldCreateCycle(working.nodes, working.edges, effectiveAnchorId, newNodeId)
+                ) {
+                  addedEdge = makeWireEdge(effectiveAnchorId, newNodeId);
+                  working.edges.push(addedEdge);
+                }
+
+                applyPatch({ op: 'add_step', node: newNode, ...(addedEdge ? { edge: addedEdge } : {}) });
+                log?.info(
+                  {
+                    workflowId: working.id,
+                    stepId: newNodeId,
+                    alias: symbolicStepId ?? null,
+                    label,
+                    kind: stepKind,
+                    entryId: matched.id,
+                    connectedFrom: addedEdge?.source ?? null,
+                  },
+                  'vibe step added',
+                );
+                toolResult = {
+                  ok: true,
+                  stepId: newNodeId,
+                  ...(symbolicStepId ? { alias: symbolicStepId } : {}),
+                  entryId: matched.id,
+                  position,
+                  connectedFrom: addedEdge?.source ?? null,
+                };
+                break;
+              }
+              case 'update_step': {
+                const resolvedStepId = resolveNodeRef(String(args.stepId ?? ''));
+                const target = resolvedStepId ? working.nodes.find(n => n.id === resolvedStepId) : undefined;
+                if (!target) {
+                  toolResult = { ok: false, error: `Step "${String(args.stepId ?? '')}" not found.` };
+                  break;
+                }
+                let nextEntry: CatalogEntry | undefined;
+                if (typeof args.entryId === 'string' && args.entryId.trim()) {
+                  const roleToLoad =
+                    args.kind === 'model' || args.kind === 'connector' || args.kind === 'agent'
+                      ? args.kind
+                      : target.data.kind;
+                  const found = await resolveCatalogEntryForStep(
+                    roleToLoad,
+                    args.entryId,
+                    loadCatalog,
+                    discoveredEntries,
+                    fetchImpl,
+                  );
+                  if (!found) {
+                    toolResult = { ok: false, error: `Entry "${args.entryId}" not found in ${roleToLoad} catalog.` };
+                    break;
+                  }
+                  target.data.kind = roleToLoad;
+                  target.data.entry = found;
+                  nextEntry = found;
+                }
+                const nextLabel =
+                  typeof args.label === 'string' && args.label.trim()
+                    ? args.label.trim().slice(0, 120)
+                    : undefined;
+                const nextNote = typeof args.note === 'string' ? args.note.slice(0, 12000) : undefined;
+                if (nextLabel) {
+                  target.data.label = nextLabel;
+                  stepAliases.set(nextLabel.toLowerCase(), target.id);
+                }
+                if (nextNote !== undefined) target.data.note = nextNote;
+
+                applyPatch({
+                  op: 'update_step',
+                  stepId: target.id,
+                  ...(nextLabel ? { label: nextLabel } : {}),
+                  ...(nextNote !== undefined ? { note: nextNote } : {}),
+                  ...(nextEntry ? { entry: nextEntry } : {}),
+                });
+                toolResult = { ok: true, stepId: target.id };
+                break;
+              }
+              case 'connect_steps': {
+                const sourceId = resolveNodeRef(String(args.sourceId ?? ''));
+                const targetId = resolveNodeRef(String(args.targetId ?? ''));
+                if (!sourceId || !targetId) {
+                  toolResult = { ok: false, error: 'Both sourceId and targetId must exist on the Canvas.' };
+                  break;
+                }
+                if (working.edges.some(e => e.source === sourceId && e.target === targetId)) {
+                  toolResult = { ok: true, alreadyConnected: true };
+                  break;
+                }
+                if (wouldCreateCycle(working.nodes, working.edges, sourceId, targetId)) {
+                  toolResult = { ok: false, error: 'Connection rejected: workflows must remain acyclic (DAG).' };
+                  break;
+                }
+                const edge = makeWireEdge(sourceId, targetId);
+                working.edges.push(edge);
+                applyPatch({ op: 'connect_steps', edge });
+                toolResult = { ok: true, edgeId: edge.id };
+                break;
+              }
+              case 'remove_step': {
+                const stepId = resolveNodeRef(String(args.stepId ?? ''));
+                if (!stepId) {
+                  toolResult = { ok: false, error: `Step "${String(args.stepId ?? '')}" not found.` };
+                  break;
+                }
+                working.nodes = working.nodes.filter(n => n.id !== stepId);
+                working.edges = working.edges.filter(e => e.source !== stepId && e.target !== stepId);
+                if (lastAddedNodeId === stepId) {
+                  lastAddedNodeId = working.nodes[working.nodes.length - 1]?.id;
+                }
+                applyPatch({ op: 'remove_step', stepId });
+                toolResult = { ok: true, removed: stepId };
+                break;
+              }
+              case 'arrange_canvas': {
+                emit({ type: 'status', text: 'Arranging DAG waves on Canvas...' });
+                const positions = computeWaveLayout(working.nodes, working.edges);
+                for (const n of working.nodes) {
+                  if (positions[n.id]) {
+                    n.position = positions[n.id]!;
+                  }
+                }
+                applyPatch({ op: 'arrange_canvas', positions });
+                toolResult = { ok: true, arrangedCount: Object.keys(positions).length };
+                break;
+              }
+              default:
+                toolResult = { ok: false, error: `Unknown tool "${call.name}".` };
+            }
+          } catch (toolErr) {
+            log?.error(
+              {
+                workflowId: working.id,
+                tool: call.name,
+                err: toolErr instanceof Error ? toolErr.message : String(toolErr),
+              },
+              'vibe tool execution error',
+            );
+            toolResult = {
+              ok: false,
+              error: toolErr instanceof Error ? toolErr.message : 'Tool execution failed.',
+            };
+          }
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: JSON.stringify(toolResult),
+          });
+        }
+
+        // Start background banner generation as soon as title, description, and steps are populated
+        // so it already includes the exact workflow title AND step brand logos without blocking!
+        const hasRealTitle = Boolean(
+          working.name.trim() && !/^unknown(?:\s*#\d+)?$/i.test(working.name.trim()),
+        );
+        if (
+          !hadInitialBanner &&
+          !working.banner &&
+          !bannerPromise &&
+          hasRealTitle &&
+          Boolean(working.brief?.trim()) &&
+          working.nodes.length > 0
+        ) {
+          void startBannerGeneration();
+        }
+      }
+
+      // Guarantee background banner generation from Vibe's title + description + step logos
+      if (!hadInitialBanner && !working.banner && !bannerPromise) {
+        void startBannerGeneration({
+          title: working.name,
+          description: working.brief || input.prompt,
+        });
+      }
+
+      const summaryText =
+        finalAssistantText ||
+        `Configured "${working.name}" with ${working.nodes.length} step${working.nodes.length === 1 ? '' : 's'}.`;
+
+      // Unblock Studio immediately so the user switches to Canvas right away while banner finishes in the background!
+      emit({
+        type: 'workflow_ready',
+        text: summaryText,
+        flow: working,
+      });
+
+      if (bannerPromise) {
+        await bannerPromise;
+      }
+
+      log?.info(
+        {
+          workflowId: working.id,
+          name: working.name,
+          nodeCount: working.nodes.length,
+          edgeCount: working.edges.length,
+          hasBanner: Boolean(working.banner),
+        },
+        'vibe stream completed',
+      );
+
+      emit({
+        type: 'done',
+        text: summaryText,
+        flow: working,
+      });
+    } catch (err) {
+      log?.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'vibe stream fatal error',
+      );
+      emit({
+        type: 'error',
+        error: err instanceof Error ? err.message : 'Vibe agent failed to complete.',
+      });
+    } finally {
+      if (!stream.destroyed) {
+        stream.end();
+      }
+    }
+  })();
+
+  return stream;
+}
