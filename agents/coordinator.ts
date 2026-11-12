@@ -242,3 +242,223 @@ function extractReadableFromRecord(rec: Record<string, unknown>, depth = 0): str
   }
   return null;
 }
+
+function extractProviderFromReceipt(receipt: Receipt): string | undefined {
+  const fromSubject = (subject?: string): string | undefined => {
+    if (!subject || !subject.includes(':')) return undefined;
+    const prefix = subject.split(':')[0]!.trim().toLowerCase();
+    return prefix && !['agent', 'workflow', 'connector'].includes(prefix) ? prefix : undefined;
+  };
+  const direct = fromSubject(receipt.subject);
+  if (direct) return direct;
+  for (const bill of receipt.bills ?? []) {
+    if (bill.kind === 'model') {
+      if (bill.source?.trim()) return bill.source.trim().toLowerCase();
+      const matched = fromSubject(bill.subject ?? bill.model);
+      if (matched) return matched;
+    }
+  }
+  return undefined;
+}
+
+function parsePositiveBigInt(value: unknown): bigint {
+  if (typeof value === 'bigint') return value > 0n ? value : 0n;
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return BigInt(Math.trunc(value));
+  }
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    return BigInt(value.trim());
+  }
+  return 0n;
+}
+
+function matchesStepSubject(
+  entry: Block['data']['entry'] | undefined,
+  kind: Block['data']['kind'],
+  subjectStr: string,
+): boolean {
+  const rawEntryId = entry?.id?.trim().toLowerCase() ?? '';
+  const subj = subjectStr.trim().toLowerCase();
+  if (!rawEntryId || !subj) return false;
+  if (kind === 'model') {
+    const entryTail = rawEntryId.split(':').pop() ?? rawEntryId;
+    const subjTail = subj.split(':').pop() ?? subj;
+    return (
+      subj === rawEntryId ||
+      subj.endsWith(`:${rawEntryId}`) ||
+      rawEntryId.endsWith(`:${subj}`) ||
+      (entryTail.length >= 3 && entryTail === subjTail)
+    );
+  }
+  if (kind === 'connector') {
+    const canonical = canonicalConnectorBindingId(entry)?.toLowerCase() ?? rawEntryId;
+    const slug = canonical.split(':').pop() ?? canonical;
+    return (
+      subj === canonical ||
+      subj === rawEntryId ||
+      subj.startsWith(`${canonical}:`) ||
+      (slug.length >= 2 &&
+        (subj === slug || subj.endsWith(`:${slug}`) || subj.includes(`:${slug}:`)))
+    );
+  }
+  const wallet = rawEntryId.replace(/^agent:/, '');
+  const subjWallet = subj.replace(/^agent:/, '');
+  return Boolean(wallet && wallet === subjWallet);
+}
+
+function extractBillItemsFromReceipt(
+  receipt: Receipt,
+  coordinator: Coordinator,
+  orderedNodes: Block[] = [],
+  stepToolCallIds?: Map<string, Set<string>>,
+  ignoreBillsTree = false,
+): WorkflowBillItem[] {
+  const items: WorkflowBillItem[] = [];
+  const coordLower = coordinator.walletAddress.toLowerCase();
+  const receiptId = typeof receipt.id === 'string' && receipt.id.trim() ? receipt.id.trim() : undefined;
+  const txHash =
+    (typeof receipt.txHash === 'string' && receipt.txHash.trim()) ||
+    (typeof receipt.settleTxHash === 'string' && receipt.settleTxHash.trim()) ||
+    (typeof receipt.claimTxHash === 'string' && receipt.claimTxHash.trim()) ||
+    undefined;
+
+  const hasNestedOrTypedBills =
+    !ignoreBillsTree &&
+    Array.isArray(receipt.bills) &&
+    receipt.bills.some(
+      b =>
+        (Array.isArray(b.children) && b.children.length > 0) ||
+        b.kind === 'model' ||
+        b.kind === 'connector' ||
+        b.kind === 'tool',
+    );
+  if (hasNestedOrTypedBills && Array.isArray(receipt.bills)) {
+    const pushBill = (bill: Bill) => {
+      if (Array.isArray(bill.children) && bill.children.length > 0) {
+        for (const child of bill.children) pushBill(child);
+      }
+      const amt = parsePositiveBigInt(bill.amountWei);
+      if (amt <= 0n) return;
+      const subj = bill.subject?.trim();
+      const isCoord =
+        bill.kind === 'agent' &&
+        ((bill.agentWallet && bill.agentWallet.toLowerCase() === coordLower) ||
+          (subj && subj.toLowerCase() === `agent:${coordLower}`));
+      const category: WorkflowBillItem['category'] = isCoord
+        ? 'coordinator'
+        : bill.kind === 'model'
+          ? 'model'
+          : bill.kind === 'connector' || bill.kind === 'tool'
+            ? 'connector'
+            : bill.kind === 'agent'
+              ? 'agent'
+              : 'coordinator';
+      const matchedNode =
+        category !== 'coordinator' && subj
+          ? orderedNodes.find(
+              n => n.data.kind === category && matchesStepSubject(n.data.entry, n.data.kind, subj),
+            )
+          : undefined;
+      items.push({
+        category,
+        kind: bill.kind,
+        name:
+          (isCoord
+            ? coordinator.name
+            : matchedNode?.data.entry?.name || bill.name?.trim() || bill.model?.trim() || subj) ||
+          bill.kind,
+        ...(subj ? { subject: subj } : {}),
+        ...(matchedNode ? { stepId: matchedNode.id } : {}),
+        ...(receiptId ? { receiptId } : {}),
+        ...(txHash ? { txHash } : {}),
+        amountWei: amt.toString(),
+      });
+    };
+    for (const bill of receipt.bills) pushBill(bill);
+    if (items.length > 0) return items;
+  }
+
+  const finalWei = parsePositiveBigInt(receipt.finalAmountWei);
+  if (finalWei <= 0n) return items;
+
+  const service = (receipt.service ?? '').trim().toLowerCase();
+  const action = (receipt.action ?? '').trim();
+  const subjectStr = receipt.subject?.trim() ?? '';
+
+  if (action === 'models_call' || action.startsWith('models_call:')) {
+    const toolCallId = action.startsWith('models_call:')
+      ? action.slice('models_call:'.length).trim()
+      : '';
+    const matchedNode =
+      (toolCallId
+        ? orderedNodes.find(n => stepToolCallIds?.get(n.id)?.has(toolCallId))
+        : undefined) ??
+      orderedNodes.find(
+        n => n.data.kind === 'model' && matchesStepSubject(n.data.entry, 'model', subjectStr),
+      );
+    items.push({
+      category: 'model',
+      kind: 'inference',
+      name: matchedNode?.data.entry?.name || subjectStr || 'model',
+      ...(subjectStr ? { subject: subjectStr } : {}),
+      ...(matchedNode ? { stepId: matchedNode.id } : {}),
+      ...(receiptId ? { receiptId } : {}),
+      ...(txHash ? { txHash } : {}),
+      amountWei: finalWei.toString(),
+    });
+    return items;
+  }
+
+  if (service === 'mcp' || service === 'connector' || service === 'onchain') {
+    const matchedNode = orderedNodes.find(
+      n => n.data.kind === 'connector' && matchesStepSubject(n.data.entry, 'connector', subjectStr),
+    );
+    items.push({
+      category: 'connector',
+      kind: service,
+      name: matchedNode?.data.entry?.name || subjectStr || service,
+      ...(subjectStr ? { subject: subjectStr } : {}),
+      ...(matchedNode ? { stepId: matchedNode.id } : {}),
+      ...(receiptId ? { receiptId } : {}),
+      ...(txHash ? { txHash } : {}),
+      amountWei: finalWei.toString(),
+    });
+    return items;
+  }
+
+  if (
+    service === 'runtime' &&
+    subjectStr &&
+    subjectStr.toLowerCase() !== `agent:${coordLower}` &&
+    subjectStr.toLowerCase() !== coordLower
+  ) {
+    const matchedNode = orderedNodes.find(
+      n => n.data.kind === 'agent' && matchesStepSubject(n.data.entry, 'agent', subjectStr),
+    );
+    items.push({
+      category: 'agent',
+      kind: 'agent',
+      name: matchedNode?.data.entry?.name || subjectStr,
+      subject: subjectStr,
+      ...(matchedNode ? { stepId: matchedNode.id } : {}),
+      ...(receiptId ? { receiptId } : {}),
+      ...(txHash ? { txHash } : {}),
+      amountWei: finalWei.toString(),
+    });
+    return items;
+  }
+
+  items.push({
+    category: 'coordinator',
+    kind: service || 'coordinator',
+    name:
+      service === 'runtime'
+        ? coordinator.name
+        : `${coordinator.name} · ${subjectStr || action || service || 'compute'}`,
+    ...(subjectStr ? { subject: subjectStr } : { subject: `agent:${coordinator.walletAddress}` }),
+    ...(receiptId ? { receiptId } : {}),
+    ...(txHash ? { txHash } : {}),
+    amountWei: finalWei.toString(),
+  });
+  return items;
+}
