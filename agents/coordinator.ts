@@ -1203,4 +1203,191 @@ export async function runWorkflow(params: {
     await Promise.all(pendingActionFetches);
   }
 
+  let totalComposeBillWei = 0n;
+  const collectedBills: WorkflowBillItem[] = [];
+  const coordinatorProviders: string[] = [];
+  const coordinatorRunIds: string[] = [];
+  const seenReceiptKeys = new Set<string>();
+  const sseReceipts: Receipt[] = [];
+
+  const receiptIdentityKey = (receipt: Receipt, requestId?: string | null): string =>
+    receipt.id ||
+    receipt.paymentIntentId ||
+    (receipt.executionRunId
+      ? `${receipt.service ?? ''}:${receipt.action ?? ''}:${receipt.executionRunId}:${receipt.checkpointSequence ?? 0}:${receipt.finalAmountWei}`
+      : '') ||
+    receipt.txHash ||
+    `${receipt.subject ?? 'run'}:${receipt.finalAmountWei}:${requestId ?? ''}`;
+
+  const recordReceipt = (receipt: Receipt | undefined, requestId?: string | null) => {
+    if (!receipt) return;
+    const dedupeKey = receiptIdentityKey(receipt, requestId);
+    if (seenReceiptKeys.has(dedupeKey)) return;
+    seenReceiptKeys.add(dedupeKey);
+    sseReceipts.push(receipt);
+
+    const meta = extractMetaFromReceiptPayload(receipt as unknown as Record<string, unknown>);
+    if (meta.billWei > 0n) {
+      totalComposeBillWei += meta.billWei;
+      onBillDelta(meta.billWei);
+    }
+    const newBills = extractBillItemsFromReceipt(
+      receipt,
+      coordinator,
+      orderedNodes,
+      stepToolCallIds,
+    );
+    if (newBills.length > 0) {
+      collectedBills.push(...newBills);
+      emitEvent({
+        type: 'sse:bill',
+        composeBillWei: totalComposeBillWei.toString(),
+        bills: [...collectedBills],
+      });
+    }
+    const provider = meta.provider ?? extractProviderFromReceipt(receipt);
+    if (provider) coordinatorProviders.push(provider);
+    if (meta.requestId) coordinatorRunIds.push(meta.requestId);
+    else if (requestId) coordinatorRunIds.push(requestId);
+  };
+
+  const offReceipt = runSdk.events.on('receipt', evt => {
+    recordReceipt(evt.receipt, evt.requestId);
+  });
+
+  const missingConnectors: MissingConnectorRequirement[] = [];
+  const missingInputs: MissingInputRequirement[] = [];
+  const activeToolSpans = new Set<string>();
+  const settledRequestIds = new Set<string>();
+  const pendingWatchQueue: Array<{ runId: string; requestId: string }> = [];
+  const streamAbort = new AbortController();
+  let pausedForConnector = false;
+  let latestModelSpanId: string | null = null;
+  let activeStepId: string | null = null;
+  let lastCompletedStepId: string | null = null;
+  let upstreamError: string | null = null;
+  let coordinatorText = '';
+
+  const matchNodeForTool = (
+    toolName: string,
+    event: Extract<RunEvent, { domain: 'activity' }>,
+  ): Block | undefined => {
+    const lowerTool = toolName.toLowerCase();
+    const mappedBinding = exposedActionToBinding.get(lowerTool);
+    const inputObj = asRecord(event.payload?.['input']);
+    const rawConnectorRef =
+      (typeof inputObj?.['connectorRef'] === 'string' && inputObj['connectorRef']) ||
+      (typeof inputObj?.['bindingId'] === 'string' && inputObj['bindingId']) ||
+      '';
+    const inputBinding = rawConnectorRef.replace(/^connector:/i, '').trim().toLowerCase();
+    const effectiveBinding = mappedBinding || inputBinding || undefined;
+
+    const targetText = JSON.stringify({
+      tool: toolName,
+      binding: effectiveBinding,
+      target: event.target,
+      input: event.payload?.['input'],
+    }).toLowerCase();
+
+    const uncompleted = orderedNodes.filter(n => !completedSteps.has(n.id));
+    const allConnectorNodes = orderedNodes.filter(n => n.data.kind === 'connector');
+
+    const findByBinding = (pool: Block[], bindingLower: string): Block | undefined =>
+      pool.find(n => {
+        if (n.data.kind !== 'connector') return false;
+        const b = canonicalConnectorBindingId(n.data.entry)?.toLowerCase();
+        const eid = n.data.entry?.id?.toLowerCase();
+        return b === bindingLower || eid === bindingLower;
+      });
+
+    if (effectiveBinding) {
+      const boundMatch =
+        findByBinding(uncompleted, effectiveBinding) ??
+        findByBinding(allConnectorNodes, effectiveBinding);
+      if (boundMatch) return boundMatch;
+    }
+
+    const matchByPrefix = (pool: Block[]): Block | undefined =>
+      !CONTROL_TOOLS.has(toolName) &&
+        toolName !== 'models_call' &&
+        toolName !== 'proposal' &&
+        toolName !== 'swarm_delegate'
+        ? pool.find(n => {
+          if (n.data.kind !== 'connector') return false;
+          const slug = (n.data.entry?.id ?? '').split(':').pop()?.toLowerCase() ?? '';
+          return slug.length >= 2 && lowerTool.startsWith(`${slug}_`);
+        })
+        : undefined;
+
+    const prefixMatch = matchByPrefix(uncompleted) ?? matchByPrefix(allConnectorNodes);
+    if (prefixMatch) return prefixMatch;
+
+    const expectedKind =
+      toolName === 'models_call'
+        ? 'model'
+        : toolName === 'connectors_call' || Boolean(effectiveBinding)
+          ? 'connector'
+          : toolName === 'proposal' || toolName === 'swarm_delegate'
+            ? 'agent'
+            : undefined;
+
+    for (const node of uncompleted) {
+      if (expectedKind && node.data.kind !== expectedKind) continue;
+      const rawId = node.data.entry?.id?.toLowerCase();
+      if (!rawId) continue;
+      const tail = rawId.split(':').pop() ?? rawId;
+      if (targetText.includes(rawId) || (tail.length >= 3 && targetText.includes(tail))) {
+        return node;
+      }
+    }
+    if (expectedKind === 'connector') {
+      for (const node of allConnectorNodes) {
+        const rawId = node.data.entry?.id?.toLowerCase();
+        if (!rawId) continue;
+        const tail = rawId.split(':').pop() ?? rawId;
+        if (targetText.includes(rawId) || (tail.length >= 3 && targetText.includes(tail))) {
+          return node;
+        }
+      }
+      return uncompleted.find(n => n.data.kind === 'connector') ?? allConnectorNodes[0];
+    }
+    return expectedKind ? uncompleted.find(n => n.data.kind === expectedKind) : undefined;
+  };
+
+  const recordStepToolCall = (stepId: string, event: RunEvent) => {
+    const set = stepToolCallIds.get(stepId) ?? new Set<string>();
+    const addCandidate = (v: unknown) => {
+      if (typeof v === 'string' && v.trim()) set.add(v.trim());
+    };
+    const rec = asRecord(event);
+    const payload = asRecord(rec?.payload);
+    addCandidate(rec?.toolCallId);
+    addCandidate(rec?.tool_call_id);
+    addCandidate(payload?.toolCallId);
+    addCandidate(payload?.tool_call_id);
+    const rawOut = payload?.output;
+    const outRec =
+      typeof rawOut === 'string' && rawOut.trim().startsWith('{')
+        ? (() => {
+            try {
+              return asRecord(JSON.parse(rawOut));
+            } catch {
+              return null;
+            }
+          })()
+        : asRecord(rawOut);
+    addCandidate(outRec?.toolCallId);
+    addCandidate(outRec?.tool_call_id);
+    const outKwargs = asRecord(outRec?.kwargs);
+    addCandidate(outKwargs?.toolCallId);
+    addCandidate(outKwargs?.tool_call_id);
+    if (event.domain === 'activity' && typeof event.target?.id === 'string' && event.target.id.trim()) {
+      set.add(event.target.id.trim());
+    }
+    if (event.domain === 'activity' && typeof event.spanId === 'string' && event.spanId.trim()) {
+      set.add(event.spanId.trim());
+    }
+    stepToolCallIds.set(stepId, set);
+  };
+
 }
