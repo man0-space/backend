@@ -729,3 +729,115 @@ function assembleFinalDeliverable(params: {
   }
   return sections.join('\n\n').trim();
 }
+
+function buildCoordinatorMessage(params: {
+  flow: Listing;
+  coordinator: Coordinator;
+  waves: Block[][];
+  orderedNodes: Block[];
+  incomingByNode: Map<string, string[]>;
+  priorStepOutputs: Record<string, string>;
+  connectedBindings: ReadonlySet<string>;
+  connectorActionSummaries: ReadonlyMap<string, string>;
+  userInput?: string;
+  attachments: WorkflowAttachment[];
+  dry: boolean;
+  isResumingThread: boolean;
+}): string {
+  const {
+    flow,
+    coordinator,
+    waves,
+    orderedNodes,
+    incomingByNode,
+    priorStepOutputs,
+    connectedBindings,
+    connectorActionSummaries,
+    userInput,
+    attachments,
+    dry,
+    isResumingThread,
+  } = params;
+
+  const completedNodes = orderedNodes.filter(n => priorStepOutputs[n.id] !== undefined);
+  const pendingNodes = orderedNodes.filter(n => priorStepOutputs[n.id] === undefined);
+  const firstPending = pendingNodes[0];
+
+  const formatStepSpec = (node: Block, idx: number): string => {
+    const deps = incomingByNode.get(node.id) ?? [];
+    const entry = node.data.entry;
+    const completed = priorStepOutputs[node.id];
+    const bindingId = node.data.kind === 'connector' ? canonicalConnectorBindingId(entry) : null;
+    const bindingLower = bindingId?.toLowerCase() ?? '';
+    const cleanModelId =
+      node.data.kind === 'model' && entry?.id ? entry.id.trim().replace(/^model:/i, '') : null;
+    const isAuthorizedConnector = Boolean(bindingLower && connectedBindings.has(bindingLower));
+    const actionSummary =
+      completed === undefined && bindingLower && !dry
+        ? connectorActionSummaries.get(bindingLower) ?? ''
+        : '';
+    return [
+      `${idx + 1}. [${node.id}] "${node.data.label}" (${node.data.kind})`,
+      bindingId
+        ? `   target: ${entry?.name ?? bindingId} (bindingId: ${bindingId}, connectorRef: connector:${bindingLower})`
+        : cleanModelId
+          ? `   target: ${entry?.name ?? cleanModelId} (id: ${cleanModelId}, modelRef: model:${cleanModelId})`
+          : entry
+            ? `   target: ${entry.name} (id: ${entry.id})`
+            : '',
+      cleanModelId && completed === undefined
+        ? `   modelRule: Pre-registered as "model:${cleanModelId}" — invoke models_call({ modelRef: "model:${cleanModelId}", ... }) directly.`
+        : '',
+      bindingId && completed === undefined && !dry
+        ? isAuthorizedConnector
+          ? actionSummary
+            ? `   connectorRule: Pre-registered as "connector:${bindingLower}" — invoke connectors_call({ connectorRef: "connector:${bindingLower}", action: "<ACTION>", args: { ... } }) directly using the schema below (if a required parent/resource ID is needed first, call a search/list action on "connector:${bindingLower}" to obtain it, then call the write action).\n   actions (* = required):\n${actionSummary}`
+            : `   connectorRule: Pre-registered as "connector:${bindingLower}" — invoke connectors_call({ connectorRef: "connector:${bindingLower}", action: "<ACTION>", args: { ... } }) or discover actions via connectors_find -> connector_select({ bindingId: "${bindingId}" }).`
+          : `   connectorRule: Discover/select "${bindingId}" via connectors_find -> connector_select (or propose_connector if authorization is required), then execute the connector action.`
+        : '',
+      deps.length > 0 ? `   dependsOn: ${deps.join(', ')}` : '',
+      node.data.note?.trim() ? `   instructions: ${node.data.note.trim()}` : '',
+      completed !== undefined
+        ? `   status: ALREADY COMPLETED — DO NOT RE-RUN OR RE-VERIFY\n   completedOutput:\n${sanitizePromptStepOutput(completed)}`
+        : '   status: PENDING — EXECUTE NOW',
+    ]
+      .filter(Boolean)
+      .join('\n');
+  };
+
+  if (isResumingThread && completedNodes.length > 0 && firstPending) {
+    return [
+      `RESUME WORKFLOW "${flow.name}" STARTING IMMEDIATELY AT STEP [${firstPending.id}] "${firstPending.data.label}".`,
+      `Steps already completed in this thread (${completedNodes.map(n => `[${n.id}] "${n.data.label}"`).join(', ')}) are IMMUTABLE — DO NOT re-run, re-select, or re-execute any completed step.`,
+      dry
+        ? 'Mode: DRY RUN — do NOT mutate external accounts or submit irreversible transactions.'
+        : 'Mode: LIVE RUN — execute all pending external connector actions and deliver the upstream output.',
+      `Completed upstream outputs & pending steps:\n${orderedNodes.map((n, i) => formatStepSpec(n, i)).join('\n\n')}`,
+      userInput?.trim() ? `User request:\n${userInput.trim()}` : '',
+      formatWorkflowAttachments(attachments),
+      `Execute ONLY the PENDING steps starting with [${firstPending.id}] "${firstPending.data.label}". Do NOT call \`proposal\` except for \`agent\` steps.`,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+  }
+
+  const waveSummary = waves
+    .map((wave, i) => `Wave ${i + 1}: ${wave.map(n => `${n.data.label} (${n.id})`).join(' || ')}`)
+    .join('\n');
+
+  return [
+    `Execute workflow "${flow.name}".`,
+    flow.brief?.trim() ? `Brief: ${flow.brief.trim()}` : '',
+    coordinator.personality?.trim() ? `Directive: ${coordinator.personality.trim()}` : '',
+    dry
+      ? 'Mode: DRY RUN — execute read/model steps, do NOT mutate external accounts or submit irreversible transactions.'
+      : 'Mode: LIVE RUN — execute every step including external connector deliveries.',
+    `DAG waves:\n${waveSummary}`,
+    `Steps:\n${orderedNodes.map((n, i) => formatStepSpec(n, i)).join('\n\n')}`,
+    userInput?.trim() ? `User request:\n${userInput.trim()}` : '',
+    formatWorkflowAttachments(attachments),
+    'Run pending steps in DAG wave order using your native tools. Do NOT call `proposal` except for `agent` steps. Return the final deliverable once all steps finish.',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
