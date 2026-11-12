@@ -1085,4 +1085,122 @@ export async function runWorkflow(params: {
     }
   }
 
+  const hasPendingUpstreamModelOrAgent = orderedNodes.some(
+    n => !completedSteps.has(n.id) && (n.data.kind === 'model' || n.data.kind === 'agent'),
+  );
+
+  if (!dry && preflightStatus && hasPendingUpstreamModelOrAgent && !hasConnectorDecisions) {
+    const preflightMissing: MissingConnectorRequirement[] = [];
+    for (const node of orderedNodes) {
+      if (node.data.kind !== 'connector' || completedSteps.has(node.id)) continue;
+      const binding = canonicalConnectorBindingId(node.data.entry);
+      if (!binding) continue;
+      const bindingLower = binding.toLowerCase();
+      if (binding.startsWith('account:') && !connectedBindings.has(bindingLower)) {
+        const slug = binding.slice('account:'.length);
+        preflightMissing.push({
+          entryId: node.data.entry?.id || binding,
+          slug,
+          name: node.data.entry?.name || slug,
+          type: 'account',
+          ...(subject ? { userAddress: subject } : {}),
+          reason: `Connect ${node.data.entry?.name || slug} before running this workflow.`,
+          agentWallet: coordinator.walletAddress,
+          runId,
+          threadId,
+        });
+      } else if (binding.startsWith('mcp:') && !connectedBindings.has(bindingLower)) {
+        const rawMcpSlug = binding.slice('mcp:'.length);
+        const mcpSlug = rawMcpSlug.toLowerCase();
+        const matchConn =
+          (preflightStatus.connectors ?? []).find(
+            c => c.slug.toLowerCase() === mcpSlug && c.connected,
+          ) ?? (preflightStatus.connectors ?? []).find(c => c.slug.toLowerCase() === mcpSlug);
+        const knownVars = matchConn?.missingVars?.length
+          ? matchConn.missingVars
+          : missingVarsBySlug.get(mcpSlug);
+        preflightMissing.push({
+          entryId: node.data.entry?.id || binding,
+          slug: matchConn?.slug || rawMcpSlug,
+          name: node.data.entry?.name || matchConn?.name || rawMcpSlug,
+          type: 'gated',
+          ...(subject ? { userAddress: subject } : {}),
+          ...(knownVars?.length ? { missingVars: knownVars } : {}),
+          reason: `Configure ${node.data.entry?.name || matchConn?.slug || rawMcpSlug} before running this workflow.`,
+          agentWallet: coordinator.walletAddress,
+          runId,
+          threadId,
+        });
+      }
+    }
+    if (preflightMissing.length > 0) {
+      emitEvent({ type: 'connector:pause', missing: preflightMissing });
+      throw Object.assign(new Error(preflightMissing[0]!.reason), {
+        statusCode: 428,
+        code: 'CONNECTOR_REQUIRED',
+        threadId,
+        missing: preflightMissing,
+      });
+    }
+  }
+
+  const selectedModels: Record<string, Record<string, unknown>> = {};
+  const selectedConnectors: Record<string, Record<string, unknown>> = {};
+  const connectorActionSummaries = new Map<string, string>();
+  const pendingActionFetches: Array<Promise<void>> = [];
+
+  for (const node of orderedNodes) {
+    if (completedSteps.has(node.id)) continue;
+    if (node.data.kind === 'model' && node.data.entry?.id) {
+      const cleanModelId = node.data.entry.id.trim().replace(/^model:/i, '');
+      if (cleanModelId) {
+        const ref = `model:${cleanModelId}`;
+        selectedModels[ref] = {
+          kind: 'model',
+          ref,
+          source: 'models_find',
+          modelId: cleanModelId,
+          ...(node.data.entry.name ? { name: node.data.entry.name } : {}),
+          ...(node.data.entry.description ? { description: node.data.entry.description } : {}),
+        };
+      }
+    } else if (node.data.kind === 'connector' && !dry) {
+      const binding = canonicalConnectorBindingId(node.data.entry);
+      if (!binding) continue;
+      const bindingLower = binding.toLowerCase();
+      if (connectedBindings.has(bindingLower) || hasConnectorDecisions) {
+        connectedBindings.add(bindingLower);
+        const origin = binding.startsWith('account:')
+          ? 'account'
+          : binding.startsWith('onchain:')
+            ? 'onchain'
+            : 'mcp';
+        const ref = `connector:${bindingLower}`;
+        selectedConnectors[ref] = {
+          kind: 'connector',
+          ref,
+          source: 'self',
+          bindingId: binding,
+          origin,
+          ...(node.data.entry?.name ? { name: node.data.entry.name } : {}),
+          ...(node.data.entry?.description ? { description: node.data.entry.description } : {}),
+          credentialGated: false,
+          actions: [],
+        };
+        if (!connectorActionSummaries.has(bindingLower)) {
+          connectorActionSummaries.set(bindingLower, '');
+          pendingActionFetches.push(
+            fetchConnectorActionSummary(runSdk, binding).then(summary => {
+              if (summary) connectorActionSummaries.set(bindingLower, summary);
+            }),
+          );
+        }
+      }
+    }
+  }
+
+  if (pendingActionFetches.length > 0) {
+    await Promise.all(pendingActionFetches);
+  }
+
 }
