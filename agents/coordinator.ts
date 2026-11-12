@@ -2086,4 +2086,115 @@ export async function runWorkflow(params: {
     }
   };
 
+  const message = buildCoordinatorMessage({
+    flow,
+    coordinator,
+    waves,
+    orderedNodes,
+    incomingByNode,
+    priorStepOutputs,
+    connectedBindings,
+    connectorActionSummaries,
+    userInput,
+    attachments,
+    dry,
+    isResumingThread,
+  });
+
+  const streamAttachments = attachments.map(att => ({
+    type: att.type,
+    url: att.url,
+    ...(att.mimeType ? { mimeType: att.mimeType } : {}),
+    ...(att.name ? { name: att.name } : {}),
+  }));
+
+  const constraints: Record<string, unknown> = {
+    ...(dry ? { dryRun: true } : {}),
+    ...(requireProof ? { requireProof: true } : {}),
+  };
+
+  const hasPendingAgentNodes = orderedNodes.some(
+    n => !completedSteps.has(n.id) && n.data.kind === 'agent',
+  );
+  const hasSelectedModels = Object.keys(selectedModels).length > 0;
+  const hasSelectedConnectors = Object.keys(selectedConnectors).length > 0;
+  const selectedResources =
+    hasSelectedModels || hasSelectedConnectors
+      ? {
+        ...(hasSelectedModels ? { models: selectedModels } : {}),
+        ...(hasSelectedConnectors ? { connectors: selectedConnectors } : {}),
+      }
+      : undefined;
+
+  try {
+    const firstPending = orderedNodes.find(n => !completedSteps.has(n.id));
+    if (firstPending && !startedSteps.has(firstPending.id)) {
+      startedSteps.add(firstPending.id);
+      activeStepId = firstPending.id;
+      stepStartTimes.set(firstPending.id, Date.now());
+      emitEvent({
+        type: 'step:start',
+        stepId: firstPending.id,
+        label: firstPending.data.label,
+        kind: firstPending.data.kind,
+      });
+      onStepProgress?.({ runningStepId: firstPending.id, stepOutputs: { ...stepOutputs } });
+    }
+
+    const gen = runSdk.agent.stream(
+      {
+        agentWallet: coordinator.walletAddress,
+        message,
+        threadId,
+        mode: hasPendingAgentNodes ? 'swarm' : 'solo',
+        ...(isResumingThread ? {} : { runId }),
+        ...(subject ? { userAddress: subject } : {}),
+        ...(backpackAccounts ? { backpackAccounts } : {}),
+        ...(selectedResources ? { selectedResources } : {}),
+        ...(streamAttachments.length > 0 ? { attachments: streamAttachments } : {}),
+        ...(Object.keys(constraints).length > 0 ? { constraints } : {}),
+      },
+      { signal: streamAbort.signal },
+    );
+
+    try {
+      let next = await gen.next();
+      while (!next.done) {
+        await handleRunEvent(next.value);
+        next = await gen.next();
+      }
+      recordReceipt(next.value?.receipt);
+    } catch (streamErr) {
+      if (!pausedForConnector) {
+        throw streamErr;
+      }
+    }
+
+    while (!pausedForConnector && pendingWatchQueue.length > 0) {
+      const watchTarget = pendingWatchQueue.shift()!;
+      const watchGen = runSdk.agent.watch(
+        {
+          agentWallet: coordinator.walletAddress,
+          runId: watchTarget.runId,
+          threadId,
+        },
+        { signal: streamAbort.signal },
+      );
+      try {
+        let nextWatch = await watchGen.next();
+        while (!nextWatch.done) {
+          await handleRunEvent(nextWatch.value);
+          nextWatch = await watchGen.next();
+        }
+        recordReceipt(nextWatch.value?.receipt);
+      } catch (watchErr) {
+        if (!pausedForConnector) {
+          throw watchErr;
+        }
+      }
+    }
+  } finally {
+    offReceipt();
+  }
+
 }
