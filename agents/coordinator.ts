@@ -2197,4 +2197,111 @@ export async function runWorkflow(params: {
     offReceipt();
   }
 
+  const receiptListRes = subject
+    ? await runSdk.receipts?.list?.({ limit: 100 }).catch(() => null)
+    : null;
+  const turnApiReceipts = (receiptListRes?.receipts ?? []).filter(r => {
+    const execId = r.executionRunId?.trim() ?? '';
+    if (execId) {
+      for (const tid of turnRunIds) {
+        if (execId === tid || execId.startsWith(`${tid}:`)) return true;
+      }
+    }
+    if (!isResumingThread && r.rootRunId?.trim() === runId) {
+      return true;
+    }
+    if (isResumingThread && turnRunIds.size === 0 && r.rootRunId?.trim() === runId) {
+      return (r.settledAt ?? 0) >= turnStartedAtMs - 5_000;
+    }
+    return false;
+  });
+
+  if (turnApiReceipts.length > 0) {
+    const mergedByKey = new Map<string, Receipt>();
+    for (const r of [...turnApiReceipts].sort((a, b) => (a.settledAt ?? 0) - (b.settledAt ?? 0))) {
+      mergedByKey.set(receiptIdentityKey(r), r);
+    }
+    for (const r of sseReceipts) {
+      const key = receiptIdentityKey(r);
+      const alreadyHasRuntime =
+        r.service === 'runtime' &&
+        Array.from(mergedByKey.values()).some(
+          existing =>
+            existing.service === 'runtime' &&
+            existing.executionRunId === r.executionRunId &&
+            existing.finalAmountWei === r.finalAmountWei,
+        );
+      if (!mergedByKey.has(key) && !alreadyHasRuntime) {
+        mergedByKey.set(key, r);
+      }
+    }
+
+    collectedBills.length = 0;
+    let reconciledComposeWei = 0n;
+    for (const r of mergedByKey.values()) {
+      const amt = parsePositiveBigInt(r.finalAmountWei);
+      if (amt > 0n) reconciledComposeWei += amt;
+      const items = extractBillItemsFromReceipt(r, coordinator, orderedNodes, stepToolCallIds, true);
+      if (items.length > 0) collectedBills.push(...items);
+      const meta = extractMetaFromReceiptPayload(r as unknown as Record<string, unknown>);
+      const provider = meta.provider ?? extractProviderFromReceipt(r);
+      if (provider && !coordinatorProviders.includes(provider)) coordinatorProviders.push(provider);
+      if (meta.requestId && !coordinatorRunIds.includes(meta.requestId)) {
+        coordinatorRunIds.push(meta.requestId);
+      }
+    }
+
+    if (reconciledComposeWei !== totalComposeBillWei) {
+      onBillDelta(reconciledComposeWei - totalComposeBillWei);
+      totalComposeBillWei = reconciledComposeWei;
+    }
+    emitEvent({
+      type: 'sse:bill',
+      composeBillWei: totalComposeBillWei.toString(),
+      bills: [...collectedBills],
+    });
+  }
+
+  for (const [slugKey, fallbackReq] of gatedFallbackBySlug.entries()) {
+    const connectorDone = orderedNodes.some(n => {
+      if (n.data.kind !== 'connector' || !completedSteps.has(n.id)) return false;
+      const eid = (n.data.entry?.id ?? '').toLowerCase();
+      return eid === fallbackReq.entryId.toLowerCase() || eid.endsWith(slugKey);
+    });
+    if (
+      !connectorDone &&
+      !missingConnectors.some(
+        m => m.entryId === fallbackReq.entryId || m.slug.toLowerCase() === slugKey,
+      )
+    ) {
+      missingConnectors.push(fallbackReq);
+    }
+  }
+
+  if (missingConnectors.length > 0) {
+    if (!pausedForConnector) {
+      emitEvent({ type: 'connector:pause', missing: missingConnectors });
+    }
+    throw Object.assign(new Error(missingConnectors[0]!.reason), {
+      statusCode: 428,
+      code: 'CONNECTOR_REQUIRED',
+      threadId,
+      missing: missingConnectors,
+    });
+  }
+
+  if (missingInputs.length > 0) {
+    emitEvent({ type: 'input:pause', missingInputs });
+    throw Object.assign(new Error(missingInputs[0]!.reason), {
+      statusCode: 428,
+      code: 'INPUT_REQUIRED',
+      threadId,
+      missingInputs,
+    });
+  }
+
+  if (upstreamError) {
+    throw Object.assign(new Error(upstreamError), { statusCode: 502, threadId });
+  }
+
 }
