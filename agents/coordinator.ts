@@ -462,3 +462,111 @@ function extractBillItemsFromReceipt(
   });
   return items;
 }
+
+const INLINE_MARKDOWN_DATA_URI_RE = /!\[([^\]]*)\]\(data:([a-zA-Z0-9/+.-]+);base64,([A-Za-z0-9+/=\s]+)\)/g;
+const RAW_DATA_URI_RE = /data:([a-zA-Z0-9/+.-]+);base64,([A-Za-z0-9+/=\s]{64,})/g;
+
+function replaceDataUrisWithHostedUrls(text: string, hostedAssets: string[]): string {
+  const hasHosted = hostedAssets.some(a => /https?:\/\//i.test(a));
+  let cleaned = text;
+  if (hasHosted) {
+    cleaned = cleaned
+      .replace(INLINE_MARKDOWN_DATA_URI_RE, '')
+      .replace(RAW_DATA_URI_RE, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+  const parts = cleaned ? [cleaned] : [];
+  for (const asset of hostedAssets) {
+    const rawUrlMatch = asset.match(/\((https?:\/\/[^)]+)\)/);
+    const checkToken = rawUrlMatch?.[1] ?? asset;
+    if (!parts.some(p => p.includes(checkToken))) {
+      parts.push(asset);
+    }
+  }
+  return parts.join('\n\n').trim();
+}
+
+async function pinResidualDataUrisInStepOutput(
+  text: string,
+  stepId: string,
+  fetchImpl?: typeof fetch,
+): Promise<{ output: string; pinnedAssets: string[] }> {
+  if (!text.includes('data:') || !text.includes(';base64,')) {
+    return { output: text, pinnedAssets: [] };
+  }
+  if (!config.pinataJwt?.trim()) {
+    return { output: text, pinnedAssets: [] };
+  }
+
+  const pinnedAssets: string[] = [];
+  let updated = text;
+  const matches = [...text.matchAll(/data:([a-zA-Z0-9/+.-]+);base64,([A-Za-z0-9+/=\s]{128,})/g)];
+  let idx = 0;
+  for (const m of matches) {
+    const fullUri = m[0];
+    const mimeType = (m[1] || 'image/png').trim().toLowerCase();
+    const rawB64 = (m[2] || '').replace(/\s+/g, '');
+    if (!rawB64) continue;
+    idx += 1;
+    const ext = mimeType.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin';
+    try {
+      const bytes = Buffer.from(rawB64, 'base64');
+      if (bytes.length === 0) continue;
+      const pinned = await pinBufferToIpfs(
+        {
+          bytes,
+          mimeType,
+          fileName: `step-${stepId}-${idx}.${ext}`,
+          name: `step-${stepId}-${idx}`,
+        },
+        fetchImpl,
+      );
+      updated = updated.split(fullUri).join(pinned.imageUrl);
+      const formatted = mimeType.startsWith('image/')
+        ? `![Generated image](${pinned.imageUrl})`
+        : pinned.imageUrl;
+      if (!pinnedAssets.includes(formatted)) pinnedAssets.push(formatted);
+    } catch {
+      // Leave intact if IPFS pin fails; sanitizePromptStepOutput still strips oversized blobs from prompts
+    }
+  }
+  return { output: updated, pinnedAssets };
+}
+
+function sanitizePromptStepOutput(text: string): string {
+  if (!text.includes('data:') || !text.includes(';base64,')) return text;
+  return text
+    .replace(
+      INLINE_MARKDOWN_DATA_URI_RE,
+      (_match, alt: string) => `[Generated media${alt ? `: ${alt}` : ''} omitted from inline prompt]`,
+    )
+    .replace(RAW_DATA_URI_RE, '[inline base64 media omitted]');
+}
+
+function formatToolStepOutput(payload: Record<string, unknown> | undefined, assets: string[]): string {
+  const parts: string[] = [];
+  if (payload) {
+    const artifact = asRecord(payload.artifact);
+    if (typeof artifact?.content === 'string' && artifact.content.trim()) {
+      parts.push(artifact.content.trim());
+    } else if (typeof artifact?.url === 'string' && artifact.url.trim()) {
+      parts.push(
+        artifact.type === 'image' ? `![Generated image](${artifact.url.trim()})` : artifact.url.trim(),
+      );
+    }
+    if (parts.length === 0) {
+      const unwrapped = unwrapToolOutput(payload.output);
+      const rec = asRecord(unwrapped);
+      if (rec) {
+        const readable = extractReadableFromRecord(rec);
+        parts.push(readable || JSON.stringify(rec));
+      } else if (typeof unwrapped === 'string' && unwrapped.trim()) {
+        parts.push(unwrapped.trim());
+      } else if (typeof payload.message === 'string' && payload.message.trim()) {
+        parts.push(payload.message.trim());
+      }
+    }
+  }
+  return replaceDataUrisWithHostedUrls(parts.join('\n\n').trim(), assets);
+}
