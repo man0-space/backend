@@ -138,3 +138,107 @@ export function decomposeWorkflowWaves(
 
   return { waves, orderedNodes, incomingByNode };
 }
+
+export function formatWorkflowAttachments(attachments: WorkflowAttachment[]): string {
+  if (attachments.length === 0) return '';
+  const blocks = attachments.map((att, idx) => {
+    const label = att.name ? `${att.name} (${att.type})` : `${att.type} #${idx + 1}`;
+    const header = `- [${label}] ${att.url}${att.mimeType ? ` (${att.mimeType})` : ''}`;
+    return att.text?.trim()
+      ? `${header}\n\`\`\`\n${att.text.trim().slice(0, 16_000)}\n\`\`\``
+      : header;
+  });
+  return `Attached inputs:\n${blocks.join('\n')}`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function unwrapToolOutput(value: unknown, depth = 0): unknown {
+  if (depth > 7 || value === null || value === undefined) return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        return unwrapToolOutput(JSON.parse(trimmed), depth + 1);
+      } catch {
+        return value;
+      }
+    }
+    return value;
+  }
+  const rec = asRecord(value);
+  if (!rec) return value;
+  if (rec.__compose_tool_result === 'compacted_json' && 'value' in rec) {
+    return unwrapToolOutput(rec.value, depth + 1);
+  }
+  if (rec.__compose_tool_result === 'truncated_text' && typeof rec.text === 'string') {
+    return unwrapToolOutput(rec.text, depth + 1);
+  }
+  const kwargs = asRecord(rec.kwargs);
+  if (kwargs?.content !== undefined) {
+    return unwrapToolOutput(kwargs.content, depth + 1);
+  }
+  if ('tool_call_id' in rec || 'lc_namespace' in rec || rec.role === 'tool') {
+    return unwrapToolOutput(rec.content, depth + 1);
+  }
+  return rec;
+}
+
+function extractReadableFromRecord(rec: Record<string, unknown>, depth = 0): string | null {
+  if (depth > 4) return null;
+  for (const field of [
+    'output',
+    'text',
+    'markdown',
+    'content',
+    'summary',
+    'result',
+    'response',
+    'message',
+  ]) {
+    const val = rec[field];
+    if (typeof val === 'string' && val.trim()) {
+      return val.trim();
+    }
+  }
+  if (Array.isArray(rec.content)) {
+    const chunks = rec.content
+      .map(item => {
+        if (typeof item === 'string') return item.trim();
+        const r = asRecord(item);
+        return typeof r?.text === 'string' ? r.text.trim() : '';
+      })
+      .filter(Boolean);
+    if (chunks.length > 0) return chunks.join('\n\n');
+  }
+  const urlCandidate = [rec.url, rec.permalink, rec.html_url, rec.webViewLink, rec.link].find(
+    v => typeof v === 'string' && /^https?:\/\//i.test(v.trim()),
+  ) as string | undefined;
+
+  for (const nestedKey of ['data', 'result', 'output', 'response']) {
+    const nested = asRecord(rec[nestedKey]);
+    if (nested) {
+      const inner = extractReadableFromRecord(nested, depth + 1);
+      if (inner) {
+        return urlCandidate && !inner.includes(urlCandidate)
+          ? `${inner}\n\n${urlCandidate}`
+          : inner;
+      }
+    }
+  }
+  if (urlCandidate) {
+    return `Published: ${urlCandidate.trim()}`;
+  }
+  if (rec.successful === true || rec.success === true) {
+    const idVal =
+      (typeof rec.id === 'string' && rec.id) ||
+      (typeof asRecord(rec.data)?.id === 'string' && (asRecord(rec.data)?.id as string)) ||
+      '';
+    return idVal ? `Action completed (ID: ${idVal}).` : 'External connector action completed.';
+  }
+  return null;
+}
