@@ -570,3 +570,102 @@ function formatToolStepOutput(payload: Record<string, unknown> | undefined, asse
   }
   return replaceDataUrisWithHostedUrls(parts.join('\n\n').trim(), assets);
 }
+
+interface RawConnectorActionDef {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+}
+
+function formatSchemaParamType(propSchema: Record<string, unknown> | null): string {
+  if (!propSchema) return 'any';
+  const rawType = propSchema['type'];
+  const baseType = Array.isArray(rawType)
+    ? rawType.map(String).join('|')
+    : typeof rawType === 'string'
+      ? rawType
+      : Array.isArray(propSchema['enum'])
+        ? 'enum'
+        : 'any';
+  if (baseType === 'object') {
+    const nested = asRecord(propSchema['properties']);
+    if (nested) {
+      const subKeys = Object.keys(nested).slice(0, 5);
+      if (subKeys.length > 0) return `object{${subKeys.join(',')}}`;
+    }
+  }
+  if (baseType === 'array') {
+    const items = asRecord(propSchema['items']);
+    const itemType = typeof items?.['type'] === 'string' ? items['type'] : 'any';
+    return `${itemType}[]`;
+  }
+  return baseType;
+}
+
+function summarizeConnectorActions(actions: RawConnectorActionDef[]): string {
+  if (actions.length === 0) return '';
+  return actions
+    .slice(0, 120)
+    .map(action => {
+      const schema = asRecord(action.inputSchema);
+      const props = asRecord(schema?.['properties']) ?? {};
+      const requiredSet = new Set(
+        Array.isArray(schema?.['required']) ? schema['required'].map(String) : [],
+      );
+      const orderedKeys = [
+        ...Object.keys(props).filter(k => requiredSet.has(k)),
+        ...Object.keys(props).filter(k => !requiredSet.has(k)),
+      ].slice(0, 8);
+      const sig = orderedKeys
+        .map(k => `${k}${requiredSet.has(k) ? '*' : ''}:${formatSchemaParamType(asRecord(props[k]))}`)
+        .join(', ');
+      const desc = (action.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 180);
+      return `     - ${action.name}(${sig})${desc ? `: ${desc}` : ''}`;
+    })
+    .join('\n');
+}
+
+async function fetchConnectorActionSummary(
+  runSdk: ComposeSDK,
+  bindingId: string,
+): Promise<string> {
+  const [origin, ...rest] = bindingId.split(':');
+  const slug = rest.join(':').trim();
+  if (!origin || !slug) return '';
+  if (origin === 'account') {
+    const res = await runSdk.connectors.accounts?.toolkits
+      ?.actions?.(slug, { limit: 200 })
+      .catch(() => null);
+    if (!res?.actions?.length) return '';
+    return summarizeConnectorActions(
+      res.actions.map(a => ({
+        name: a.slug,
+        description: a.description || a.name,
+        inputSchema: a.inputParameters,
+      })),
+    );
+  }
+  if (origin === 'mcp') {
+    const res = await runSdk.connectors.mcps?.actions?.(slug).catch(() => null);
+    if (!res?.tools?.length) return '';
+    return summarizeConnectorActions(
+      res.tools.map(t => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema,
+      })),
+    );
+  }
+  if (origin === 'onchain') {
+    const res = await runSdk.connectors.onchain?.get?.(slug).catch(() => null);
+    if (!res?.tools?.length) return '';
+    return summarizeConnectorActions(
+      res.tools.map(t => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema ?? t.parameters,
+      })),
+    );
+  }
+  return '';
+}
