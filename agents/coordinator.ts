@@ -1390,4 +1390,700 @@ export async function runWorkflow(params: {
     stepToolCallIds.set(stepId, set);
   };
 
+  const handleRunEvent = async (event: RunEvent): Promise<void> => {
+    if (typeof event.runId === 'string' && event.runId.trim()) {
+      turnRunIds.add(event.runId.trim());
+    }
+    if (event.domain === 'model') {
+      if (activeToolSpans.size > 0) {
+        if (event.type === 'model.text.delta' && event.delta) {
+          if (typeof event.toolCallId === 'string' && event.toolCallId) {
+            toolCallTextBuffers.set(
+              event.toolCallId,
+              (toolCallTextBuffers.get(event.toolCallId) ?? '') + event.delta,
+            );
+          }
+          if (latestModelSpanId) {
+            spanStreamBuffers.set(
+              latestModelSpanId,
+              (spanStreamBuffers.get(latestModelSpanId) ?? '') + event.delta,
+            );
+          }
+          if (activeStepId) {
+            stepStreamBuffers.set(
+              activeStepId,
+              (stepStreamBuffers.get(activeStepId) ?? '') + event.delta,
+            );
+          }
+          emitEvent({ type: 'sse:delta', stepId: activeStepId, delta: event.delta });
+        } else if (event.type === 'model.text.done' && event.text) {
+          if (
+            typeof event.toolCallId === 'string' &&
+            event.toolCallId &&
+            !toolCallTextBuffers.get(event.toolCallId)
+          ) {
+            toolCallTextBuffers.set(event.toolCallId, event.text);
+          }
+          if (latestModelSpanId && !spanStreamBuffers.get(latestModelSpanId)) {
+            spanStreamBuffers.set(latestModelSpanId, event.text);
+          }
+          if (activeStepId && !stepStreamBuffers.get(activeStepId)) {
+            stepStreamBuffers.set(activeStepId, event.text);
+          }
+        }
+      } else {
+        if (event.type === 'model.text.delta' && event.delta) {
+          coordinatorText += event.delta;
+          emitEvent({ type: 'sse:delta', stepId: null, delta: event.delta });
+        } else if (event.type === 'model.text.done' && event.text && !coordinatorText) {
+          coordinatorText = event.text;
+        }
+      }
+      if (event.type === 'model.asset' && event.asset && !event.asset.partial && event.asset.url) {
+        const formatted =
+          event.asset.kind === 'image' ? `![Generated image](${event.asset.url})` : event.asset.url;
+        if (!globalAssets.includes(formatted)) globalAssets.push(formatted);
+        const targetStepId = activeStepId ?? lastCompletedStepId;
+        if (targetStepId) {
+          const list = stepAssets.get(targetStepId) ?? [];
+          if (!list.includes(formatted)) list.push(formatted);
+          stepAssets.set(targetStepId, list);
+          if (stepOutputs[targetStepId]) {
+            const upgraded = replaceDataUrisWithHostedUrls(stepOutputs[targetStepId]!, list);
+            if (upgraded !== stepOutputs[targetStepId]) {
+              stepOutputs[targetStepId] = upgraded;
+              const prevExec = executedSteps.get(targetStepId);
+              if (prevExec) executedSteps.set(targetStepId, { ...prevExec, output: upgraded });
+            }
+          }
+        }
+      }
+      if (event.type === 'model.error' && event.error?.code === 'MISSING_MEDIA_INPUT') {
+        const details = asRecord(event.error.details);
+        const required = Array.isArray(details?.['requiredInputs'])
+          ? (details['requiredInputs'] as unknown[]).map(String)
+          : ['audio'];
+        const stepNode =
+          (activeStepId ? orderedNodes.find(n => n.id === activeStepId) : undefined) ??
+          orderedNodes.find(n => n.data.kind === 'model' && !completedSteps.has(n.id)) ??
+          orderedNodes[0];
+        if (stepNode && !missingInputs.some(m => m.stepId === stepNode.id)) {
+          missingInputs.push({
+            stepId: stepNode.id,
+            stepLabel: stepNode.data.label,
+            modelId: stepNode.data.entry?.id,
+            modelName: stepNode.data.entry?.name,
+            acceptedInputs: required,
+            reason: event.error.message,
+            agentWallet: coordinator.walletAddress,
+            runId: event.runId ?? runId,
+            threadId,
+          });
+        }
+      }
+      return;
+    }
+
+    if (event.type === 'activity.thinking' && event.status === 'running') {
+      emitActivity({
+        stepId: activeStepId,
+        kind: 'thinking',
+        status: 'running',
+        title: activeStepId
+          ? `Orchestrating ${orderedNodes.find(n => n.id === activeStepId)?.data.label ?? 'step'}`
+          : `${coordinator.name} planning next step`,
+      });
+      return;
+    }
+
+    if (event.type === 'activity.connector') {
+      const payload = event.payload ?? {};
+      const details = asRecord(event.target?.details) ?? {};
+      const state =
+        (typeof payload['state'] === 'string' && payload['state']) ||
+        (typeof details['decision'] === 'string' && details['decision']) ||
+        '';
+      const rawBinding =
+        (typeof payload['bindingId'] === 'string' && payload['bindingId']) ||
+        (typeof event.target?.target === 'string' && event.target.target) ||
+        '';
+      const bindingTail = rawBinding.split(':').pop()?.toLowerCase() ?? '';
+      const connectorNode = orderedNodes.find(n => {
+        if (n.data.kind !== 'connector') return false;
+        if (!rawBinding) return true;
+        const nodeBinding = canonicalConnectorBindingId(n.data.entry)?.toLowerCase() ?? '';
+        const nodeEntryId = n.data.entry?.id?.toLowerCase() ?? '';
+        return (
+          nodeBinding === rawBinding.toLowerCase() ||
+          nodeEntryId === rawBinding.toLowerCase() ||
+          (bindingTail.length > 0 &&
+            (nodeEntryId === bindingTail || nodeEntryId.endsWith(`:${bindingTail}`)))
+        );
+      });
+      const nodeBindingLower = connectorNode
+        ? canonicalConnectorBindingId(connectorNode.data.entry)?.toLowerCase() ?? ''
+        : '';
+      const entryId = connectorNode?.data.entry?.id || rawBinding || 'connector';
+      const slug =
+        (typeof payload['slug'] === 'string' && payload['slug'].trim()) ||
+        (typeof event.target?.name === 'string' && event.target.name.trim()) ||
+        (rawBinding ? rawBinding.split(':').pop() : '') ||
+        entryId.split(':').pop() ||
+        entryId;
+
+      if (event.status === 'completed' || state === 'connected') {
+        const idx = missingConnectors.findIndex(
+          m => m.entryId === entryId || m.slug.toLowerCase() === slug.toLowerCase(),
+        );
+        if (idx >= 0) missingConnectors.splice(idx, 1);
+        gatedFallbackBySlug.delete(slug.toLowerCase());
+        emitActivity({
+          stepId: connectorNode?.id ?? activeStepId,
+          kind: 'connector',
+          status: 'completed',
+          title: `Connected · ${connectorNode?.data.entry?.name || slug}`,
+        });
+        return;
+      }
+
+      if (event.status === 'pending' || state === 'requested' || state === 'escalated') {
+        const requestId =
+          (typeof payload['requestId'] === 'string' && payload['requestId'].trim()) ||
+          (typeof details['requestId'] === 'string' && details['requestId'].trim()) ||
+          (typeof event.target?.id === 'string' && event.target.id.trim()) ||
+          undefined;
+        const targetRunId =
+          (typeof payload['runId'] === 'string' && payload['runId']) || event.runId || runId;
+
+        const alreadyAuthorized =
+          (nodeBindingLower.length > 0 && connectedBindings.has(nodeBindingLower)) ||
+          (rawBinding.length > 0 && connectedBindings.has(rawBinding.toLowerCase())) ||
+          connectedSlugs.has(slug.toLowerCase());
+
+        if (alreadyAuthorized && requestId && !settledRequestIds.has(requestId)) {
+          settledRequestIds.add(requestId);
+          const settled = await runSdk.agent
+            .decideConnector({
+              agentWallet: coordinator.walletAddress,
+              runId: targetRunId,
+              requestId,
+              decision: 'connected',
+              ...(subject ? { userAddress: subject } : {}),
+            })
+            .catch(() => null);
+          if (settled) {
+            pendingWatchQueue.push({ runId: targetRunId, requestId });
+            emitActivity({
+              stepId: connectorNode?.id ?? activeStepId,
+              kind: 'connector',
+              status: 'completed',
+              title: `Connected · ${connectorNode?.data.entry?.name || slug}`,
+            });
+            return;
+          }
+        }
+
+        const kindRaw =
+          (typeof payload['kind'] === 'string' && payload['kind']) ||
+          (typeof details['kind'] === 'string' && details['kind']) ||
+          (rawBinding.startsWith('account:') || entryId.startsWith('account:')
+            ? 'account'
+            : 'gated');
+        const knownVars = Array.isArray(payload['missingVars'])
+          ? (payload['missingVars'] as MissingConnectorRequirement['missingVars'])
+          : missingVarsBySlug.get(slug.toLowerCase());
+
+        const nextReq: MissingConnectorRequirement = {
+          entryId,
+          slug,
+          name:
+            (typeof payload['name'] === 'string' && payload['name']) ||
+            connectorNode?.data.entry?.name ||
+            event.target?.name ||
+            slug,
+          type: kindRaw === 'account' ? 'account' : 'gated',
+          ...(subject ? { userAddress: subject } : {}),
+          ...(knownVars && knownVars.length > 0 ? { missingVars: knownVars } : {}),
+          reason:
+            (typeof payload['reason'] === 'string' && payload['reason']) ||
+            event.target?.summary ||
+            `Connect ${connectorNode?.data.entry?.name || slug} to continue this workflow.`,
+          agentWallet: coordinator.walletAddress,
+          runId: targetRunId,
+          threadId,
+          ...(requestId ? { requestId } : {}),
+        };
+        const existingIdx = missingConnectors.findIndex(
+          m => m.entryId === nextReq.entryId || m.slug.toLowerCase() === nextReq.slug.toLowerCase(),
+        );
+        if (existingIdx >= 0) missingConnectors[existingIdx] = nextReq;
+        else missingConnectors.push(nextReq);
+        emitActivity({
+          stepId: connectorNode?.id ?? activeStepId,
+          kind: 'connector',
+          status: 'pending',
+          title: `Authorization required · ${nextReq.name}`,
+          summary: nextReq.reason,
+        });
+        if (!pausedForConnector) {
+          pausedForConnector = true;
+          emitEvent({ type: 'connector:pause', missing: [...missingConnectors] });
+          void runSdk.agent
+            .stop({
+              agentWallet: coordinator.walletAddress,
+              runId: targetRunId,
+              threadId,
+            })
+            .catch(() => undefined);
+          streamAbort.abort();
+        }
+      }
+      return;
+    }
+
+    if (event.type === 'activity.plan') {
+      const payload = event.payload ?? {};
+      if (
+        payload['state'] === 'awaiting_approval' &&
+        typeof payload['proposalId'] === 'string' &&
+        typeof payload['version'] === 'number'
+      ) {
+        const proposalRunId =
+          (typeof payload['runId'] === 'string' && payload['runId']) || event.runId || runId;
+        await runSdk.agent.decide({
+          agentWallet: coordinator.walletAddress,
+          runId: proposalRunId,
+          proposalId: payload['proposalId'],
+          proposalVersion: payload['version'],
+          decision: 'approved',
+          ...(subject ? { approver: subject } : {}),
+        });
+        const watchGen = runSdk.agent.watch(
+          {
+            agentWallet: coordinator.walletAddress,
+            runId: proposalRunId,
+            threadId,
+          },
+          { signal: streamAbort.signal },
+        );
+        let nextWatch = await watchGen.next();
+        while (!nextWatch.done) {
+          await handleRunEvent(nextWatch.value);
+          nextWatch = await watchGen.next();
+        }
+        recordReceipt(nextWatch.value?.receipt);
+      }
+      return;
+    }
+
+    if (event.type === 'activity.tool') {
+      if (
+        !event.name ||
+        event.id.startsWith('artifact:') ||
+        event.spanId.startsWith('artifact:')
+      ) {
+        const artifact = asRecord(event.payload?.['artifact']);
+        const artifactUrl = typeof artifact?.['url'] === 'string' ? artifact['url'].trim() : '';
+        if (artifactUrl) {
+          const formatted =
+            artifact?.['type'] === 'image'
+              ? `![Generated image](${artifactUrl})`
+              : artifactUrl;
+          if (!globalAssets.includes(formatted)) globalAssets.push(formatted);
+          const targetStepId = activeStepId ?? lastCompletedStepId;
+          if (targetStepId) {
+            const list = stepAssets.get(targetStepId) ?? [];
+            if (!list.includes(formatted)) list.push(formatted);
+            stepAssets.set(targetStepId, list);
+            if (stepOutputs[targetStepId]) {
+              const upgraded = replaceDataUrisWithHostedUrls(stepOutputs[targetStepId]!, list);
+              if (upgraded !== stepOutputs[targetStepId]) {
+                stepOutputs[targetStepId] = upgraded;
+                const prevExec = executedSteps.get(targetStepId);
+                if (prevExec) executedSteps.set(targetStepId, { ...prevExec, output: upgraded });
+                const targetNode = orderedNodes.find(n => n.id === targetStepId);
+                if (targetNode) {
+                  emitEvent({
+                    type: 'step:done',
+                    stepId: targetNode.id,
+                    label: targetNode.data.label,
+                    kind: targetNode.data.kind,
+                    output: upgraded,
+                  });
+                }
+              }
+            }
+          }
+        }
+        return;
+      }
+
+      const toolName = event.name;
+      if (event.status === 'running') {
+        activeToolSpans.add(event.spanId);
+        if (toolName === 'models_call') {
+          latestModelSpanId = event.spanId;
+          spanStreamBuffers.set(event.spanId, '');
+        }
+        coordinatorText = '';
+      } else {
+        activeToolSpans.delete(event.spanId);
+        if (latestModelSpanId === event.spanId) {
+          latestModelSpanId = null;
+        }
+      }
+      const payload = event.payload ?? {};
+      const parsedOut =
+        asRecord(unwrapToolOutput(payload['output'])) ??
+        asRecord(unwrapToolOutput(payload['error']));
+
+      if (toolName === 'connector_select' && event.status === 'completed' && parsedOut) {
+        const selected = asRecord(parsedOut['selected']);
+        const bindingId =
+          (typeof selected?.['bindingId'] === 'string' && selected['bindingId'].trim()) ||
+          (typeof parsedOut['bindingId'] === 'string' && parsedOut['bindingId'].trim()) ||
+          '';
+        if (bindingId) {
+          const bindingKey = bindingId.toLowerCase();
+          if (Array.isArray(selected?.['actions'])) {
+            for (const rawAct of selected['actions']) {
+              const act = asRecord(rawAct);
+              if (typeof act?.['name'] === 'string' && act['name'].trim()) {
+                exposedActionToBinding.set(act['name'].trim().toLowerCase(), bindingKey);
+              }
+            }
+          }
+          if (Array.isArray(parsedOut['exposedTools'])) {
+            for (const rawName of parsedOut['exposedTools']) {
+              if (typeof rawName === 'string' && rawName.trim()) {
+                exposedActionToBinding.set(rawName.trim().toLowerCase(), bindingKey);
+              }
+            }
+          }
+        }
+        if (parsedOut['state'] === 'credential_gated') {
+          const gatedBinding =
+            (typeof parsedOut['bindingId'] === 'string' && parsedOut['bindingId'].trim()) ||
+            bindingId;
+          const gatedSlug =
+            (typeof parsedOut['slug'] === 'string' && parsedOut['slug'].trim()) ||
+            gatedBinding.split(':').pop() ||
+            '';
+          if (gatedSlug) {
+            if (Array.isArray(parsedOut['missingVars'])) {
+              missingVarsBySlug.set(
+                gatedSlug.toLowerCase(),
+                parsedOut['missingVars'] as NonNullable<MissingConnectorRequirement['missingVars']>,
+              );
+            }
+            const cNode = orderedNodes.find(n => {
+              if (n.data.kind !== 'connector') return false;
+              const nb = canonicalConnectorBindingId(n.data.entry)?.toLowerCase() ?? '';
+              return (
+                nb === gatedBinding.toLowerCase() ||
+                (n.data.entry?.id ?? '').toLowerCase().endsWith(gatedSlug.toLowerCase())
+              );
+            });
+            const entryId = cNode?.data.entry?.id || gatedBinding || gatedSlug;
+            gatedFallbackBySlug.set(gatedSlug.toLowerCase(), {
+              entryId,
+              slug: gatedSlug,
+              name: cNode?.data.entry?.name || gatedSlug,
+              type:
+                gatedBinding.startsWith('account:') || entryId.startsWith('account:')
+                  ? 'account'
+                  : 'gated',
+              ...(subject ? { userAddress: subject } : {}),
+              ...(Array.isArray(parsedOut['missingVars'])
+                ? {
+                  missingVars: parsedOut[
+                    'missingVars'
+                  ] as MissingConnectorRequirement['missingVars'],
+                }
+                : {}),
+              reason:
+                (typeof parsedOut['message'] === 'string' && parsedOut['message']) ||
+                `Connect ${cNode?.data.entry?.name || gatedSlug} to continue this workflow.`,
+              agentWallet: coordinator.walletAddress,
+              runId: event.runId ?? runId,
+              threadId,
+            });
+          }
+        }
+        return;
+      }
+
+      if (
+        event.status !== 'running' &&
+        parsedOut &&
+        (parsedOut['code'] === 'MISSING_MEDIA_INPUT' || Array.isArray(parsedOut['requiredInputs']))
+      ) {
+        const modelRec = asRecord(parsedOut['model']);
+        const required = Array.isArray(parsedOut['requiredInputs'])
+          ? parsedOut['requiredInputs'].map(String)
+          : ['audio'];
+        const matchedNode =
+          (spanToStepId.get(event.spanId)
+            ? orderedNodes.find(n => n.id === spanToStepId.get(event.spanId))
+            : undefined) ?? matchNodeForTool(toolName, event);
+        if (matchedNode && !missingInputs.some(m => m.stepId === matchedNode.id)) {
+          missingInputs.push({
+            stepId: matchedNode.id,
+            stepLabel: matchedNode.data.label,
+            modelId:
+              (typeof modelRec?.['id'] === 'string' && modelRec['id']) || matchedNode.data.entry?.id,
+            modelName:
+              (typeof modelRec?.['name'] === 'string' && modelRec['name']) ||
+              matchedNode.data.entry?.name,
+            acceptedInputs: required,
+            reason:
+              (typeof parsedOut['error'] === 'string' && parsedOut['error']) ||
+              `Provide ${required.join('/')} input for "${matchedNode.data.label}".`,
+            agentWallet: coordinator.walletAddress,
+            runId: event.runId ?? runId,
+            threadId,
+          });
+        }
+        return;
+      }
+
+      if (event.status !== 'running' && parsedOut?.['code'] === 'CONNECTOR_AUTH_REQUIRED') {
+        const authBinding =
+          (typeof parsedOut['bindingId'] === 'string' && parsedOut['bindingId'].trim()) || '';
+        const authSlug =
+          (typeof parsedOut['slug'] === 'string' && parsedOut['slug'].trim()) ||
+          authBinding.split(':').pop() ||
+          'connector';
+        const matchedNode =
+          (spanToStepId.get(event.spanId)
+            ? orderedNodes.find(n => n.id === spanToStepId.get(event.spanId))
+            : undefined) ?? matchNodeForTool(toolName, event);
+        const entryId = matchedNode?.data.entry?.id || authBinding || authSlug;
+        const authReq: MissingConnectorRequirement = {
+          entryId,
+          slug: authSlug,
+          name: matchedNode?.data.entry?.name || authSlug,
+          type: authBinding.startsWith('account:') || entryId.startsWith('account:') ? 'account' : 'gated',
+          ...(subject ? { userAddress: subject } : {}),
+          reason:
+            (typeof parsedOut['error'] === 'string' && parsedOut['error']) ||
+            `Connect ${matchedNode?.data.entry?.name || authSlug} to continue this workflow.`,
+          agentWallet: coordinator.walletAddress,
+          runId: event.runId ?? runId,
+          threadId,
+        };
+        const existingIdx = missingConnectors.findIndex(
+          m => m.entryId === authReq.entryId || m.slug.toLowerCase() === authReq.slug.toLowerCase(),
+        );
+        if (existingIdx >= 0) missingConnectors[existingIdx] = authReq;
+        else missingConnectors.push(authReq);
+        if (!pausedForConnector) {
+          pausedForConnector = true;
+          emitEvent({ type: 'connector:pause', missing: [...missingConnectors] });
+          void runSdk.agent
+            .stop({
+              agentWallet: coordinator.walletAddress,
+              runId: event.runId ?? runId,
+              threadId,
+            })
+            .catch(() => undefined);
+          streamAbort.abort();
+        }
+        return;
+      }
+
+      if (CONTROL_TOOLS.has(toolName)) return;
+
+      if (event.status === 'running') {
+        const node = matchNodeForTool(toolName, event);
+        if (node) {
+          spanToStepId.set(event.spanId, node.id);
+          recordStepToolCall(node.id, event);
+          activeStepId = node.id;
+          if (toolName === 'models_call') {
+            stepStreamBuffers.set(node.id, '');
+          }
+          if (!startedSteps.has(node.id)) {
+            startedSteps.add(node.id);
+            stepStartTimes.set(node.id, event.ts || Date.now());
+            emitEvent({
+              type: 'step:start',
+              stepId: node.id,
+              label: node.data.label,
+              kind: node.data.kind,
+            });
+            onStepProgress?.({ runningStepId: node.id, stepOutputs: { ...stepOutputs } });
+          }
+          emitActivity({
+            stepId: node.id,
+            kind: node.data.kind,
+            status: 'running',
+            title: `${node.data.kind === 'model' ? 'Model' : node.data.kind === 'connector' ? 'Connector' : 'Agent'} · ${node.data.entry?.name || node.data.label}`,
+          });
+        }
+        return;
+      }
+
+      const mappedStepId = spanToStepId.get(event.spanId);
+      const node =
+        (mappedStepId ? orderedNodes.find(n => n.id === mappedStepId) : undefined) ??
+        matchNodeForTool(toolName, event);
+      if (node) {
+        recordStepToolCall(node.id, event);
+      }
+
+      const nestedResult = asRecord(parsedOut?.['result']);
+      const toolFailed =
+        event.status === 'failed' ||
+        Boolean(payload['error']) ||
+        parsedOut?.['success'] === false ||
+        parsedOut?.['successful'] === false ||
+        parsedOut?.['ok'] === false ||
+        nestedResult?.['successful'] === false ||
+        nestedResult?.['success'] === false;
+
+      if (toolFailed) {
+        const errDetail =
+          (typeof parsedOut?.['error'] === 'string' && parsedOut['error'].trim()) ||
+          (typeof nestedResult?.['error'] === 'string' && nestedResult['error'].trim()) ||
+          (typeof parsedOut?.['message'] === 'string' && parsedOut['message'].trim()) ||
+          (typeof payload['error'] === 'string' && payload['error'].trim()) ||
+          `Tool ${toolName} failed.`;
+        if (node) {
+          stepErrors.set(node.id, errDetail);
+          emitActivity({
+            stepId: node.id,
+            kind: node.data.kind,
+            status: 'failed',
+            title: `Failed · ${node.data.entry?.name || node.data.label}`,
+            summary: errDetail,
+          });
+        }
+        return;
+      }
+
+      if (node && event.status === 'completed') {
+        stepErrors.delete(node.id);
+        const startedAt = stepStartTimes.get(node.id) ?? event.ts ?? Date.now();
+        const endedAt = Date.now();
+        const nodeAssets = stepAssets.get(node.id) ?? [];
+        const formattedPayload = formatToolStepOutput(payload, nodeAssets);
+        const streamedText = (
+          (typeof payload['toolCallId'] === 'string' &&
+            toolCallTextBuffers.get(payload['toolCallId'])) ||
+          spanStreamBuffers.get(event.spanId) ||
+          stepStreamBuffers.get(node.id) ||
+          ''
+        ).trim();
+
+        const rawOutputJson = JSON.stringify(payload['output'] ?? '');
+        const wasTruncated =
+          formattedPayload.includes('[truncated ') ||
+          rawOutputJson.includes('[truncated ') ||
+          rawOutputJson.includes('truncated_text');
+
+        let stepText = formattedPayload;
+        if (toolName === 'models_call' && streamedText.length > 0 && (!formattedPayload || wasTruncated)) {
+          const combined = [streamedText];
+          for (const asset of nodeAssets) {
+            if (!combined.some(part => part.includes(asset))) combined.push(asset);
+          }
+          stepText = replaceDataUrisWithHostedUrls(combined.join('\n\n').trim(), nodeAssets);
+        }
+
+        if (stepText.includes('data:') && stepText.includes(';base64,')) {
+          const pinnedRes = await pinResidualDataUrisInStepOutput(stepText, node.id, fetchImpl);
+          stepText = pinnedRes.output;
+          if (pinnedRes.pinnedAssets.length > 0) {
+            const list = stepAssets.get(node.id) ?? [];
+            for (const asset of pinnedRes.pinnedAssets) {
+              if (!list.includes(asset)) list.push(asset);
+              if (!globalAssets.includes(asset)) globalAssets.push(asset);
+            }
+            stepAssets.set(node.id, list);
+          }
+        }
+
+        if (node.data.kind === 'connector') {
+          const publishedMatch = stepText.match(/https?:\/\/[^\s)]+/);
+          if (publishedMatch && stepText.startsWith('Published:')) {
+            const urls = stepPublishedUrls.get(node.id) ?? [];
+            if (!urls.includes(publishedMatch[0])) urls.push(publishedMatch[0]);
+            stepPublishedUrls.set(node.id, urls);
+          }
+          const priorUrls = stepPublishedUrls.get(node.id) ?? [];
+          for (const url of priorUrls) {
+            if (!stepText.includes(url)) {
+              stepText = `Published: ${url}\n\n${stepText}`.trim();
+            }
+          }
+        }
+
+        if (!stepText) {
+          stepText = event.target?.summary || `Completed ${node.data.label}`;
+        }
+
+        stepOutputs[node.id] = stepText;
+        completedSteps.add(node.id);
+        lastCompletedStepId = node.id;
+        if (activeStepId === node.id) activeStepId = null;
+
+        const inputAction = asRecord(payload['input'])?.['action'];
+        const recordedTool =
+          toolName === 'connectors_call' && typeof inputAction === 'string' && inputAction.trim()
+            ? inputAction.trim()
+            : toolName;
+
+        executedSteps.set(node.id, {
+          id: node.id,
+          label: node.data.label,
+          kind: node.data.kind,
+          entryId: node.data.entry?.id ?? null,
+          billWei: '0',
+          output: stepText,
+          stepInput: payload['input'] ?? { stepId: node.id, label: node.data.label },
+          invokedTool: recordedTool,
+          inferenceRunIds: event.runId ? [event.runId] : [runId],
+          startedAt,
+          endedAt,
+        });
+
+        emitEvent({
+          type: 'step:done',
+          stepId: node.id,
+          label: node.data.label,
+          kind: node.data.kind,
+          output: stepText,
+        });
+        emitActivity({
+          stepId: node.id,
+          kind: node.data.kind,
+          status: 'completed',
+          title: `Completed · ${node.data.entry?.name || node.data.label}`,
+        });
+        onStepProgress?.({ runningStepId: null, stepOutputs: { ...stepOutputs } });
+      }
+      return;
+    }
+
+    if (event.type === 'activity.message' && event.status === 'completed' && event.delta) {
+      coordinatorText = event.delta;
+      return;
+    }
+
+    if (event.type === 'activity.error') {
+      upstreamError =
+        (typeof event.payload?.['message'] === 'string' && event.payload['message']) ||
+        (typeof event.payload?.['error'] === 'string' && event.payload['error']) ||
+        'Coordinator runtime execution failed.';
+      emitActivity({
+        stepId: activeStepId,
+        kind: 'error',
+        status: 'failed',
+        title: 'Execution error',
+        summary: upstreamError,
+      });
+    }
+  };
+
 }
