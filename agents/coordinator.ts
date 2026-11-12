@@ -669,3 +669,63 @@ async function fetchConnectorActionSummary(
   }
   return '';
 }
+
+function assembleFinalDeliverable(params: {
+  orderedNodes: Block[];
+  edges: Link[];
+  executedSteps: Map<string, ExecutedWorkflowStep>;
+  coordinatorText: string;
+  globalAssets: string[];
+}): string {
+  const { orderedNodes, edges, executedSteps, coordinatorText, globalAssets } = params;
+  const sourceNodeIds = new Set(edges.map(e => e.source));
+  const orderedSteps = orderedNodes
+    .map(n => executedSteps.get(n.id))
+    .filter((s): s is ExecutedWorkflowStep => Boolean(s && s.output.trim()));
+
+  const contentSteps = orderedSteps.filter(s => s.kind === 'model' || s.kind === 'agent');
+  const sinkConnectorSteps = orderedSteps.filter(
+    s => s.kind === 'connector' && !sourceNodeIds.has(s.id) && s.invokedTool !== 'dry_run',
+  );
+  const primaryStepText = contentSteps[contentSteps.length - 1]?.output.trim() ?? '';
+  const primaryProseLen = primaryStepText.replace(/!\[[^\]]*\]\([^)]+\)/g, '').trim().length;
+
+  const rawCoord = coordinatorText.trim();
+  const coordUsable =
+    rawCoord && !rawCoord.includes('[truncated ') && !rawCoord.startsWith('{"role":"tool"')
+      ? rawCoord
+      : '';
+
+  const sections: string[] = [];
+  if (
+    primaryProseLen >= 300 &&
+    (!coordUsable ||
+      (!coordUsable.includes(primaryStepText.slice(0, 120)) &&
+        coordUsable.length < primaryProseLen * 0.7))
+  ) {
+    sections.push(primaryStepText);
+    if (coordUsable) {
+      sections.push(`---\n\n${coordUsable}`);
+    }
+  } else if (coordUsable) {
+    sections.push(coordUsable);
+  } else if (primaryStepText) {
+    sections.push(primaryStepText);
+  } else if (orderedSteps.length > 0) {
+    sections.push(orderedSteps[orderedSteps.length - 1]!.output.trim());
+  }
+
+  const joinedSoFar = sections.join('\n\n');
+  for (const conn of sinkConnectorSteps) {
+    const summary = conn.output.trim();
+    if (summary && !joinedSoFar.includes(summary)) {
+      sections.push(`---\n\n**${conn.label}:** ${summary}`);
+    }
+  }
+  for (const asset of globalAssets) {
+    const rawUrlMatch = asset.match(/\((https?:\/\/[^)]+)\)/);
+    const checkToken = rawUrlMatch?.[1] ?? asset;
+    if (!sections.some(s => s.includes(checkToken))) sections.push(asset);
+  }
+  return sections.join('\n\n').trim();
+}
