@@ -841,3 +841,248 @@ function buildCoordinatorMessage(params: {
     .filter(Boolean)
     .join('\n\n');
 }
+
+export async function runWorkflow(params: {
+  flow: Listing;
+  coordinator: Coordinator;
+  runSdk: ComposeSDK;
+  runId: string;
+  threadId: string;
+  subject?: string;
+  userInput?: string;
+  attachments?: WorkflowAttachment[];
+  priorStepOutputs?: Record<string, string>;
+  dry?: boolean;
+  requireProof?: boolean;
+  isResumingThread?: boolean;
+  hasConnectorDecisions?: boolean;
+  fetchImpl?: typeof fetch;
+  emitEvent: (event: Record<string, unknown>) => void;
+  onBillDelta: (deltaWei: bigint) => void;
+  onStepProgress?: (progress: {
+    runningStepId: string | null;
+    stepOutputs: Record<string, string>;
+  }) => void;
+}): Promise<WorkflowResult> {
+  const {
+    flow,
+    coordinator,
+    runSdk,
+    runId,
+    threadId,
+    subject,
+    userInput,
+    attachments = [],
+    priorStepOutputs = {},
+    dry = false,
+    requireProof = false,
+    isResumingThread = false,
+    hasConnectorDecisions = false,
+    fetchImpl,
+    emitEvent,
+    onBillDelta,
+    onStepProgress,
+  } = params;
+
+  const { waves, orderedNodes, incomingByNode } = decomposeWorkflowWaves(flow.nodes, flow.edges);
+  const stepOutputs: Record<string, string> = { ...priorStepOutputs };
+  const startedSteps = new Set<string>(Object.keys(priorStepOutputs));
+  const completedSteps = new Set<string>(Object.keys(priorStepOutputs));
+  const stepStartTimes = new Map<string, number>();
+  const stepAssets = new Map<string, string[]>();
+  const stepErrors = new Map<string, string>();
+  const stepPublishedUrls = new Map<string, string[]>();
+  const spanToStepId = new Map<string, string>();
+  const stepToolCallIds = new Map<string, Set<string>>();
+  const turnStartedAtMs = Date.now();
+  const turnRunIds = new Set<string>(isResumingThread ? [] : [runId]);
+  const spanStreamBuffers = new Map<string, string>();
+  const toolCallTextBuffers = new Map<string, string>();
+  const stepStreamBuffers = new Map<string, string>();
+  const exposedActionToBinding = new Map<string, string>();
+  const missingVarsBySlug = new Map<
+    string,
+    NonNullable<MissingConnectorRequirement['missingVars']>
+  >();
+  const gatedFallbackBySlug = new Map<string, MissingConnectorRequirement>();
+  const executedSteps = new Map<string, ExecutedWorkflowStep>();
+  const globalAssets: string[] = [];
+  let activitySeq = 0;
+
+  const emitActivity = (item: {
+    stepId: string | null;
+    kind: string;
+    status: 'running' | 'completed' | 'pending' | 'failed';
+    title: string;
+    summary?: string;
+  }) => {
+    activitySeq += 1;
+    emitEvent({
+      type: 'sse:activity',
+      id: `act-${activitySeq}`,
+      ts: Date.now(),
+      stepId: item.stepId,
+      kind: item.kind,
+      status: item.status,
+      title: item.title,
+      ...(item.summary ? { summary: item.summary } : {}),
+    });
+  };
+
+  for (const node of orderedNodes) {
+    const prior = priorStepOutputs[node.id];
+    if (prior !== undefined) {
+      executedSteps.set(node.id, {
+        id: node.id,
+        label: node.data.label,
+        kind: node.data.kind,
+        entryId: node.data.entry?.id ?? null,
+        billWei: '0',
+        output: prior,
+        stepInput: { stepId: node.id, resumed: true },
+        invokedTool: 'cached',
+        inferenceRunIds: [runId],
+        startedAt: Date.now(),
+        endedAt: Date.now(),
+      });
+      emitEvent({
+        type: 'step:done',
+        stepId: node.id,
+        label: node.data.label,
+        kind: node.data.kind,
+        output: prior,
+      });
+    }
+  }
+
+  let backpackAccounts:
+    | Array<{
+      slug: string;
+      name: string;
+      connected: boolean;
+      accountId?: string;
+      status?: string;
+    }>
+    | undefined;
+
+  const connectedBindings = new Set<string>();
+  const connectedSlugs = new Set<string>();
+
+  for (const node of orderedNodes) {
+    if (node.data.kind !== 'connector') continue;
+    const binding = canonicalConnectorBindingId(node.data.entry);
+    if (binding?.startsWith('onchain:')) {
+      connectedBindings.add(binding.toLowerCase());
+      connectedSlugs.add(binding.slice('onchain:'.length).toLowerCase());
+    }
+  }
+
+  const preflightStatus =
+    subject && orderedNodes.some(n => n.data.kind === 'connector' || n.data.kind === 'agent')
+      ? await runSdk.connectors.status({ userAddress: subject }).catch(() => null)
+      : null;
+
+  if (subject && preflightStatus) {
+    for (const acc of preflightStatus.accounts ?? []) {
+      if (acc.connected) {
+        const slugLower = acc.slug.toLowerCase();
+        connectedSlugs.add(slugLower);
+        connectedBindings.add(`account:${slugLower}`);
+      }
+    }
+    for (const conn of preflightStatus.connectors ?? []) {
+      if (conn.connected && (conn.missingVars?.length ?? 0) === 0) {
+        const slugLower = conn.slug.toLowerCase();
+        connectedSlugs.add(slugLower);
+        connectedBindings.add(`mcp:${slugLower}`);
+      }
+    }
+
+    for (const node of orderedNodes) {
+      if (node.data.kind !== 'connector') continue;
+      const binding = canonicalConnectorBindingId(node.data.entry);
+      if (!binding) continue;
+      if (binding.startsWith('account:')) {
+        const toolkit = binding.slice('account:'.length).toLowerCase();
+        const matchAcc =
+          (preflightStatus.accounts ?? []).find(
+            a => a.slug.toLowerCase() === toolkit && a.connected,
+          ) ?? (preflightStatus.accounts ?? []).find(a => a.slug.toLowerCase() === toolkit);
+        if (matchAcc?.connected) {
+          if (!matchAcc.granted) {
+            await runSdk.connectors.accounts
+              .grant({ userAddress: subject, toolkit: matchAcc.slug })
+              .catch(() => undefined);
+            matchAcc.granted = true;
+          }
+          connectedBindings.add(binding.toLowerCase());
+          connectedSlugs.add(toolkit);
+        }
+      } else if (binding.startsWith('mcp:')) {
+        const rawMcpSlug = binding.slice('mcp:'.length);
+        const mcpSlug = rawMcpSlug.toLowerCase();
+        const matchConn =
+          (preflightStatus.connectors ?? []).find(
+            c => c.slug.toLowerCase() === mcpSlug && c.connected,
+          ) ?? (preflightStatus.connectors ?? []).find(c => c.slug.toLowerCase() === mcpSlug);
+        if (matchConn?.connected && (matchConn.missingVars?.length ?? 0) === 0) {
+          if (!matchConn.allowed) {
+            await runSdk.connectors.gated
+              .grant({ userAddress: subject, slug: matchConn.slug })
+              .catch(() => undefined);
+          }
+          connectedBindings.add(binding.toLowerCase());
+          connectedSlugs.add(mcpSlug);
+        } else if (matchConn?.missingVars?.length) {
+          missingVarsBySlug.set(mcpSlug, matchConn.missingVars);
+        } else if (!matchConn) {
+          const serverInfo = await runSdk.connectors.mcps
+            ?.get?.(rawMcpSlug)
+            .catch(() => null);
+          const rawCreds = (
+            serverInfo as {
+              credentials?: Array<{ varName: string; description?: string; obtainUrl?: string }>;
+            } | null
+          )?.credentials;
+          const requiredSpecs = Array.isArray(rawCreds)
+            ? rawCreds.filter(c => typeof c?.varName === 'string' && c.varName.trim().length > 0)
+            : [];
+          if (requiredSpecs.length > 0) {
+            missingVarsBySlug.set(mcpSlug, requiredSpecs);
+          } else {
+            // Public/ungated MCP server with zero required credentials
+            connectedBindings.add(binding.toLowerCase());
+            connectedSlugs.add(mcpSlug);
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(preflightStatus.accounts) && preflightStatus.accounts.length > 0) {
+      const dedupedBySlug = new Map<
+        string,
+        {
+          slug: string;
+          name: string;
+          connected: boolean;
+          accountId?: string;
+          status?: string;
+        }
+      >();
+      for (const acc of preflightStatus.accounts) {
+        const key = acc.slug.toLowerCase();
+        const existing = dedupedBySlug.get(key);
+        if (existing?.connected && !acc.connected) continue;
+        dedupedBySlug.set(key, {
+          slug: acc.slug,
+          name: acc.slug,
+          connected: Boolean(acc.connected),
+          ...(acc.connectedAccountId ? { accountId: acc.connectedAccountId } : {}),
+          ...(acc.status ? { status: acc.status } : {}),
+        });
+      }
+      backpackAccounts = [...dedupedBySlug.values()];
+    }
+  }
+
+}
