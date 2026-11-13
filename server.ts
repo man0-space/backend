@@ -394,5 +394,231 @@ export async function build(deps: ServerDeps = {}) {
     }
   });
 
+  const profileCacheKey = (identifier: string) => `profile:${identifier.trim().toLowerCase()}`;
+
+  function toProfileSlug(raw: string): string {
+    let decoded = raw;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch {
+      decoded = raw;
+    }
+    return decoded
+      .trim()
+      .replace(/^@+/, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  function looksLikeWalletAddress(raw: string): boolean {
+    const s = raw.trim();
+    return (
+      /^0u[a-z0-9]{18,}$/i.test(s) ||
+      /^0x[a-f0-9]{40}$/i.test(s) ||
+      /^[a-f0-9]{64}$/i.test(s) ||
+      /\.(?:near|testnet)$/i.test(s) ||
+      /^(?=.*[0-9A-Z])[1-9A-HJ-NP-Za-km-z]{32,48}$/.test(s)
+    );
+  }
+
+  async function loadCreatorWallets(
+    canonicalAddresses: string[],
+  ): Promise<Map<string, { near: string; evm: string | null; svm: string | null }>> {
+    const map = new Map<string, { near: string; evm: string | null; svm: string | null }>();
+    if (canonicalAddresses.length === 0) return map;
+    for (const addr of canonicalAddresses) {
+      map.set(addr.toLowerCase(), { near: addr, evm: null, svm: null });
+    }
+    const linkRows = await user`
+      SELECT "userAddress", network, address, status
+      FROM links
+      WHERE LOWER("userAddress") = ANY(${canonicalAddresses.map(a => a.toLowerCase())})
+        AND status <> 'failed'
+      ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, created ASC
+    `;
+    for (const row of linkRows) {
+      const uaLower = String(row.userAddress ?? '').trim().toLowerCase();
+      const entry = map.get(uaLower);
+      if (!entry) continue;
+      const net = String(row.network ?? '').toLowerCase();
+      const addr = String(row.address ?? '').trim();
+      if (!addr) continue;
+      if (net === 'evm' && !entry.evm) entry.evm = addr;
+      if (net === 'svm' && !entry.svm) entry.svm = addr;
+    }
+    return map;
+  }
+
+  async function loadCreatorProfiles(rawAddresses: string[]): Promise<Map<string, CreatorProfile>> {
+    await token.ensureUserColumns();
+    const result = new Map<string, CreatorProfile>();
+    const uniqueByLower = new Map<string, string>();
+    for (const raw of rawAddresses) {
+      const trimmed = String(raw ?? '').trim();
+      if (!trimmed) continue;
+      const lower = trimmed.toLowerCase();
+      if (!uniqueByLower.has(lower)) {
+        uniqueByLower.set(lower, trimmed);
+      }
+    }
+    if (uniqueByLower.size === 0) return result;
+
+    const lowerAddresses = [...uniqueByLower.keys()];
+    const cacheKeys = lowerAddresses.map(lower => `profile:${lower}`);
+    const cachedMap = await cacheMGet<CreatorProfile>(cacheKeys, 30_000);
+    const missingLower: string[] = [];
+
+    for (const lower of lowerAddresses) {
+      const hit = cachedMap.get(`profile:${lower}`);
+      if (hit && hit.userAddress && hit.wallets) {
+        result.set(lower, hit);
+      } else {
+        missingLower.push(lower);
+      }
+    }
+
+    if (missingLower.length > 0) {
+      const missingSlugs = [
+        ...new Set(missingLower.map(item => toProfileSlug(item)).filter(Boolean)),
+      ];
+
+      const [directRows, linkedRows] = await Promise.all([
+        user`
+          SELECT "userAddress", name, bio, image, banner, socials
+          FROM users
+          WHERE LOWER("userAddress") = ANY(${missingLower})
+             OR (
+               TRIM(name) <> ''
+               AND (
+                 LOWER(TRIM(name)) = ANY(${missingLower})
+                 OR TRIM(BOTH '-' FROM REGEXP_REPLACE(LOWER(TRIM(name)), '[^a-z0-9]+', '-', 'g')) = ANY(${missingSlugs})
+               )
+             )
+        `,
+        user`
+          SELECT "userAddress", LOWER(address) AS "linkedLower"
+          FROM links
+          WHERE LOWER(address) = ANY(${missingLower})
+            AND status <> 'failed'
+        `,
+      ]);
+
+      const dbByCanonicalLower = new Map<string, Record<string, unknown>>();
+      for (const row of directRows) {
+        const ua = String(row.userAddress ?? '').trim();
+        if (ua) dbByCanonicalLower.set(ua.toLowerCase(), row);
+      }
+
+      const linkedOwnerByAddrLower = new Map<string, string>();
+      const extraCanonicalLower: string[] = [];
+      for (const linkRow of linkedRows) {
+        const ua = String(linkRow.userAddress ?? '').trim();
+        const linkedLower = String(linkRow.linkedLower ?? '').trim();
+        if (!ua || !linkedLower) continue;
+        linkedOwnerByAddrLower.set(linkedLower, ua.toLowerCase());
+        if (!dbByCanonicalLower.has(ua.toLowerCase())) {
+          extraCanonicalLower.push(ua.toLowerCase());
+        }
+      }
+
+      if (extraCanonicalLower.length > 0) {
+        const extraRows = await user`
+          SELECT "userAddress", name, bio, image, banner, socials
+          FROM users
+          WHERE LOWER("userAddress") = ANY(${extraCanonicalLower})
+        `;
+        for (const row of extraRows) {
+          const ua = String(row.userAddress ?? '').trim();
+          if (ua) dbByCanonicalLower.set(ua.toLowerCase(), row);
+        }
+      }
+
+      const byNameLower = new Map<string, Record<string, unknown>>();
+      const bySlug = new Map<string, Record<string, unknown>>();
+      const canonicalList: string[] = [];
+      for (const row of dbByCanonicalLower.values()) {
+        const ua = String(row.userAddress ?? '').trim();
+        if (ua) canonicalList.push(ua);
+        const cleanName = String(row.name ?? '').trim();
+        if (cleanName) {
+          byNameLower.set(cleanName.toLowerCase(), row);
+          const slug = toProfileSlug(cleanName);
+          if (slug) bySlug.set(slug, row);
+        }
+      }
+
+      const walletsMap = await loadCreatorWallets(canonicalList);
+
+      await Promise.all(
+        missingLower.map(async lower => {
+          const rawOriginal = uniqueByLower.get(lower) ?? lower;
+          const slug = toProfileSlug(rawOriginal);
+          const linkedOwnerLower = linkedOwnerByAddrLower.get(lower);
+          const row =
+            dbByCanonicalLower.get(lower) ??
+            (linkedOwnerLower ? dbByCanonicalLower.get(linkedOwnerLower) : undefined) ??
+            byNameLower.get(lower) ??
+            (slug ? bySlug.get(slug) : undefined);
+
+          if (row) {
+            const canonicalAddress = String(row.userAddress);
+            const wallets = walletsMap.get(canonicalAddress.toLowerCase()) ?? {
+              near: canonicalAddress,
+              evm: null,
+              svm: null,
+            };
+            const hydrated: CreatorProfile = {
+              userAddress: canonicalAddress,
+              name: String(row.name ?? '').trim(),
+              bio: String(row.bio ?? ''),
+              image: row.image ? String(row.image) : null,
+              banner: row.banner ? String(row.banner) : null,
+              socials: Array.isArray(row.socials) ? (row.socials as SocialLink[]) : [],
+              wallets,
+            };
+            result.set(lower, hydrated);
+            result.set(canonicalAddress.toLowerCase(), hydrated);
+            await Promise.all([
+              cacheSet(`profile:${lower}`, hydrated, 300, 30_000),
+              lower !== canonicalAddress.toLowerCase()
+                ? cacheSet(`profile:${canonicalAddress.toLowerCase()}`, hydrated, 300, 30_000)
+                : Promise.resolve(),
+            ]);
+          } else {
+            const fallbackAddr = looksLikeWalletAddress(rawOriginal) ? rawOriginal : '';
+            const emptyProfile: CreatorProfile = {
+              userAddress: fallbackAddr,
+              name: '',
+              bio: '',
+              image: null,
+              banner: null,
+              socials: [],
+              wallets: { near: fallbackAddr, evm: null, svm: null },
+            };
+            result.set(lower, emptyProfile);
+          }
+        }),
+      );
+    }
+
+    return result;
+  }
+
+  async function attachCreatorProfiles(items: Listing[]): Promise<Listing[]> {
+    if (items.length === 0) return items;
+    const byLower = await loadCreatorProfiles(items.map(item => item.userAddress));
+    return items.map(item => {
+      const meta = byLower.get(item.userAddress.trim().toLowerCase());
+      if (!meta) return item;
+      const trimmedName = meta.name.trim();
+      return {
+        ...item,
+        ...(trimmedName ? { creatorName: trimmedName } : {}),
+        ...(meta.image ? { creatorAvatar: meta.image } : {}),
+      };
+    });
+  }
+
   return app;
 }
