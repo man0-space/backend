@@ -762,5 +762,214 @@ export async function build(deps: ServerDeps = {}) {
     return { imageUrl: result.imageUrl, cid: result.cid };
   });
 
+  async function fetchCatalogCoordinators(): Promise<Coordinator[]> {
+    const load = async (): Promise<Coordinator[]> => {
+      const res = await fetchImpl(CATALOG_COORDINATORS_URL, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!res.ok) {
+        throw new Error(`Unable to fetch Coordinator catalog (${res.status}).`);
+      }
+      const payload = (await res.json()) as unknown;
+      const rows: Array<Record<string, unknown>> = Array.isArray(payload)
+        ? (payload as Array<Record<string, unknown>>)
+        : payload && typeof payload === 'object'
+          ? (((payload as { agents?: unknown; data?: unknown }).agents ??
+            (payload as { data?: unknown }).data ??
+            []) as Array<Record<string, unknown>>)
+          : [];
+      return rows
+        .map(row => mapCatalogRowToCoordinator(row))
+        .filter((item): item is Coordinator => Boolean(item));
+    };
+    if (fetchImpl !== globalThis.fetch) {
+      return load().catch(() => []);
+    }
+    return cached(CATALOG_COORDINATORS_CACHE_KEY, 15, 5_000, load).catch(() => []);
+  }
+
+  async function listAvailableCoordinators(): Promise<Coordinator[]> {
+    const [catalogRows, dbRows] = await Promise.all([
+      fetchCatalogCoordinators(),
+      coordinators.listAll().catch(() => [] as Coordinator[]),
+    ]);
+
+    const byWallet = new Map<string, Coordinator>();
+    for (const item of catalogRows) {
+      byWallet.set(item.walletAddress.toLowerCase(), item);
+    }
+    for (const dbItem of dbRows) {
+      const key = dbItem.walletAddress.toLowerCase();
+      const existing = byWallet.get(key);
+      if (existing) {
+        const hasCatalogTimestamp =
+          existing.created && existing.created !== '1970-01-01T00:00:00.000Z';
+        byWallet.set(key, {
+          ...existing,
+          id: dbItem.id || existing.id,
+          userAddress: dbItem.userAddress || existing.userAddress,
+          agentId: dbItem.agentId || existing.agentId,
+          image: dbItem.image || existing.image,
+          personality: dbItem.personality || existing.personality,
+          cid: dbItem.cid || existing.cid,
+          txHash: dbItem.txHash || existing.txHash,
+          contractId: dbItem.contractId || existing.contractId,
+          created: hasCatalogTimestamp ? existing.created : dbItem.created,
+        });
+      } else {
+        byWallet.set(key, dbItem);
+      }
+    }
+
+    return Array.from(byWallet.values()).sort((a, b) => {
+      const ta = Date.parse(a.created ?? '1970-01-01T00:00:00.000Z');
+      const tb = Date.parse(b.created ?? '1970-01-01T00:00:00.000Z');
+      return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
+    });
+  }
+
+  app.get('/api/coordinators', async () => {
+    return listAvailableCoordinators();
+  });
+
+  app.post('/api/coordinators/mint', async request => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const body = coordinatorMintBody.parse(request.body);
+    const targetContract = body.contractId ?? config.contracts.factory;
+    const targetNetwork: 'near:testnet' | 'near:mainnet' =
+      body.network ?? (targetContract.endsWith('.testnet') ? 'near:testnet' : 'near:mainnet');
+    const shortNet = targetNetwork === 'near:testnet' ? 'testnet' : 'mainnet';
+
+    const resolvedCreator = await resolveUserAddressOnNetwork(authUser.userAddress, shortNet).catch(
+      () => null,
+    );
+    const creatorAddress = resolvedCreator?.signerId ?? authUser.userAddress;
+    const timestamp = Date.now();
+    const walletAddress = deriveAgentWallet(
+      `${creatorAddress}:${targetContract}:${body.model.trim()}:${body.name.trim()}`,
+      timestamp,
+      shortNet,
+    );
+
+    const pinName = `man0-coordinator-${body.name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .slice(0, 48) || 'persona'}`;
+
+    const pinRes = await fetchImpl('https://api.pinata.cloud/pinning/pinJSONToIPFS', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${config.pinataJwt}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        pinataOptions: { cidVersion: 1 },
+        pinataMetadata: {
+          name: pinName,
+          keyvalues: {
+            app: 'man0',
+            role: 'coordinator',
+            type: 'agent-card',
+            network: targetNetwork,
+          },
+        },
+        pinataContent: {
+          schemaVersion: '1.0.0',
+          name: body.name.trim(),
+          description: body.personality.trim(),
+          role: 'coordinator',
+          framework: 'man0',
+          model: body.model.trim(),
+          image: body.image,
+          avatar: body.image,
+          walletAddress,
+          network: targetNetwork,
+          x402: true,
+          x402Support: true,
+          licensePrice: '0',
+          creatorFee: 0,
+          licenses: 0,
+          cloneable: false,
+          skills: [],
+          connectors: [],
+          protocols: [{ name: 'Man0', version: '1.0' }],
+          createdAt: new Date().toISOString(),
+          creator: creatorAddress,
+        },
+      }),
+    });
+
+    if (!pinRes.ok) {
+      throw Object.assign(new Error('Failed to pin Coordinator card metadata to IPFS.'), {
+        statusCode: 502,
+      });
+    }
+    const pinned = (await pinRes.json()) as { IpfsHash: string };
+    const cardUri = `ipfs://${pinned.IpfsHash}`;
+
+    const registered = await executeContract(authUser.userAddress, {
+      contractId: targetContract,
+      methodName: 'register_agent',
+      args: {
+        uri: cardUri,
+        metadata: [
+          {
+            key: 'cardUri',
+            value: Buffer.from(cardUri, 'utf8').toString('base64'),
+          },
+        ],
+      },
+      deposit: '0',
+      gas: 80_000_000_000_000,
+    });
+    const agentId = parseMintedAgentIdFromOutcome(registered);
+
+    await executeContract(authUser.userAddress, {
+      contractId: targetContract,
+      methodName: 'set_agent_wallet',
+      args: {
+        agent_id: agentId,
+        new_wallet: walletAddress,
+      },
+      deposit: '0',
+      gas: 60_000_000_000_000,
+    });
+
+    const upsertRes = await fetchImpl('https://agents.compose.market/agents/upsert', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify({
+        cid: pinned.IpfsHash,
+        walletAddress,
+      }),
+    }).catch(() => null);
+
+    if (upsertRes && !upsertRes.ok) {
+      app.log.warn(
+        { status: upsertRes.status, walletAddress },
+        'agents.compose.market upsert returned non-OK status',
+      );
+    }
+
+    const created = await coordinators.create({
+      userAddress: authUser.userAddress,
+      agentId,
+      walletAddress,
+      name: body.name.trim(),
+      image: body.image,
+      personality: body.personality.trim(),
+      model: body.model.trim(),
+      cid: pinned.IpfsHash,
+      txHash: registered.txHash,
+      contractId: targetContract,
+      network: targetNetwork,
+    });
+    await cacheDel(CATALOG_COORDINATORS_CACHE_KEY);
+    return created;
+  });
+
   return app;
 }
