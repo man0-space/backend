@@ -643,5 +643,110 @@ export async function build(deps: ServerDeps = {}) {
   await app.register(oauthRoutes, { prefix: '/api/oauth' });
   await app.register(oauthRoutes, { prefix: '/oauth' });
 
+  app.post('/api/ipfs/pin/json', async request => {
+    await token.authorize(bearer(request.headers.authorization));
+    const body = ipfsPinJsonBody.parse(request.body);
+    const res = await fetchImpl('https://api.pinata.cloud/pinning/pinJSONToIPFS', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${config.pinataJwt}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        pinataOptions: { cidVersion: 1 },
+        pinataContent: body.content,
+        pinataMetadata: {
+          name: body.name,
+          ...(body.keyvalues ? { keyvalues: body.keyvalues } : {}),
+        },
+      }),
+    });
+    if (!res.ok) {
+      throw Object.assign(new Error('Failed to pin metadata to IPFS.'), { statusCode: 502 });
+    }
+    const pinned = (await res.json()) as { IpfsHash: string; PinSize: number };
+    return {
+      cid: pinned.IpfsHash,
+      uri: `ipfs://${pinned.IpfsHash}`,
+      url: `https://${config.pinataGateway}/ipfs/${pinned.IpfsHash}`,
+      size: pinned.PinSize,
+    };
+  });
+
+  app.post('/api/ipfs/pin/file', async request => {
+    await token.authorize(bearer(request.headers.authorization));
+    const body = ipfsPinFileBody.parse(request.body);
+    const bytes = Buffer.from(body.fileBase64, 'base64');
+    const formData = new FormData();
+    formData.append('file', new Blob([bytes], { type: body.mimeType }), body.fileName);
+    formData.append(
+      'pinataMetadata',
+      JSON.stringify({
+        name: body.name ?? body.fileName,
+        ...(body.keyvalues ? { keyvalues: body.keyvalues } : {}),
+      }),
+    );
+    formData.append('pinataOptions', JSON.stringify({ cidVersion: 1 }));
+
+    const res = await fetchImpl('https://api.pinata.cloud/pinning/pinFileToIPFS', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${config.pinataJwt}`,
+      },
+      body: formData,
+    });
+    if (!res.ok) {
+      throw Object.assign(new Error('Failed to pin file to IPFS.'), { statusCode: 502 });
+    }
+    const pinned = (await res.json()) as { IpfsHash: string; PinSize: number };
+    return {
+      cid: pinned.IpfsHash,
+      uri: `ipfs://${pinned.IpfsHash}`,
+      url: `https://${config.pinataGateway}/ipfs/${pinned.IpfsHash}`,
+      size: pinned.PinSize,
+    };
+  });
+
+  app.post(
+    '/api/uploads',
+    { bodyLimit: 32 * 1024 * 1024 },
+    async request => {
+      await token.authorize(bearer(request.headers.authorization));
+      const body = uploadAttachmentBody.parse(request.body);
+      const stripped = body.fileBase64.replace(/^data:[^,]*;base64,/i, '').trim();
+      const bytes = Buffer.from(stripped, 'base64');
+      if (bytes.length === 0) {
+        throw Object.assign(new Error('Uploaded file is empty.'), { statusCode: 400 });
+      }
+      if (bytes.length > 20 * 1024 * 1024) {
+        throw Object.assign(new Error('Attachment exceeds the 20 MB limit.'), { statusCode: 413 });
+      }
+      const safeName = body.fileName.replace(/[^\w.\- ()[\]]+/g, '_').slice(0, 200) || 'attachment';
+      const mimeType = (body.mimeType || 'application/octet-stream').trim();
+      const type = classifyAttachmentType(mimeType, safeName);
+      const pinned = await pinBufferToIpfs(
+        {
+          bytes,
+          mimeType,
+          fileName: safeName,
+          name: `man0-run-${safeName}`,
+          keyvalues: { app: 'man0', kind: 'workflow-attachment', modality: type },
+        },
+        fetchImpl,
+      );
+      const text = extractInlineTextIfReadable(bytes, type);
+      return {
+        cid: pinned.cid,
+        uri: pinned.uri,
+        url: pinned.imageUrl,
+        name: safeName,
+        mimeType,
+        size: bytes.length,
+        type,
+        ...(text ? { text } : {}),
+      } satisfies WorkflowAttachment & { uri: string };
+    },
+  );
+
   return app;
 }
