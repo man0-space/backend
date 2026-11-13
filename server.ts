@@ -620,5 +620,28 @@ export async function build(deps: ServerDeps = {}) {
     });
   }
 
+  app.get('/api/config', async () => {
+    const creatorOptions: number[] = [];
+    for (let fee = MIN_CREATOR_FEE_PERCENT; fee <= MAX_CREATOR_FEE_PERCENT; fee += 1) {
+      creatorOptions.push(fee);
+    }
+    return {
+      providers: authProviders.map(spec => ({ id: spec.id, available: available(spec) })),
+      linkProviders: providers.map(spec => ({ id: spec.id, available: available(spec) })),
+      passkey: { create: true, login: true },
+      email: { enabled: emailAvailable() },
+      fees: {
+        creatorOptions,
+        platformPercent: PLATFORM_FEE_PERCENT,
+      },
+    };
+  });
+
+  await app.register(optionsRoutes);
+  await app.register(routes, { prefix: '/api/auth' });
+  await app.register(nearRoutes, { prefix: '/api/near' });
+  await app.register(oauthRoutes, { prefix: '/api/oauth' });
+  await app.register(oauthRoutes, { prefix: '/oauth' });
+
   return app;
 }
