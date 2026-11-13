@@ -330,3 +330,69 @@ export interface ServerDeps {
   viewContractImpl?: typeof viewNearContract;
   executeContractImpl?: typeof executeContractCall;
 }
+
+export async function build(deps: ServerDeps = {}) {
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const viewContract = deps.viewContractImpl ?? viewNearContract;
+  const executeContract = deps.executeContractImpl ?? executeContractCall;
+  const app = Fastify({
+    bodyLimit: 8_388_608,
+    logger: {
+      level: 'info',
+      redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers["set-cookie"]'],
+    },
+  });
+  await app.register(cors, {
+    origin: config.origins,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    exposedHeaders: ['PAYMENT-REQUIRED', 'PAYMENT-RESPONSE', 'X-Transaction-Hash', 'X-Receipt'],
+  });
+  await app.register(limit, { max: 120, timeWindow: '1 minute' });
+
+  app.setErrorHandler((error, _request, reply) => {
+    const failure = error as {
+      statusCode?: number;
+      status?: number;
+      expose?: boolean;
+      code?: string;
+      name?: string;
+      message?: string;
+      threadId?: string;
+      missing?: MissingConnectorRequirement[];
+      missingInputs?: MissingInputRequirement[];
+    };
+    const status = error instanceof ZodError ? 400 : failure.statusCode ?? failure.status ?? 503;
+    if (status >= 500) app.log.error({ err: error, code: failure.code, name: failure.name }, 'Service request failed');
+    reply.code(status).send({
+      ...(status < 500 && failure.code ? { code: failure.code } : {}),
+      ...(status < 500 && failure.threadId ? { threadId: failure.threadId } : {}),
+      ...(status < 500 && Array.isArray(failure.missing) ? { missing: failure.missing } : {}),
+      ...(status < 500 && Array.isArray(failure.missingInputs)
+        ? { missingInputs: failure.missingInputs }
+        : {}),
+      error:
+        status === 400 && error instanceof ZodError
+          ? Array.from(new Set(error.issues.map(issue => issue.message))).join(' ')
+          : status < 500 || failure.expose === true
+            ? failure.message
+            : 'A required service is unavailable. Please try again.',
+    });
+  });
+
+  app.get('/api/health', async (_req, reply) => {
+    try {
+      await Promise.all([
+        user`SELECT 1`,
+        workflow`SELECT 1`,
+        cache.ping(),
+        composer.ping(),
+      ]);
+      return { status: 'ready', users: true, workflows: true, cache: true, composer: true };
+    } catch {
+      reply.code(503);
+      return { status: 'unavailable' };
+    }
+  });
+
+  return app;
+}
