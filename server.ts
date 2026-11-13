@@ -748,5 +748,19 @@ export async function build(deps: ServerDeps = {}) {
     },
   );
 
+  app.post('/api/generate-avatar', async request => {
+    await token.authorize(bearer(request.headers.authorization));
+    const body = mediaGenerateBody.parse(request.body ?? {});
+    const result = await generateAvatar(body, deps.mediaDeps ?? { fetchImpl });
+    return { imageUrl: result.imageUrl, cid: result.cid };
+  });
+
+  app.post('/api/generate-banner', async request => {
+    await token.authorize(bearer(request.headers.authorization));
+    const body = mediaGenerateBody.parse(request.body ?? {});
+    const result = await generateBanner(body, deps.mediaDeps ?? { fetchImpl });
+    return { imageUrl: result.imageUrl, cid: result.cid };
+  });
+
   return app;
 }
