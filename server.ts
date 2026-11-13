@@ -971,5 +971,31 @@ export async function build(deps: ServerDeps = {}) {
     return created;
   });
 
+  app.post('/api/vibe', async (request, reply) => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const body = vibeRequestBody.parse(request.body);
+    const abortController = new AbortController();
+    request.raw.on('close', () => {
+      if (!request.raw.complete) abortController.abort();
+    });
+
+    reply.header('content-type', 'application/x-ndjson; charset=utf-8');
+    reply.header('cache-control', 'no-cache, no-transform');
+    reply.header('x-accel-buffering', 'no');
+
+    return reply.send(
+      createVibeStream(
+        {
+          prompt: body.prompt,
+          flow: body.flow,
+          userAddress: authUser.userAddress,
+          history: body.history,
+          signal: abortController.signal,
+        },
+        deps.vibeDeps ?? { fetchImpl, logger: app.log },
+      ),
+    );
+  });
+
   return app;
 }
