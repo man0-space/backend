@@ -280,3 +280,53 @@ function parseMintedAgentIdFromOutcome(outcome: { result: unknown; logs: string[
     { statusCode: 502 },
   );
 }
+
+const vibeRequestBody = z.object({
+  prompt: z.string().trim().min(1).max(8000),
+  flow: graph,
+  history: z
+    .array(
+      z.object({
+        role: z.enum(['user', 'assistant']),
+        content: z.string().max(16000),
+      }),
+    )
+    .max(20)
+    .optional(),
+});
+
+export interface MissingConnectorRequirement {
+  entryId: string;
+  slug: string;
+  name: string;
+  type: 'account' | 'gated';
+  userAddress?: string;
+  missingVars?: Array<{ varName: string; description?: string; obtainUrl?: string }>;
+  reason: string;
+  agentWallet?: string;
+  runId?: string;
+  threadId?: string;
+  requestId?: string;
+}
+
+export interface MissingInputRequirement {
+  stepId: string;
+  stepLabel: string;
+  modelId?: string;
+  modelName?: string;
+  acceptedInputs: string[];
+  questions?: string[];
+  reason: string;
+  agentWallet?: string;
+  runId?: string;
+  threadId?: string;
+  proposalId?: string;
+}
+
+export interface ServerDeps {
+  fetchImpl?: typeof fetch;
+  mediaDeps?: MediaDeps;
+  vibeDeps?: VibeDeps;
+  viewContractImpl?: typeof viewNearContract;
+  executeContractImpl?: typeof executeContractCall;
+}
