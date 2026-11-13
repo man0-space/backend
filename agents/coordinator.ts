@@ -2304,4 +2304,134 @@ export async function runWorkflow(params: {
     throw Object.assign(new Error(upstreamError), { statusCode: 502, threadId });
   }
 
+  // Attribute Coordinator synthesis to a pending specialist agent step if delegated via watch
+  const rawSummary = coordinatorText.trim();
+  for (const node of orderedNodes) {
+    if (!executedSteps.has(node.id) && node.data.kind === 'agent' && rawSummary) {
+      stepOutputs[node.id] = rawSummary;
+      completedSteps.add(node.id);
+      executedSteps.set(node.id, {
+        id: node.id,
+        label: node.data.label,
+        kind: node.data.kind,
+        entryId: node.data.entry?.id ?? null,
+        billWei: '0',
+        output: rawSummary,
+        stepInput: { stepId: node.id, label: node.data.label },
+        invokedTool: 'proposal',
+        inferenceRunIds: coordinatorRunIds.length > 0 ? [...coordinatorRunIds] : [runId],
+        startedAt: stepStartTimes.get(node.id) ?? Date.now(),
+        endedAt: Date.now(),
+      });
+      emitEvent({
+        type: 'step:done',
+        stepId: node.id,
+        label: node.data.label,
+        kind: node.data.kind,
+        output: rawSummary,
+      });
+    }
+  }
+
+  if (dry) {
+    for (const node of orderedNodes) {
+      if (node.data.kind === 'connector' && !completedSteps.has(node.id)) {
+        const dryNote = `[Dry run] Skipped external connector mutation for ${node.data.label}.`;
+        stepOutputs[node.id] = dryNote;
+        completedSteps.add(node.id);
+        executedSteps.set(node.id, {
+          id: node.id,
+          label: node.data.label,
+          kind: node.data.kind,
+          entryId: node.data.entry?.id ?? null,
+          billWei: '0',
+          output: dryNote,
+          stepInput: { stepId: node.id, dryRun: true },
+          invokedTool: 'dry_run',
+          inferenceRunIds: coordinatorRunIds.length > 0 ? [...coordinatorRunIds] : [runId],
+          startedAt: stepStartTimes.get(node.id) ?? Date.now(),
+          endedAt: Date.now(),
+        });
+      }
+    }
+  } else {
+    const uncompletedNode = orderedNodes.find(n => !completedSteps.has(n.id));
+    if (uncompletedNode) {
+      const reason =
+        stepErrors.get(uncompletedNode.id) ||
+        `Step "${uncompletedNode.data.label}" (${uncompletedNode.data.kind}) did not complete execution.`;
+      throw Object.assign(new Error(reason), { statusCode: 502, threadId });
+    }
+  }
+
+  const finalOutput = assembleFinalDeliverable({
+    orderedNodes,
+    edges: flow.edges,
+    executedSteps,
+    coordinatorText,
+    globalAssets,
+  });
+
+  const usedBillIndexes = new Set<number>();
+  const latestProvider = coordinatorProviders[coordinatorProviders.length - 1];
+  const stepBillMap = new Map<string, bigint>();
+  const baseSteps = orderedNodes
+    .map(node => executedSteps.get(node.id))
+    .filter((step): step is ExecutedWorkflowStep => Boolean(step));
+
+  for (const step of baseSteps) {
+    stepBillMap.set(step.id, parsePositiveBigInt(step.billWei));
+  }
+
+  for (let i = 0; i < collectedBills.length; i++) {
+    const b = collectedBills[i]!;
+    if (b.category === 'coordinator') continue;
+    if (b.stepId && stepBillMap.has(b.stepId)) {
+      stepBillMap.set(b.stepId, (stepBillMap.get(b.stepId) ?? 0n) + parsePositiveBigInt(b.amountWei));
+      usedBillIndexes.add(i);
+    }
+  }
+
+  for (let i = 0; i < collectedBills.length; i++) {
+    if (usedBillIndexes.has(i)) continue;
+    const b = collectedBills[i]!;
+    if (b.category === 'coordinator' || !b.subject) continue;
+    const matchedStep = baseSteps.find(step => {
+      if (step.kind !== b.category) return false;
+      const node = orderedNodes.find(n => n.id === step.id);
+      return matchesStepSubject(node?.data.entry, step.kind, b.subject!);
+    });
+    if (matchedStep) {
+      stepBillMap.set(
+        matchedStep.id,
+        (stepBillMap.get(matchedStep.id) ?? 0n) + parsePositiveBigInt(b.amountWei),
+      );
+      usedBillIndexes.add(i);
+    }
+  }
+
+  const finalSteps = baseSteps.map(step => ({
+    ...step,
+    billWei: (stepBillMap.get(step.id) ?? 0n).toString(),
+    ...(step.provider || !latestProvider ? {} : { provider: latestProvider }),
+    inferenceRunIds:
+      step.inferenceRunIds.length > 0
+        ? step.inferenceRunIds
+        : coordinatorRunIds.length > 0
+          ? [...coordinatorRunIds]
+          : [runId],
+  }));
+
+  onStepProgress?.({ runningStepId: null, stepOutputs: { ...stepOutputs } });
+
+  return {
+    output: finalOutput,
+    steps: finalSteps,
+    bills: collectedBills,
+    coordinatorBillWei: totalComposeBillWei,
+    coordinatorProviders,
+    coordinatorRunIds: coordinatorRunIds.length > 0 ? coordinatorRunIds : [runId],
+    totalComposeBillWei,
+    stepOutputs,
+  };
 }
