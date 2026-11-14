@@ -46,15 +46,21 @@ import {
 } from './agents/coordinator.js';
 import { ProofAccumulator, pinProofBundleToIPFS } from './proof.js';
 import {
+  BANNER_CHARGE_SPEC,
   MAX_CREATOR_FEE_PERCENT,
   MIN_CREATOR_FEE_PERCENT,
   PLATFORM_FEE_PERCENT,
+  VIBE_CHARGE_SPEC,
+  abortPreparedFixedCharge,
   abortWorkflowPayment,
   extractPaymentSignature,
   extractSessionToken,
   getPaymentContext,
   parseComposeToken,
+  prepareFixedCharge,
   requireSessionPayment,
+  runWithChildSessionCharge,
+  settlePreparedFixedCharge,
   settleWorkflowPayment,
   type Charge,
 } from './payment.js';
@@ -755,11 +761,25 @@ export async function build(deps: ServerDeps = {}) {
     return { imageUrl: result.imageUrl, cid: result.cid };
   });
 
-  app.post('/api/generate-banner', async request => {
+  app.post('/api/generate-banner', async (request, reply) => {
     await token.authorize(bearer(request.headers.authorization));
     const body = mediaGenerateBody.parse(request.body ?? {});
-    const result = await generateBanner(body, deps.mediaDeps ?? { fetchImpl });
-    return { imageUrl: result.imageUrl, cid: result.cid };
+    if (!body.title?.trim() || !body.description?.trim()) {
+      throw Object.assign(
+        new Error('You should add Title + Description before generating a banner'),
+        { statusCode: 400 },
+      );
+    }
+    const charge = await prepareFixedCharge(request, reply, BANNER_CHARGE_SPEC, fetchImpl);
+    if (!charge) return reply;
+    try {
+      const result = await generateBanner(body, deps.mediaDeps ?? { fetchImpl });
+      await settlePreparedFixedCharge(charge, reply, fetchImpl);
+      return { imageUrl: result.imageUrl, cid: result.cid };
+    } catch (err) {
+      await abortPreparedFixedCharge(charge, 'banner_generation_failed', fetchImpl);
+      throw err;
+    }
   });
 
   async function fetchCatalogCoordinators(): Promise<Coordinator[]> {
