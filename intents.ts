@@ -23,10 +23,14 @@ import { config, rpcFor, treasuryFor, usdcFor } from './config.js';
 import {
   callViewFunction,
   derive,
+  deriveIntentsEd25519,
   derivePrivate,
   discoverNearIntentsContracts,
   ensureDepositReady,
+  ensureIntentsPublicKeyRegistered,
   ensureSpendingRecord,
+  executeContractCall,
+  invalidateNearBalanceCache,
   listLinkedWallets,
   oneClickBaseUrl,
   readFtBalanceWei,
@@ -158,6 +162,8 @@ interface BridgeHealthChain {
   chainId?: number;
   cluster?: string;
   network?: string;
+  nativeEthPayable?: boolean;
+  swapCapEth?: string;
   payoutCapSol?: string;
   swapCapSui?: string;
   swapCapBtc?: string;
@@ -486,6 +492,11 @@ export async function discoverDynamicChains(
         regItem?.name?.replace(/\s+Mainnet$/i, '') ||
         humanizeChainKey(key);
       const label = rawLabel === 'BNB' ? 'BNB Chain' : rawLabel === 'Layer X' ? 'X Layer' : rawLabel;
+      const evmCapNum = bridge?.swapCapEth
+        ? Number(bridge.swapCapEth)
+        : network === 'testnet' && bridge?.nativeEthPayable
+          ? 0.006
+          : undefined;
       const meta: DynamicChainMeta = {
         blockchain: key,
         caip2: `eip155:${evmChainId}`,
@@ -503,6 +514,9 @@ export async function discoverDynamicChains(
           regItem?.chain,
           regItem?.shortName,
         ),
+        ...(evmCapNum && Number.isFinite(evmCapNum) && evmCapNum > 0
+          ? { maxSwapCapDecimal: evmCapNum }
+          : {}),
       };
       out.set(key, meta);
       latestChainCatalogByKey.set(key, meta);
@@ -514,7 +528,13 @@ export async function discoverDynamicChains(
       (sdkChainName ? humanizeChainKey(sdkChainName) : undefined) ||
       humanizeChainKey(key);
     const rawCap = bridge?.swapCapSui ?? bridge?.swapCapBtc;
-    const capNum = rawCap ? Number(rawCap) : undefined;
+    const capNum = rawCap
+      ? Number(rawCap)
+      : network === 'testnet' && (key === 'stellar' || key === 'xrp')
+        ? 100
+        : network === 'testnet' && key === 'hypercore'
+          ? 5
+          : undefined;
     const meta: DynamicChainMeta = {
       blockchain: key,
       caip2,
@@ -1246,21 +1266,25 @@ function effectiveTokenUsdPrice(token: OneClickToken): number {
   return token.price > 0 ? token.price : 1;
 }
 
-function maxSpendableAtomic(
-  holding: WalletHolding,
-  chainMeta?: DynamicChainMeta,
-): bigint {
+function rawWalletSpendableAtomic(holding: WalletHolding): bigint {
   const bal = BigInt(holding.balanceAtomic);
   if (bal <= 0n) return 0n;
-  let usable = bal;
-
   if (holding.source === 'external' && !holding.token.contractAddress) {
     const price = effectiveTokenUsdPrice(holding.token);
     const fixedReserve = decimalToAtomic(0.15 / price, holding.token.decimals);
     const pctReserve = bal / 20n;
     const gasReserve = fixedReserve > pctReserve ? fixedReserve : pctReserve;
-    usable = bal > gasReserve ? bal - gasReserve : 0n;
+    return bal > gasReserve ? bal - gasReserve : 0n;
   }
+  return bal;
+}
+
+function maxSpendableAtomic(
+  holding: WalletHolding,
+  chainMeta?: DynamicChainMeta,
+): bigint {
+  let usable = rawWalletSpendableAtomic(holding);
+  if (usable <= 0n) return 0n;
 
   if (chainMeta?.maxSwapCapDecimal && !holding.token.contractAddress) {
     const capAtomic = decimalToAtomic(chainMeta.maxSwapCapDecimal, holding.token.decimals);
@@ -1307,27 +1331,6 @@ function formatLegDisplayAmount(amountAtomic: bigint, token: OneClickToken): str
   return token.symbol.toUpperCase() === 'USDC'
     ? `$${humanIn.toFixed(2)}`
     : `${Number(humanIn.toFixed(Math.min(6, token.decimals)))} ${token.symbol}`;
-}
-
-function extractBridgeCapAtomicFromError(err: unknown, decimals: number): bigint | null {
-  if (!(err instanceof ApiError)) return null;
-  const body = err.body as { capWei?: string; capAtomic?: string; message?: string } | undefined;
-  const direct = body?.capWei ?? body?.capAtomic;
-  if (typeof direct === 'string' && /^\d+$/.test(direct) && BigInt(direct) > 0n) {
-    return BigInt(direct);
-  }
-  const msg = typeof body?.message === 'string' ? body.message : err.message;
-  const parenUnits = msg.match(/\((\d{4,})\s*[a-zA-Z]*\)/);
-  if (parenUnits?.[1]) {
-    const v = BigInt(parenUnits[1]);
-    if (v > 0n) return v;
-  }
-  const cappedDec = msg.match(/capped\s+at\s+(\d+(?:\.\d+)?)/i);
-  if (cappedDec?.[1]) {
-    const v = decimalToAtomic(Number(cappedDec[1]), decimals);
-    if (v > 0n) return v;
-  }
-  return null;
 }
 
 async function quoteSingleLegWithRetry(input: {
@@ -2509,4 +2512,25 @@ export async function broadcastSolanaOriginTransfer(input: {
     txHash,
     explorerUrl: buildSolanaExplorerTxUrl(explorerBase, txHash),
   };
+}
+
+function extractBridgeCapAtomicFromError(err: unknown, decimals: number): bigint | null {
+  if (!(err instanceof ApiError)) return null;
+  const body = err.body as { capWei?: string; capAtomic?: string; message?: string } | undefined;
+  const direct = body?.capWei ?? body?.capAtomic;
+  if (typeof direct === 'string' && /^\d+$/.test(direct) && BigInt(direct) > 0n) {
+    return BigInt(direct);
+  }
+  const msg = typeof body?.message === 'string' ? body.message : err.message;
+  const parenUnits = msg.match(/\((\d{4,})\s*[a-zA-Z]*\)/);
+  if (parenUnits?.[1]) {
+    const v = BigInt(parenUnits[1]);
+    if (v > 0n) return v;
+  }
+  const cappedDec = msg.match(/capped\s+at\s+(\d+(?:\.\d+)?)/i);
+  if (cappedDec?.[1]) {
+    const v = decimalToAtomic(Number(cappedDec[1]), decimals);
+    if (v > 0n) return v;
+  }
+  return null;
 }
