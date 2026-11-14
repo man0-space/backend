@@ -290,6 +290,7 @@ function parseMintedAgentIdFromOutcome(outcome: { result: unknown; logs: string[
 const vibeRequestBody = z.object({
   prompt: z.string().trim().min(1).max(8000),
   flow: graph,
+  mode: z.enum(['create', 'edit']).optional(),
   history: z
     .array(
       z.object({
@@ -994,27 +995,116 @@ export async function build(deps: ServerDeps = {}) {
   app.post('/api/vibe', async (request, reply) => {
     const authUser = await token.authorize(bearer(request.headers.authorization));
     const body = vibeRequestBody.parse(request.body);
+    const vibeCharge = await prepareFixedCharge(request, reply, VIBE_CHARGE_SPEC, fetchImpl);
+    if (!vibeCharge) return reply;
+
     const abortController = new AbortController();
     request.raw.on('close', () => {
-      if (!request.raw.complete) abortController.abort();
+      if (!request.raw.complete) {
+        abortController.abort();
+        void abortPreparedFixedCharge(vibeCharge, 'client_disconnected', fetchImpl);
+      }
     });
 
     reply.header('content-type', 'application/x-ndjson; charset=utf-8');
     reply.header('cache-control', 'no-cache, no-transform');
     reply.header('x-accel-buffering', 'no');
 
-    return reply.send(
-      createVibeStream(
-        {
-          prompt: body.prompt,
-          flow: body.flow,
-          userAddress: authUser.userAddress,
-          history: body.history,
-          signal: abortController.signal,
-        },
-        deps.vibeDeps ?? { fetchImpl, logger: app.log },
-      ),
+    const baseVibeDeps: VibeDeps = deps.vibeDeps ?? { fetchImpl, logger: app.log };
+    const rawBannerGen =
+      baseVibeDeps.bannerGenerator ?? (args => generateBanner(args, deps.mediaDeps ?? { fetchImpl }));
+
+    const upstream = createVibeStream(
+      {
+        prompt: body.prompt,
+        flow: body.flow,
+        mode: body.mode,
+        userAddress: authUser.userAddress,
+        history: body.history,
+        signal: abortController.signal,
+      },
+      {
+        ...baseVibeDeps,
+        bannerGenerator: bannerArgs =>
+          runWithChildSessionCharge(
+            vibeCharge,
+            BANNER_CHARGE_SPEC,
+            () => rawBannerGen(bannerArgs),
+            fetchImpl,
+          ),
+      },
     );
+
+    const out = new PassThrough();
+    void (async () => {
+      let lineBuf = '';
+      let hadError = false;
+      const handleLine = async (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let evt: { type?: string } | null = null;
+        try {
+          evt = JSON.parse(trimmed) as { type?: string };
+        } catch {
+          // Forward line even if JSON inspection fails
+        }
+        if (evt) {
+          try {
+            if (evt.type === 'workflow_ready' || evt.type === 'done') {
+              await settlePreparedFixedCharge(vibeCharge, undefined, fetchImpl);
+            } else if (evt.type === 'error') {
+              hadError = true;
+              await abortPreparedFixedCharge(vibeCharge, 'vibe_error', fetchImpl);
+            }
+          } catch (settleErr) {
+            app.log.warn(
+              { err: settleErr instanceof Error ? settleErr.message : String(settleErr) },
+              'vibe payment settlement warning',
+            );
+          }
+        }
+        if (!out.destroyed) {
+          out.write(`${trimmed}\n`);
+        }
+      };
+
+      try {
+        for await (const chunk of upstream) {
+          lineBuf += String(chunk);
+          const lines = lineBuf.split('\n');
+          lineBuf = lines.pop() ?? '';
+          for (const line of lines) {
+            await handleLine(line);
+          }
+        }
+        if (lineBuf.trim()) {
+          await handleLine(lineBuf);
+        }
+        if (!vibeCharge.settled && !vibeCharge.aborted) {
+          await abortPreparedFixedCharge(
+            vibeCharge,
+            hadError ? 'vibe_error' : 'vibe_incomplete',
+            fetchImpl,
+          );
+        }
+      } catch (streamErr) {
+        await abortPreparedFixedCharge(vibeCharge, 'vibe_stream_error', fetchImpl);
+        if (!out.destroyed) {
+          out.write(
+            `${JSON.stringify({
+              type: 'error',
+              error: streamErr instanceof Error ? streamErr.message : 'Vibe stream failed.',
+            })}\n`,
+          );
+        }
+      } finally {
+        if (!out.destroyed) {
+          out.end();
+        }
+      }
+    })();
+
+    return reply.send(out);
   });
 
   app.get('/api/policy', async () => ({ hash: consent.hash, ...consent.policy }));
