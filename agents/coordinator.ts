@@ -970,14 +970,23 @@ export async function runWorkflow(params: {
     }>
     | undefined;
 
+  const workflowConnectorBindings = new Set<string>();
+  const workflowConnectorSlugs = new Set<string>();
   const connectedBindings = new Set<string>();
   const connectedSlugs = new Set<string>();
 
   for (const node of orderedNodes) {
     if (node.data.kind !== 'connector') continue;
     const binding = canonicalConnectorBindingId(node.data.entry);
-    if (binding?.startsWith('onchain:')) {
-      connectedBindings.add(binding.toLowerCase());
+    if (!binding) continue;
+    const bindingLower = binding.toLowerCase();
+    workflowConnectorBindings.add(bindingLower);
+    const slugTail = bindingLower.split(':').pop()?.trim() ?? '';
+    if (slugTail) {
+      workflowConnectorSlugs.add(slugTail);
+    }
+    if (binding.startsWith('onchain:')) {
+      connectedBindings.add(bindingLower);
       connectedSlugs.add(binding.slice('onchain:'.length).toLowerCase());
     }
   }
@@ -988,21 +997,6 @@ export async function runWorkflow(params: {
       : null;
 
   if (subject && preflightStatus) {
-    for (const acc of preflightStatus.accounts ?? []) {
-      if (acc.connected) {
-        const slugLower = acc.slug.toLowerCase();
-        connectedSlugs.add(slugLower);
-        connectedBindings.add(`account:${slugLower}`);
-      }
-    }
-    for (const conn of preflightStatus.connectors ?? []) {
-      if (conn.connected && (conn.missingVars?.length ?? 0) === 0) {
-        const slugLower = conn.slug.toLowerCase();
-        connectedSlugs.add(slugLower);
-        connectedBindings.add(`mcp:${slugLower}`);
-      }
-    }
-
     for (const node of orderedNodes) {
       if (node.data.kind !== 'connector') continue;
       const binding = canonicalConnectorBindingId(node.data.entry);
@@ -1063,7 +1057,11 @@ export async function runWorkflow(params: {
       }
     }
 
-    if (Array.isArray(preflightStatus.accounts) && preflightStatus.accounts.length > 0) {
+    if (
+      workflowConnectorSlugs.size > 0 &&
+      Array.isArray(preflightStatus.accounts) &&
+      preflightStatus.accounts.length > 0
+    ) {
       const dedupedBySlug = new Map<
         string,
         {
@@ -1076,6 +1074,7 @@ export async function runWorkflow(params: {
       >();
       for (const acc of preflightStatus.accounts) {
         const key = acc.slug.toLowerCase();
+        if (!workflowConnectorSlugs.has(key)) continue;
         const existing = dedupedBySlug.get(key);
         if (existing?.connected && !acc.connected) continue;
         dedupedBySlug.set(key, {
@@ -1086,7 +1085,9 @@ export async function runWorkflow(params: {
           ...(acc.status ? { status: acc.status } : {}),
         });
       }
-      backpackAccounts = [...dedupedBySlug.values()];
+      if (dedupedBySlug.size > 0) {
+        backpackAccounts = [...dedupedBySlug.values()];
+      }
     }
   }
 
@@ -1263,6 +1264,7 @@ export async function runWorkflow(params: {
   const missingConnectors: MissingConnectorRequirement[] = [];
   const missingInputs: MissingInputRequirement[] = [];
   const activeToolSpans = new Set<string>();
+  const spanToConnectorAction = new Map<string, string>();
   const settledRequestIds = new Set<string>();
   const pendingWatchQueue: Array<{ runId: string; requestId: string }> = [];
   const streamAbort = new AbortController();
@@ -1512,17 +1514,26 @@ export async function runWorkflow(params: {
         (typeof payload['bindingId'] === 'string' && payload['bindingId']) ||
         (typeof event.target?.target === 'string' && event.target.target) ||
         '';
-      const bindingTail = rawBinding.split(':').pop()?.toLowerCase() ?? '';
+      const rawSlugHint =
+        (typeof payload['slug'] === 'string' && payload['slug'].trim()) ||
+        (typeof event.target?.name === 'string' && event.target.name.trim()) ||
+        '';
+      const bindingTail =
+        (rawBinding ? rawBinding.split(':').pop()?.toLowerCase() : undefined) ||
+        rawSlugHint.toLowerCase();
       const connectorNode = orderedNodes.find(n => {
         if (n.data.kind !== 'connector') return false;
-        if (!rawBinding) return true;
+        if (!rawBinding && !bindingTail) return true;
         const nodeBinding = canonicalConnectorBindingId(n.data.entry)?.toLowerCase() ?? '';
         const nodeEntryId = n.data.entry?.id?.toLowerCase() ?? '';
         return (
-          nodeBinding === rawBinding.toLowerCase() ||
-          nodeEntryId === rawBinding.toLowerCase() ||
+          (rawBinding.length > 0 &&
+            (nodeBinding === rawBinding.toLowerCase() ||
+              nodeEntryId === rawBinding.toLowerCase())) ||
           (bindingTail.length > 0 &&
-            (nodeEntryId === bindingTail || nodeEntryId.endsWith(`:${bindingTail}`)))
+            (nodeEntryId === bindingTail ||
+              nodeEntryId.endsWith(`:${bindingTail}`) ||
+              nodeBinding.endsWith(`:${bindingTail}`)))
         );
       });
       const nodeBindingLower = connectorNode
@@ -1559,6 +1570,31 @@ export async function runWorkflow(params: {
           undefined;
         const targetRunId =
           (typeof payload['runId'] === 'string' && payload['runId']) || event.runId || runId;
+
+        const inWorkflowScope =
+          Boolean(connectorNode) ||
+          (nodeBindingLower.length > 0 && workflowConnectorBindings.has(nodeBindingLower)) ||
+          (rawBinding.length > 0 && workflowConnectorBindings.has(rawBinding.toLowerCase())) ||
+          workflowConnectorSlugs.has(slug.toLowerCase());
+
+        if (!inWorkflowScope) {
+          if (requestId && !settledRequestIds.has(requestId)) {
+            settledRequestIds.add(requestId);
+            const discarded = await runSdk.agent
+              .decideConnector({
+                agentWallet: coordinator.walletAddress,
+                runId: targetRunId,
+                requestId,
+                decision: 'discarded',
+                ...(subject ? { userAddress: subject } : {}),
+              })
+              .catch(() => null);
+            if (discarded) {
+              pendingWatchQueue.push({ runId: targetRunId, requestId });
+            }
+          }
+          return;
+        }
 
         const alreadyAuthorized =
           (nodeBindingLower.length > 0 && connectedBindings.has(nodeBindingLower)) ||
@@ -1900,6 +1936,13 @@ export async function runWorkflow(params: {
       if (CONTROL_TOOLS.has(toolName)) return;
 
       if (event.status === 'running') {
+        const inputRec = asRecord(payload['input']) ?? asRecord(payload['args']);
+        const rawActionName =
+          (typeof inputRec?.['action'] === 'string' && inputRec['action'].trim()) ||
+          (toolName !== 'connectors_call' && toolName !== 'models_call' ? toolName : '');
+        if (rawActionName) {
+          spanToConnectorAction.set(event.spanId, rawActionName);
+        }
         const node = matchNodeForTool(toolName, event);
         if (node) {
           spanToStepId.set(event.spanId, node.id);
@@ -2010,8 +2053,28 @@ export async function runWorkflow(params: {
         }
 
         if (node.data.kind === 'connector') {
+          const doneInputRec = asRecord(payload['input']) ?? asRecord(payload['args']);
+          const invokedAction =
+            spanToConnectorAction.get(event.spanId) ||
+            (typeof doneInputRec?.['action'] === 'string' && doneInputRec['action'].trim()) ||
+            (toolName !== 'connectors_call' ? toolName : '');
+          const isMutatingAction =
+            /(?:^|_)(create|insert|append|update|publish|post|send|write|add|upsert|upload|patch|edit|reply|comment|schedule|fork|merge)(?:_|$)/i.test(
+              invokedAction,
+            );
+          const isReadOnlyAction =
+            !isMutatingAction &&
+            Boolean(invokedAction) &&
+            /(?:^|_)(search|list|fetch|get|retrieve|read|query|find|lookup|inspect|browse|check)(?:_|$)/i.test(
+              invokedAction,
+            );
+
+          if (isReadOnlyAction && stepText.startsWith('Published: ')) {
+            stepText = `Found: ${stepText.slice('Published: '.length)}`;
+          }
+
           const publishedMatch = stepText.match(/https?:\/\/[^\s)]+/);
-          if (publishedMatch && stepText.startsWith('Published:')) {
+          if (!isReadOnlyAction && publishedMatch && stepText.startsWith('Published:')) {
             const urls = stepPublishedUrls.get(node.id) ?? [];
             if (!urls.includes(publishedMatch[0])) urls.push(publishedMatch[0]);
             stepPublishedUrls.set(node.id, urls);
@@ -2146,14 +2209,17 @@ export async function runWorkflow(params: {
       onStepProgress?.({ runningStepId: firstPending.id, stepOutputs: { ...stepOutputs } });
     }
 
+    const workflowSessionGrants = [...connectedBindings];
     const gen = runSdk.agent.stream(
       {
         agentWallet: coordinator.walletAddress,
         message,
         threadId,
+        scope: 'local',
         mode: hasPendingAgentNodes ? 'swarm' : 'solo',
         ...(isResumingThread ? {} : { runId }),
         ...(subject ? { userAddress: subject } : {}),
+        ...(workflowSessionGrants.length > 0 ? { sessionGrants: workflowSessionGrants } : {}),
         ...(backpackAccounts ? { backpackAccounts } : {}),
         ...(selectedResources ? { selectedResources } : {}),
         ...(streamAttachments.length > 0 ? { attachments: streamAttachments } : {}),
@@ -2202,10 +2268,36 @@ export async function runWorkflow(params: {
     offReceipt();
   }
 
-  const receiptListRes = subject
-    ? await runSdk.receipts?.list?.({ limit: 100 }).catch(() => null)
-    : null;
-  const turnApiReceipts = (receiptListRes?.receipts ?? []).filter(r => {
+  const fetchedReceipts: Receipt[] = [];
+  if (subject && runSdk.receipts?.list) {
+    const queries: Array<Promise<{ receipts?: Receipt[] } | null>> = [
+      runSdk.receipts.list({ limit: 100, ...(isResumingThread ? {} : { rootRunId: runId }) }).catch(() => null),
+    ];
+    for (const tid of turnRunIds) {
+      if (tid && (isResumingThread || tid !== runId)) {
+        queries.push(runSdk.receipts.list({ limit: 100, rootRunId: tid }).catch(() => null));
+        queries.push(runSdk.receipts.list({ limit: 100, executionRunId: tid }).catch(() => null));
+      }
+    }
+    if (isResumingThread && turnRunIds.size === 0) {
+      queries.push(runSdk.receipts.list({ limit: 100, rootRunId: runId }).catch(() => null));
+    }
+    const queryResults = await Promise.all(queries);
+    const seenFetched = new Set<string>();
+    for (const res of queryResults) {
+      for (const r of res?.receipts ?? []) {
+        const key = receiptIdentityKey(r);
+        if (!seenFetched.has(key)) {
+          seenFetched.add(key);
+          fetchedReceipts.push(r);
+        }
+      }
+    }
+  }
+  const turnApiReceipts = fetchedReceipts.filter(r => {
+    if (r.service === 'workflow' || r.service === 'vibe' || r.service === 'banner') {
+      return false;
+    }
     const execId = r.executionRunId?.trim() ?? '';
     if (execId) {
       for (const tid of turnRunIds) {
@@ -2216,7 +2308,12 @@ export async function runWorkflow(params: {
       return true;
     }
     if (isResumingThread && turnRunIds.size === 0 && r.rootRunId?.trim() === runId) {
-      return (r.settledAt ?? 0) >= turnStartedAtMs - 5_000;
+      return (
+        r.settlementStatus === 'queued' ||
+        r.settlementStatus === 'submitted' ||
+        r.settlementStatus === 'claimed' ||
+        (r.settledAt ?? 0) >= turnStartedAtMs - 5_000
+      );
     }
     return false;
   });
@@ -2226,13 +2323,14 @@ export async function runWorkflow(params: {
     for (const r of [...turnApiReceipts].sort((a, b) => (a.settledAt ?? 0) - (b.settledAt ?? 0))) {
       mergedByKey.set(receiptIdentityKey(r), r);
     }
+    const isAgentService = (svc?: string) => svc === 'agent' || svc === 'runtime';
     for (const r of sseReceipts) {
       const key = receiptIdentityKey(r);
       const alreadyHasRuntime =
-        r.service === 'runtime' &&
+        isAgentService(r.service) &&
         Array.from(mergedByKey.values()).some(
           existing =>
-            existing.service === 'runtime' &&
+            isAgentService(existing.service) &&
             existing.executionRunId === r.executionRunId &&
             existing.finalAmountWei === r.finalAmountWei,
         );
