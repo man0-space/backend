@@ -1082,6 +1082,7 @@ export async function assertAllowedNearContract(
     config.contracts.reputation,
     config.contracts.validation,
     'intents.near',
+    'verifier.tidepool-sandbox.testnet',
     mainnetUsdc,
     testnetUsdc,
     ...(activeIntents ? [activeIntents.verifier, ...activeIntents.nearTokenContracts] : []),
@@ -1288,6 +1289,23 @@ export async function ensureSpendingRecord(userAddress: string): Promise<Spendin
     rawActiveSpendingInit: Buffer.from(activeSpendingPrepared.state, 'base64'),
     seedId,
   };
+}
+
+export async function readIntentsTokenBalanceWei(
+  rpcUrl: string,
+  verifier: string,
+  accountId: string,
+  tokenId: string,
+): Promise<string> {
+  try {
+    const raw = await callViewFunction<string>(rpcUrl, verifier, 'mt_balance_of', {
+      account_id: accountId,
+      token_id: tokenId,
+    });
+    return typeof raw === 'string' && /^\d+$/.test(raw) ? raw : '0';
+  } catch {
+    return '0';
+  }
 }
 
 interface ActiveAccountBalances {
