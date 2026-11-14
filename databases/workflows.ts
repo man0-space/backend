@@ -273,11 +273,88 @@ export async function current(userAddress: string) {
   return parsed;
 }
 
+export async function listDrafts(userAddress: string): Promise<Flow[]> {
+  const prefix = `draft:${digest(userAddress)}:`;
+  const indexKey = draftIndexKey(userAddress);
+  const activeKey = activeDraftKey(userAddress);
+  const indexedIds = await composer.zrevrange(indexKey, 0, MAX_WIP_DRAFTS - 1);
+  const candidateIds = [...indexedIds];
+
+  const activePointer = await composer.get(activeKey);
+  if (activePointer && activePointer.startsWith(prefix) && activePointer !== activeKey && activePointer !== indexKey) {
+    const legacyId = activePointer.slice(prefix.length);
+    if (legacyId && !candidateIds.includes(legacyId)) {
+      candidateIds.unshift(legacyId);
+    }
+  }
+
+  if (candidateIds.length === 0) return [];
+
+  const keys = candidateIds.map(id => `${prefix}${id}`);
+  const rawValues = await composer.mget(...keys);
+  const parsedFlows: Flow[] = [];
+  const staleIds: string[] = [];
+
+  candidateIds.forEach((id, idx) => {
+    const raw = rawValues[idx];
+    if (!raw) {
+      staleIds.push(id);
+      return;
+    }
+    try {
+      parsedFlows.push(graph.parse(JSON.parse(raw)));
+    } catch {
+      staleIds.push(id);
+    }
+  });
+
+  if (parsedFlows.length > 0) {
+    const savedRows = await workflow.query(
+      'SELECT id, published FROM workflows WHERE "userAddress"=$1 AND id = ANY($2::text[]) AND deleted IS NULL',
+      [userAddress, parsedFlows.map(f => f.id)],
+    );
+    const savedSet = new Set(savedRows.map(r => String(r.id)));
+    for (const row of savedRows) {
+      if (row.published) {
+        staleIds.push(String(row.id));
+      }
+    }
+    const filtered = parsedFlows.filter(
+      f =>
+        !savedSet.has(f.id) &&
+        (f.nodes.length > 0 || Boolean(f.name.trim()) || Boolean(f.brief?.trim())),
+    );
+    if (staleIds.length > 0) {
+      await Promise.all(staleIds.map(id => deleteFlowDraftFromComposer(userAddress, id)));
+    }
+    return filtered;
+  }
+
+  if (staleIds.length > 0) {
+    await Promise.all(staleIds.map(id => deleteFlowDraftFromComposer(userAddress, id)));
+  }
+  return [];
+}
+
+export async function deleteDraft(userAddress: string, flowId: string): Promise<void> {
+  await deleteFlowDraftFromComposer(userAddress, flowId);
+}
+
 export async function clearDraft(userAddress: string) {
   const prefix = `draft:${digest(userAddress)}:`;
   const activeKey = `${prefix}active`;
-  const currentKey = await composer.get(activeKey);
-  const keys = currentKey && currentKey.startsWith(prefix) ? [activeKey, currentKey] : [activeKey];
+  const indexKey = draftIndexKey(userAddress);
+  const [currentKey, indexedIds] = await Promise.all([
+    composer.get(activeKey),
+    composer.zrevrange(indexKey, 0, -1),
+  ]);
+  const keys = new Set<string>([activeKey, indexKey]);
+  if (currentKey && currentKey.startsWith(prefix)) {
+    keys.add(currentKey);
+  }
+  for (const id of indexedIds) {
+    if (id) keys.add(`${prefix}${id}`);
+  }
   await composer.del(...keys);
 }
 
