@@ -103,7 +103,9 @@ export interface Payer {
   creatorRecipientAddress: string;
   creatorFeePercent: number;
   treasuryAddress: string;
+  service: 'workflow' | 'vibe' | 'banner';
   action: string;
+  meterSubject: string;
   runId: string;
 }
 export type PaymentSessionContext = Payer;
@@ -214,18 +216,19 @@ export function ceilPercent(amountWei: bigint, percent: number): bigint {
 export function computeWorkflowServiceFees(
   composeBillWei: bigint,
   creatorFeePercent: number,
-  isCreator: boolean,
+  isSelfRecipient: boolean,
 ): Split {
   const normalizedBill = composeBillWei > 0n ? composeBillWei : 0n;
-  if (isCreator && creatorFeePercent === 0) {
+  if (creatorFeePercent === 0) {
+    const platformFeeWei = ceilPercent(normalizedBill, PLATFORM_FEE_PERCENT);
     return {
       composeBillWei: normalizedBill,
       creatorFeePercent: 0,
       creatorFeeWei: 0n,
-      platformFeePercent: 0,
-      platformFeeWei: 0n,
-      serviceFeeWei: 0n,
-      totalChargedWei: normalizedBill,
+      platformFeePercent: PLATFORM_FEE_PERCENT,
+      platformFeeWei,
+      serviceFeeWei: platformFeeWei,
+      totalChargedWei: normalizedBill + platformFeeWei,
     };
   }
   if (
@@ -240,7 +243,7 @@ export function computeWorkflowServiceFees(
       { statusCode: 400 },
     );
   }
-  const effectiveCreatorPercent = isCreator ? 0 : creatorFeePercent;
+  const effectiveCreatorPercent = isSelfRecipient ? 0 : creatorFeePercent;
   const creatorFeeWei = ceilPercent(normalizedBill, effectiveCreatorPercent);
   const platformFeeWei = ceilPercent(normalizedBill, PLATFORM_FEE_PERCENT);
   const serviceFeeWei = creatorFeeWei + platformFeeWei;
@@ -342,12 +345,14 @@ export function extractMetaFromReceiptPayload(
   let billWei = finalWei;
 
   const isRuntimeAgentReceipt =
+    receiptObj.service === 'agent' ||
     receiptObj.service === 'runtime' ||
     (Array.isArray(receiptObj.bills) &&
       receiptObj.bills.some(
         b =>
           Boolean(b && typeof b === 'object') &&
           ((b as Record<string, unknown>).kind === 'agent' ||
+            (b as Record<string, unknown>).source === 'agent' ||
             (b as Record<string, unknown>).source === 'runtime'),
       ));
 
@@ -659,30 +664,9 @@ export function requireSessionPayment(
         return;
       }
 
-      if (
-        canonicalUserAddress === paymentConfig.creatorUserAddress &&
-        paymentConfig.creatorFeePercent === 0
-      ) {
-        request.headers['x-session-user-address'] = parsed.sub;
-        request.headers['x-network-id'] = network;
-        request.headers['x-run-id'] = runId;
-        (request as unknown as { paymentContext: Payer }).paymentContext = {
-          mode: 'session',
-          userAddress: canonicalUserAddress,
-          sessionSubject: parsed.sub,
-          network,
-          token: sessionToken,
-          creatorUserAddress: paymentConfig.creatorUserAddress,
-          creatorRecipientAddress,
-          creatorFeePercent: paymentConfig.creatorFeePercent,
-          treasuryAddress,
-          action: paymentConfig.action,
-          runId,
-        };
-        return;
-      }
-
-      const idempotencyKey = `${paymentConfig.action}:${parsed.keyId ?? parsed.sub}:${runId}`;
+      const serviceName = paymentConfig.service ?? 'workflow';
+      const meterSubject = paymentConfig.meterSubject?.trim() || serviceName;
+      const idempotencyKey = `${serviceName}:${paymentConfig.action}:${parsed.keyId ?? parsed.sub}:${runId}`;
       const prepareRes = await fetchFn(`${composeUrl}/api/payments/prepare`, {
         method: 'POST',
         headers: {
@@ -692,8 +676,9 @@ export function requireSessionPayment(
           'x-session-user-address': parsed.sub,
         },
         body: JSON.stringify({
-          service: 'man0',
+          service: serviceName,
           action: paymentConfig.action,
+          meterSubject,
           resource: resourceUrl,
           method: request.method,
           maxAmountWei,
@@ -703,6 +688,7 @@ export function requireSessionPayment(
             treasury: treasuryAddress,
           },
           runId,
+          rootRunId: runId,
           idempotencyKey,
         }),
       });
@@ -746,7 +732,9 @@ export function requireSessionPayment(
         creatorRecipientAddress,
         creatorFeePercent: paymentConfig.creatorFeePercent,
         treasuryAddress,
+        service: serviceName,
         action: paymentConfig.action,
+        meterSubject,
         runId,
       };
       return;
@@ -837,6 +825,9 @@ export function requireSessionPayment(
     request.headers['x-network-id'] = network;
     request.headers['x-run-id'] = runId;
 
+    const serviceName = paymentConfig.service ?? 'workflow';
+    const meterSubject = paymentConfig.meterSubject?.trim() || serviceName;
+
     (request as unknown as { paymentContext: Payer }).paymentContext = {
       mode: 'x402',
       paymentPayload,
@@ -848,7 +839,9 @@ export function requireSessionPayment(
       creatorRecipientAddress,
       creatorFeePercent: paymentConfig.creatorFeePercent,
       treasuryAddress,
+      service: serviceName,
       action: paymentConfig.action,
+      meterSubject,
       runId,
     };
   };
@@ -889,8 +882,12 @@ export async function settleWorkflowPayment(
     });
   }
 
-  const isCreator = ctx.userAddress === ctx.creatorUserAddress;
-  const fees = computeWorkflowServiceFees(composeBillWei, ctx.creatorFeePercent, isCreator);
+  const isSelfRecipient = Boolean(
+    ctx.sessionSubject &&
+    ctx.creatorRecipientAddress &&
+    ctx.sessionSubject.toLowerCase() === ctx.creatorRecipientAddress.toLowerCase(),
+  );
+  const fees = computeWorkflowServiceFees(composeBillWei, ctx.creatorFeePercent, isSelfRecipient);
 
   if (fees.serviceFeeWei === 0n || (!ctx.paymentIntentId && ctx.mode === 'session')) {
     if (ctx.mode === 'session' && ctx.paymentIntentId) {
@@ -927,6 +924,33 @@ export async function settleWorkflowPayment(
     ).catch(() => undefined);
   }
 
+  const lineItems: MeterLineItem[] = [
+    ...(fees.creatorFeeWei > 0n
+      ? [
+        {
+          key: 'royalty',
+          unit: 'percent',
+          quantity: fees.creatorFeePercent,
+          unitPriceUsd:
+            Number(fees.creatorFeeWei) / (1_000_000 * Math.max(1, fees.creatorFeePercent)),
+          amountWei: fees.creatorFeeWei.toString(),
+        },
+      ]
+      : []),
+    ...(fees.platformFeeWei > 0n
+      ? [
+        {
+          key: 'treasury',
+          unit: 'percent',
+          quantity: fees.platformFeePercent,
+          unitPriceUsd:
+            Number(fees.platformFeeWei) / (1_000_000 * Math.max(1, fees.platformFeePercent)),
+          amountWei: fees.platformFeeWei.toString(),
+        },
+      ]
+      : []),
+  ];
+
   if (ctx.mode === 'session') {
     const settleRes = await fetchImpl(`${config.composeApiUrl}/api/payments/settle`, {
       method: 'POST',
@@ -941,6 +965,8 @@ export async function settleWorkflowPayment(
         ...(fees.creatorFeeWei > 0n ? { providerAmountWei: fees.creatorFeeWei.toString() } : {}),
         ...(fees.platformFeeWei > 0n ? { platformFeeWei: fees.platformFeeWei.toString() } : {}),
         executeImmediately: true,
+        meterSubject: ctx.meterSubject || 'workflow',
+        lineItems,
         royalties: {
           ...(fees.creatorFeeWei > 0n && ctx.creatorRecipientAddress
             ? { creator: ctx.creatorRecipientAddress }
@@ -988,6 +1014,7 @@ export async function settleWorkflowPayment(
     amount: fees.serviceFeeWei.toString(),
     maxAmountRequired: fees.serviceFeeWei.toString(),
     extra: {
+      service: ctx.service,
       ...(fees.creatorFeeWei > 0n ? { providerAmountWei: fees.creatorFeeWei.toString() } : {}),
       ...(fees.platformFeeWei > 0n ? { platformFeeWei: fees.platformFeeWei.toString() } : {}),
       royalties: {
