@@ -1865,5 +1865,163 @@ export async function build(deps: ServerDeps = {}) {
     return runCore();
   }
 
+  app.get('/api/workflows/:id/threads', async request => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const id = z.string().uuid().parse((request.params as { id: string }).id);
+    return workflows.listThreads(authUser.userAddress, id);
+  });
+
+  app.get('/api/workflows/:id/threads/:threadId', async request => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const params = z
+      .object({
+        id: z.string().uuid(),
+        threadId: z.string().trim().min(1).max(200),
+      })
+      .parse(request.params);
+    const found = await workflows.getThread(authUser.userAddress, params.id, params.threadId);
+    if (!found) {
+      throw Object.assign(new Error('Workflow thread not found.'), { statusCode: 404 });
+    }
+    return found;
+  });
+
+  app.get('/api/workflows/:id/threads/:threadId/watch', async (request, reply) => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const params = z
+      .object({
+        id: z.string().uuid(),
+        threadId: z.string().trim().min(1).max(200),
+      })
+      .parse(request.params);
+    const initial = await workflows.getThread(authUser.userAddress, params.id, params.threadId);
+    if (!initial) {
+      throw Object.assign(new Error('Workflow thread not found.'), { statusCode: 404 });
+    }
+
+    const stream = new PassThrough();
+    reply.header('content-type', 'application/x-ndjson; charset=utf-8');
+    reply.header('cache-control', 'no-cache, no-transform');
+    reply.header('x-accel-buffering', 'no');
+
+    const writeEvent = (evt: Record<string, unknown>) => {
+      if (!stream.destroyed && !stream.writableEnded) {
+        stream.write(`${JSON.stringify(evt)}\n`);
+      }
+    };
+
+    writeEvent({ type: 'thread:init', threadId: initial.threadId, runId: initial.runId });
+    const deliveredSteps = new Set<string>();
+    for (const [stepId, output] of Object.entries(initial.stepOutputs ?? {})) {
+      deliveredSteps.add(stepId);
+      writeEvent({ type: 'step:done', stepId, label: stepId, kind: 'step', output });
+    }
+    if (initial.runningStepId) {
+      writeEvent({
+        type: 'step:start',
+        stepId: initial.runningStepId,
+        label: initial.runningStepId,
+        kind: 'step',
+      });
+    }
+
+    const emitTerminalFromThread = (item: Awaited<ReturnType<typeof workflows.getThread>>): boolean => {
+      if (!item || item.status === 'running') return false;
+      for (const [stepId, output] of Object.entries(item.stepOutputs ?? {})) {
+        if (!deliveredSteps.has(stepId)) {
+          deliveredSteps.add(stepId);
+          writeEvent({ type: 'step:done', stepId, label: stepId, kind: 'step', output });
+        }
+      }
+      if (item.status === 'succeeded' && item.execution) {
+        writeEvent({ type: 'result', execution: item.execution });
+        return true;
+      }
+      if (item.status === 'input_required') {
+        writeEvent({ type: 'input:pause', missingInputs: item.missingInputs });
+        writeEvent({
+          type: 'error',
+          statusCode: 428,
+          code: 'INPUT_REQUIRED',
+          threadId: item.threadId,
+          missingInputs: item.missingInputs,
+          error: item.error || 'Additional input is required to continue.',
+        });
+        return true;
+      }
+      if (item.status === 'connector_required') {
+        writeEvent({ type: 'connector:pause', missing: item.missingConnectors });
+        writeEvent({
+          type: 'error',
+          statusCode: 428,
+          code: 'CONNECTOR_REQUIRED',
+          threadId: item.threadId,
+          missing: item.missingConnectors,
+          error: item.error || 'Connect required account to continue.',
+        });
+        return true;
+      }
+      writeEvent({
+        type: 'error',
+        statusCode: 502,
+        threadId: item.threadId,
+        error: item.error || 'Workflow execution failed.',
+      });
+      return true;
+    };
+
+    if (emitTerminalFromThread(initial)) {
+      stream.end();
+      return reply.send(stream);
+    }
+
+    const channel = `${workflows.workflowThreadScopeKey(authUser.userAddress, params.id)}:${params.threadId}`;
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      threadWatchers.off(channel, onLiveEvent);
+      clearInterval(pollTimer);
+      clearInterval(pingTimer);
+      if (!stream.destroyed && !stream.writableEnded) {
+        stream.end();
+      }
+    };
+
+    const onLiveEvent = (evt: Record<string, unknown>) => {
+      if (closed) return;
+      if (evt.type === 'step:done' && typeof evt.stepId === 'string') {
+        if (deliveredSteps.has(evt.stepId)) return;
+        deliveredSteps.add(evt.stepId);
+      }
+      writeEvent(evt);
+      if (evt.type === 'result' || evt.type === 'error') {
+        cleanup();
+      }
+    };
+
+    threadWatchers.on(channel, onLiveEvent);
+    const pingTimer = setInterval(() => {
+      writeEvent({ type: 'ping', ts: Date.now() });
+    }, 5_000);
+    pingTimer.unref?.();
+
+    const pollTimer = setInterval(() => {
+      void workflows
+        .getThread(authUser.userAddress, params.id, params.threadId)
+        .then(latest => {
+          if (closed || !latest) return;
+          if (emitTerminalFromThread(latest)) {
+            cleanup();
+          }
+        })
+        .catch(() => undefined);
+    }, 1_500);
+    pollTimer.unref?.();
+
+    request.raw.on('close', cleanup);
+    return reply.send(stream);
+  });
+
   return app;
 }
