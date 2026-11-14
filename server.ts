@@ -2023,5 +2023,130 @@ export async function build(deps: ServerDeps = {}) {
     return reply.send(stream);
   });
 
+  async function resolveCallerMainAddress(request: FastifyRequest): Promise<string | undefined> {
+    const rawBearer = bearer(request.headers.authorization);
+    if (rawBearer && !rawBearer.startsWith('compose-')) {
+      const authAccount = await token.read(rawBearer).catch(() => null);
+      if (authAccount?.userAddress) return authAccount.userAddress;
+    }
+    const sessionToken = extractSessionToken(request);
+    const parsed = sessionToken ? parseComposeToken(sessionToken) : null;
+    return parsed?.sub ? resolveMainUserAddress(parsed.sub) : undefined;
+  }
+
+  const connectorDecisionField = z.object({
+    runId: z.string().trim().min(1).max(200),
+    requestId: z.string().trim().min(1).max(200),
+    decision: z.enum(['connected', 'discarded']),
+  });
+
+  const workflowRunFields = {
+    input: z.string().max(32000).optional(),
+    attachments: z.array(workflowAttachmentSchema).max(8).optional(),
+    dry: z.boolean().optional(),
+    composeBillWei: z.string().regex(/^\d+$/).optional(),
+    threadId: z.string().trim().min(1).max(200).optional(),
+    coordinator: coordinator.nullable().optional(),
+    connectorDecisions: z.array(connectorDecisionField).max(16).optional(),
+  };
+
+  app.post(
+    '/api/workflows/:id/run',
+    {
+      preHandler: requireSessionPayment(async request => {
+        const id = z.string().uuid().parse((request.params as { id: string }).id);
+        const callerMainAddress = await resolveCallerMainAddress(request);
+        if (!callerMainAddress && !extractPaymentSignature(request)) {
+          throw Object.assign(new Error('Sign in before running a workflow.'), {
+            statusCode: 401,
+          });
+        }
+
+        const flow = await workflows.get(id, callerMainAddress);
+        if (!flow.published || !flow.terms) {
+          if (!callerMainAddress || callerMainAddress !== flow.userAddress) {
+            throw Object.assign(new Error('This workflow has not been published yet.'), {
+              statusCode: 403,
+            });
+          }
+          (request as unknown as { workflow: Listing }).workflow = flow;
+          return {
+            action: 'workflow-run',
+            creatorUserAddress: flow.userAddress,
+            creatorFeePercent: 0,
+          } satisfies Charge;
+        }
+
+        (request as unknown as { workflow: Listing }).workflow = flow;
+        return {
+          action: 'workflow-run',
+          creatorUserAddress: flow.userAddress,
+          creatorFeePercent: flow.terms.creatorFee,
+        } satisfies Charge;
+      }, { fetchImpl }),
+    },
+    async (request, reply) => {
+      const id = z.string().uuid().parse((request.params as { id: string }).id);
+      const paymentCtx = getPaymentContext(request);
+      const flow =
+        (request as unknown as { workflow?: Awaited<ReturnType<typeof workflows.get>> }).workflow ??
+        (await workflows.get(id, paymentCtx?.userAddress));
+      const body = z.object(workflowRunFields).optional().parse(request.body);
+      return executeFlowRun(request, reply, flow, {
+        input: body?.input,
+        attachments: body?.attachments,
+        dry: body?.dry,
+        overrideBillWei: body?.composeBillWei,
+        threadId: body?.threadId,
+        coordinator: body?.coordinator,
+        connectorDecisions: body?.connectorDecisions,
+        mode: 'run',
+      });
+    },
+  );
+
+  app.post(
+    '/api/draft/run',
+    {
+      preHandler: requireSessionPayment(async request => {
+        const callerMainAddress = await resolveCallerMainAddress(request);
+        if (!callerMainAddress) {
+          throw Object.assign(new Error('Sign in before test-running a draft.'), {
+            statusCode: 401,
+          });
+        }
+        return {
+          action: 'workflow-run',
+          creatorUserAddress: callerMainAddress,
+          creatorFeePercent: 0,
+        } satisfies Charge;
+      }, { fetchImpl }),
+    },
+    async (request, reply) => {
+      const paymentCtx = getPaymentContext(request);
+      const body = z.object({ flow: graph, ...workflowRunFields }).parse(request.body);
+      return executeFlowRun(
+        request,
+        reply,
+        {
+          ...body.flow,
+          userAddress: paymentCtx?.userAddress ?? '',
+          terms: null,
+          published: null,
+        },
+        {
+          input: body.input,
+          attachments: body.attachments,
+          dry: body.dry,
+          overrideBillWei: body.composeBillWei,
+          threadId: body.threadId,
+          coordinator: body.coordinator,
+          connectorDecisions: body.connectorDecisions,
+          mode: 'test',
+        },
+      );
+    },
+  );
+
   return app;
 }
