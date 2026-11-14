@@ -1319,3 +1319,152 @@ export async function abortPreparedFixedCharge(
     }),
   }).catch(() => undefined);
 }
+
+export async function settlePreparedFixedCharge(
+  charge: PreparedFixedCharge,
+  reply?: FastifyReply,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ txHash: string | null }> {
+  if (charge.settled || charge.aborted) {
+    return { txHash: null };
+  }
+  charge.settled = true;
+  const amountStr = charge.spec.amountWei.toString();
+
+  if (charge.mode === 'session') {
+    const settleRes = await fetchImpl(`${config.composeApiUrl}/api/payments/settle`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-network-id': charge.network,
+        ...(charge.token ? { authorization: `Bearer ${charge.token}` } : {}),
+      },
+      body: JSON.stringify({
+        paymentIntentId: charge.paymentIntentId,
+        finalAmountWei: amountStr,
+        providerAmountWei: amountStr,
+        executeImmediately: true,
+        meterSubject: charge.spec.meterSubject,
+        lineItems: charge.spec.lineItems,
+        royalties: { treasury: charge.treasuryAddress },
+      }),
+    });
+    const settlePayload = (await settleRes.json().catch(() => ({}))) as {
+      txHash?: string;
+      error?: string;
+    };
+    if (!settleRes.ok) {
+      charge.settled = false;
+      throw Object.assign(
+        new Error(settlePayload.error || `${charge.spec.service} payment settlement failed.`),
+        { statusCode: settleRes.status || 402 },
+      );
+    }
+    if (reply && !reply.sent && settlePayload.txHash) {
+      reply.header('X-Transaction-Hash', settlePayload.txHash);
+    }
+    return { txHash: settlePayload.txHash ?? null };
+  }
+
+  const settleRes = await fetchImpl(`${config.composeApiUrl}/api/x402/facilitator/settle`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-network-id': charge.network,
+    },
+    body: JSON.stringify({
+      x402Version: 2,
+      paymentPayload: charge.paymentPayload,
+      paymentRequirements: charge.paymentRequirements,
+    }),
+  });
+  const settleBody = (await settleRes.json().catch(() => ({}))) as {
+    success?: boolean;
+    transaction?: string;
+    errorReason?: string;
+    error?: string;
+  };
+  if (!settleRes.ok || !settleBody.success) {
+    charge.settled = false;
+    throw Object.assign(
+      new Error(settleBody.errorReason ?? settleBody.error ?? 'x402 settlement failed.'),
+      { statusCode: 402 },
+    );
+  }
+  if (reply && !reply.sent) {
+    reply.header('PAYMENT-RESPONSE', Buffer.from(JSON.stringify(settleBody), 'utf8').toString('base64'));
+    if (settleBody.transaction) {
+      reply.header('X-Transaction-Hash', settleBody.transaction);
+    }
+  }
+  return { txHash: settleBody.transaction ?? null };
+}
+
+export async function runWithChildSessionCharge<T>(
+  parent: PreparedFixedCharge,
+  spec: FixedChargeSpec,
+  work: () => Promise<T>,
+  fetchImpl: typeof fetch = fetch,
+): Promise<T> {
+  if (parent.mode !== 'session' || !parent.token || !parent.sessionSubject) {
+    return work();
+  }
+  const amountStr = spec.amountWei.toString();
+  const childExecId = `${parent.runId}:${spec.service}:${randomUUID().slice(0, 8)}`;
+  const prepareRes = await fetchImpl(`${config.composeApiUrl}/api/payments/prepare`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${parent.token}`,
+      'content-type': 'application/json',
+      'x-network-id': parent.network,
+      'x-session-user-address': parent.sessionSubject,
+    },
+    body: JSON.stringify({
+      service: spec.service,
+      action: spec.action,
+      meterSubject: spec.meterSubject,
+      lineItems: spec.lineItems,
+      resource: parent.resourceUrl.replace(/\/api\/[^/?#]+$/, `/api/generate-${spec.service}`),
+      method: 'POST',
+      maxAmountWei: amountStr,
+      payTo: parent.treasuryAddress,
+      royalties: { treasury: parent.treasuryAddress },
+      runId: parent.runId,
+      rootRunId: parent.runId,
+      executionRunId: childExecId,
+      idempotencyKey: `${spec.service}:${spec.action}:${parent.keyId ?? parent.sessionSubject}:${childExecId}`,
+    }),
+  });
+  const preparePayload = (await prepareRes.json().catch(() => ({}))) as {
+    paymentIntentId?: string;
+    error?: string;
+  };
+  if (!prepareRes.ok || !preparePayload.paymentIntentId) {
+    throw Object.assign(
+      new Error(preparePayload.error || `${spec.service} payment preparation failed.`),
+      { statusCode: prepareRes.status || 402 },
+    );
+  }
+  const childCharge: PreparedFixedCharge = {
+    spec,
+    mode: 'session',
+    network: parent.network,
+    treasuryAddress: parent.treasuryAddress,
+    token: parent.token,
+    sessionSubject: parent.sessionSubject,
+    keyId: parent.keyId,
+    paymentIntentId: preparePayload.paymentIntentId,
+    runId: parent.runId,
+    resourceUrl: parent.resourceUrl,
+    settled: false,
+    aborted: false,
+  };
+  try {
+    const out = await work();
+    await settlePreparedFixedCharge(childCharge, undefined, fetchImpl);
+    return out;
+  } catch (err) {
+    await abortPreparedFixedCharge(childCharge, `${spec.service}_failed`, fetchImpl);
+    throw err;
+  }
+}
