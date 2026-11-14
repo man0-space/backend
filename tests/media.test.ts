@@ -16,12 +16,68 @@ import {
 
 const testUser = `test-media:${randomUUID()}`;
 const jwt = await sign(privateKey, issuer!, testUser, randomBytes(32).toString('base64url'), 3600);
+const composeSessionToken = (() => {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(
+    JSON.stringify({
+      sub: testUser,
+      keyId: 'key-media-1',
+      network: 'near:testnet',
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    }),
+  ).toString('base64url');
+  return `compose-${header}.${payload}.sig`;
+})();
 
 const calls: Array<{ url: string; init?: RequestInit }> = [];
+const bannerPaymentCalls: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
 const samplePngBase64 = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64');
 
 const mockFetch: typeof fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+  if (url.endsWith('/api/x402/facilitator/chains')) {
+    return new Response(
+      JSON.stringify({
+        defaultNetwork: 'near:testnet',
+        chains: [
+          {
+            name: 'NEAR Testnet',
+            network: 'near:testnet',
+            namespace: 'near',
+            shortName: 'near-testnet',
+            isTestnet: true,
+            explorer: 'https://testnet.nearblocks.io',
+            rpcUrl: 'https://rpc.testnet.near.org',
+            assetAddress: 'usdc.tidepool-sandbox.testnet',
+            assetSymbol: 'USDC',
+            assetDecimals: 6,
+            schemes: ['exact', 'upto', 'batch-settlement'],
+          },
+        ],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }
+
+  if (url.endsWith('/api/payments/prepare')) {
+    const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+    bannerPaymentCalls.push({ endpoint: 'prepare', body });
+    return new Response(
+      JSON.stringify({ paymentIntentId: 'pi-banner-1', userAddress: testUser }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }
+
+  if (url.endsWith('/api/payments/settle')) {
+    const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+    bannerPaymentCalls.push({ endpoint: 'settle', body });
+    return new Response(
+      JSON.stringify({ status: 'confirmed', txHash: 'near_banner_tx_1' }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }
+
   calls.push({ url, init });
 
   if (url === 'https://logos.composio.dev/api/notion') {
@@ -150,10 +206,27 @@ test('POST /api/generate-avatar and /api/generate-banner validate required field
   assert.deepEqual(geminiReq.generationConfig, { responseModalities: ['IMAGE'] });
 
   calls.length = 0;
-  const okBanner = await app.inject({
+  bannerPaymentCalls.length = 0;
+
+  const unpaidBanner = await app.inject({
     method: 'POST',
     url: '/api/generate-banner',
     headers,
+    payload: {
+      title: 'Intents Yield Router',
+      description: 'Routes NEAR Intents swaps with research synthesis',
+    },
+  });
+  assert.equal(unpaidBanner.statusCode, 402);
+
+  const okBanner = await app.inject({
+    method: 'POST',
+    url: '/api/generate-banner',
+    headers: {
+      ...headers,
+      'x-compose-key': composeSessionToken,
+      'x-network-id': 'near:testnet',
+    },
     payload: {
       title: 'Intents Yield Router',
       description: 'Routes NEAR Intents swaps with research synthesis',
@@ -166,6 +239,12 @@ test('POST /api/generate-avatar and /api/generate-banner validate required field
   });
   assert.equal(okBanner.statusCode, 200);
   assert.equal(okBanner.json().cid, 'bafkreigeneratedmediacidv1example1234567890abcdef');
+  assert.equal(bannerPaymentCalls.length, 2);
+  assert.equal(bannerPaymentCalls[0]!.body['service'], 'banner');
+  assert.equal(bannerPaymentCalls[0]!.body['action'], 'generate');
+  assert.equal(bannerPaymentCalls[0]!.body['maxAmountWei'], '30000');
+  assert.equal(bannerPaymentCalls[1]!.body['finalAmountWei'], '30000');
+  assert.equal(bannerPaymentCalls[1]!.body['meterSubject'], 'banner');
   assert.equal(calls.length, 3);
   assert.equal(calls[0]!.url, 'https://logos.composio.dev/api/notion');
   assert.ok(calls[1]!.url.includes('models/gemini-nano-banana-2.1:generateContent'));
