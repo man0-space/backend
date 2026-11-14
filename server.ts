@@ -1259,5 +1259,611 @@ export async function build(deps: ServerDeps = {}) {
     return enriched!;
   });
 
+  const threadWatchers = new EventEmitter();
+  threadWatchers.setMaxListeners(0);
+
+  async function resolveRequestMainUserAddress(
+    request: FastifyRequest,
+    fallbackAddress?: string,
+  ): Promise<string | undefined> {
+    const rawBearer = bearer(request.headers.authorization);
+    if (rawBearer && !rawBearer.startsWith('compose-')) {
+      const authAccount = await token.read(rawBearer).catch(() => null);
+      if (authAccount?.userAddress) return authAccount.userAddress;
+    }
+    if (fallbackAddress) {
+      const resolved = await resolveMainUserAddress(fallbackAddress).catch(() => undefined);
+      return resolved || fallbackAddress;
+    }
+    return undefined;
+  }
+
+  async function executeFlowRun(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    flow: Listing,
+    options: {
+      input?: string;
+      attachments?: WorkflowAttachment[];
+      dry?: boolean;
+      overrideBillWei?: string;
+      threadId?: string;
+      coordinator?: Coordinator | null;
+      connectorDecisions?: Array<{
+        runId: string;
+        requestId: string;
+        decision: 'connected' | 'discarded';
+      }>;
+      mode: 'run' | 'test';
+    },
+  ) {
+    const isDry = Boolean(options.dry);
+    const shouldPinProof = options.mode === 'run' && !isDry;
+    const wantsStream = Boolean(request.headers.accept?.includes('application/x-ndjson'));
+    const ndjsonStream = wantsStream ? new PassThrough() : null;
+    let activeThreadWatchChannel: string | null = null;
+
+    const emitEvent = (event: Record<string, unknown>) => {
+      if (ndjsonStream && !ndjsonStream.destroyed) {
+        ndjsonStream.write(`${JSON.stringify(event)}\n`);
+      }
+      if (activeThreadWatchChannel && event.type !== 'ping') {
+        threadWatchers.emit(activeThreadWatchChannel, event);
+      }
+    };
+
+    const runCore = async () => {
+      const startedAtMs = Date.now();
+      const paymentCtx = getPaymentContext(request);
+      if (!paymentCtx) {
+        throw Object.assign(new Error('Missing prepared workflow payment context.'), {
+          statusCode: 402,
+        });
+      }
+
+      const attachments = options.attachments ?? [];
+      const { waves, orderedNodes } = decomposeWorkflowWaves(flow.nodes, flow.edges);
+
+      const turnRunId = paymentCtx.runId;
+      const threadId = options.threadId?.trim() || `wf-${flow.id}-${turnRunId}`;
+      const subject = paymentCtx.sessionSubject ?? paymentCtx.userAddress;
+      const network = paymentCtx.network;
+      const threadOwnerAddress =
+        options.mode === 'run'
+          ? await resolveRequestMainUserAddress(request, paymentCtx.userAddress)
+          : undefined;
+      if (threadOwnerAddress) {
+        activeThreadWatchChannel = `${workflows.workflowThreadScopeKey(threadOwnerAddress, flow.id)}:${threadId}`;
+      }
+
+      const existingThread =
+        threadOwnerAddress && options.threadId?.trim()
+          ? await workflows.getThread(threadOwnerAddress, flow.id, threadId).catch(() => null)
+          : null;
+      const rootRunId = existingThread?.runId?.trim() || turnRunId;
+
+      let composeBillWei = options.overrideBillWei ? BigInt(options.overrideBillWei) : 0n;
+      let turnBills: WorkflowBillItem[] = [];
+      const initialInput =
+        options.input?.trim() ||
+        (attachments.length > 0
+          ? `Attached: ${attachments.map(a => `${a.name || a.type} (${a.url})`).join(', ')}`
+          : (flow.brief ?? ''));
+      let currentOutput = initialInput;
+
+      const stepResults: Array<{
+        id: string;
+        label: string;
+        kind: string;
+        entryId: string | null;
+        billWei: string;
+        output: string;
+      }> = [];
+
+      const selectedCoordinator =
+        options.coordinator ??
+        flow.coordinator ??
+        (options.overrideBillWei ? null : (await listAvailableCoordinators())[0] ?? null);
+
+      if (!options.overrideBillWei && !selectedCoordinator) {
+        throw Object.assign(new Error('No Coordinator available to execute this workflow.'), {
+          statusCode: 400,
+        });
+      }
+
+      const planSnapshot = {
+        workflowId: flow.id,
+        name: flow.name,
+        coordinatorWallet: selectedCoordinator?.walletAddress ?? null,
+        waves: waves.map(wave => wave.map(n => n.id)),
+        nodes: orderedNodes.map(n => ({
+          id: n.id,
+          label: n.data.label,
+          kind: n.data.kind,
+          entryId: n.data.entry?.id ?? null,
+          note: n.data.note,
+        })),
+        edges: flow.edges.map(e => ({ source: e.source, target: e.target })),
+      };
+
+      const proofAccumulator = shouldPinProof
+        ? new ProofAccumulator({
+          runId: turnRunId,
+          workflowId: flow.id,
+          chainWorkflowId: flow.terms?.chainWorkflowId ?? null,
+          coordinatorWallet: selectedCoordinator?.walletAddress ?? null,
+          planSnapshot,
+          startedAt: startedAtMs,
+        })
+        : null;
+
+      const pendingDecisions = [...(options.connectorDecisions ?? [])].filter(
+        d => Boolean(d.runId && d.requestId),
+      );
+      const sdkFetch: typeof fetch =
+        pendingDecisions.length > 0
+          ? async (input, init) => {
+              const reqUrl =
+                typeof input === 'string'
+                  ? input
+                  : input instanceof URL
+                    ? input.href
+                    : input.url;
+              if (pendingDecisions.length > 0 && /\/agent\/[^/]+\/stream(?:\?|$)/.test(reqUrl)) {
+                const decided = pendingDecisions.shift()!;
+                const headers = new Headers(
+                  init?.headers ?? (input instanceof Request ? input.headers : undefined),
+                );
+                headers.set(
+                  'x-connector-decision',
+                  `${decided.runId}:${decided.requestId}:${decided.decision}`,
+                );
+                return fetchImpl(input, { ...init, headers });
+              }
+              return fetchImpl(input, init);
+            }
+          : fetchImpl;
+
+      const runSdk = new ComposeSDK({
+        baseUrl: config.composeApiUrl,
+        fetch: sdkFetch,
+        storage: createMemoryStorage(),
+        ...(subject ? { userAddress: subject } : {}),
+        network: network,
+        ...(paymentCtx.token ? { key: paymentCtx.token } : {}),
+      });
+
+      const parseBillingBigInt = (val: unknown): bigint =>
+        typeof val === 'string' && /^\d+$/.test(val) ? BigInt(val) : 0n;
+
+      let priorThreadBilling = {
+        composeBillWei: 0n,
+        creatorFeeWei: 0n,
+        platformFeeWei: 0n,
+        serviceFeeWei: 0n,
+        totalChargedWei: 0n,
+        lastTxHash: null as string | null,
+        lastPaymentIntentId: null as string | null,
+        bills: [] as WorkflowBillItem[],
+      };
+
+      const priorStepOutputs: Record<string, string> =
+        existingThread?.stepOutputs && typeof existingThread.stepOutputs === 'object'
+          ? { ...existingThread.stepOutputs }
+          : {};
+      const liveStepOutputsRecord: Record<string, string> = { ...priorStepOutputs };
+      const firstPendingStepId =
+        orderedNodes.find(n => priorStepOutputs[n.id] === undefined)?.id ?? null;
+      emitEvent({ type: 'thread:init', threadId, runId: rootRunId });
+
+      if (threadOwnerAddress) {
+        const savedThread = await workflows
+          .upsertThread({
+            threadId,
+            workflowId: flow.id,
+            userAddress: threadOwnerAddress,
+            status: 'running',
+            runId: rootRunId,
+            dry: isDry,
+            prompt: options.input ?? '',
+            attachments: attachments as unknown as Array<Record<string, unknown>>,
+            coordinator: selectedCoordinator ?? null,
+            runningStepId: firstPendingStepId,
+            stepOutputs: liveStepOutputsRecord,
+            missingInputs: [],
+            missingConnectors: [],
+            error: null,
+          })
+          .catch(() => null);
+        if (savedThread?.billing && typeof savedThread.billing === 'object') {
+          const b = savedThread.billing;
+          priorThreadBilling = {
+            composeBillWei: parseBillingBigInt(b.composeBillWei),
+            creatorFeeWei: parseBillingBigInt(b.creatorFeeWei),
+            platformFeeWei: parseBillingBigInt(b.platformFeeWei),
+            serviceFeeWei: parseBillingBigInt(b.serviceFeeWei),
+            totalChargedWei: parseBillingBigInt(b.totalChargedWei),
+            lastTxHash: typeof b.lastTxHash === 'string' && b.lastTxHash ? b.lastTxHash : null,
+            lastPaymentIntentId:
+              typeof b.lastPaymentIntentId === 'string' && b.lastPaymentIntentId
+                ? b.lastPaymentIntentId
+                : null,
+            bills: Array.isArray(b.bills) ? (b.bills as WorkflowBillItem[]) : [],
+          };
+        }
+      }
+
+      try {
+        if (!options.overrideBillWei && selectedCoordinator) {
+          const coordStartedAt = Date.now();
+          const coordResult = await runWorkflow({
+            flow,
+            coordinator: selectedCoordinator,
+            runSdk,
+            runId: rootRunId,
+            threadId,
+            subject,
+            userInput: options.input,
+            attachments,
+            priorStepOutputs,
+            dry: isDry,
+            requireProof: shouldPinProof,
+            isResumingThread: Boolean(existingThread) || Boolean(options.connectorDecisions?.length),
+            hasConnectorDecisions: Boolean(
+              options.connectorDecisions?.some(d => d.decision === 'connected'),
+            ),
+            fetchImpl,
+            emitEvent,
+            onBillDelta: deltaWei => {
+              composeBillWei += deltaWei;
+            },
+            onStepProgress: ({ runningStepId, stepOutputs }) => {
+              Object.assign(liveStepOutputsRecord, stepOutputs);
+              if (threadOwnerAddress) {
+                void workflows
+                  .upsertThread({
+                    threadId,
+                    workflowId: flow.id,
+                    userAddress: threadOwnerAddress,
+                    status: 'running',
+                    runId: rootRunId,
+                    dry: isDry,
+                    runningStepId,
+                    stepOutputs: liveStepOutputsRecord,
+                    persistDb: false,
+                  })
+                  .catch(() => undefined);
+              }
+            },
+          });
+
+          composeBillWei = coordResult.totalComposeBillWei;
+          currentOutput = coordResult.output;
+          turnBills = coordResult.bills;
+          Object.assign(liveStepOutputsRecord, coordResult.stepOutputs);
+
+          for (const step of coordResult.steps) {
+            stepResults.push({
+              id: step.id,
+              label: step.label,
+              kind: step.kind,
+              entryId: step.entryId,
+              billWei: step.billWei,
+              output: step.output,
+            });
+            proofAccumulator?.recordStep({
+              stepId: step.id,
+              kind: step.kind,
+              entryId: step.entryId,
+              provider: step.provider,
+              stepInput: step.stepInput,
+              stepOutput: step.output,
+              invokedTool: step.invokedTool,
+              inferenceRunIds: step.inferenceRunIds,
+              startedAt: step.startedAt,
+              endedAt: step.endedAt,
+            });
+          }
+
+          proofAccumulator?.recordStep({
+            stepId: `coordinator:${selectedCoordinator.id}`,
+            kind: 'agent',
+            entryId: selectedCoordinator.walletAddress,
+            provider: coordResult.coordinatorProviders[coordResult.coordinatorProviders.length - 1],
+            stepInput: planSnapshot,
+            stepOutput: currentOutput,
+            invokedTool: `agent:${selectedCoordinator.walletAddress}:stream`,
+            inferenceRunIds: coordResult.coordinatorRunIds,
+            startedAt: coordStartedAt,
+          });
+        } else {
+          for (const node of orderedNodes) {
+            stepResults.push({
+              id: node.id,
+              label: node.data.label,
+              kind: node.data.kind,
+              entryId: node.data.entry?.id ?? null,
+              billWei: '0',
+              output: currentOutput,
+            });
+            proofAccumulator?.recordStep({
+              stepId: node.id,
+              kind: node.data.kind,
+              entryId: node.data.entry?.id ?? null,
+              stepInput: initialInput,
+              stepOutput: currentOutput,
+              invokedTool: `${node.data.kind}:${node.data.entry?.id ?? 'step'}`,
+              startedAt: startedAtMs,
+            });
+          }
+        }
+      } catch (error) {
+        const errObj = error as {
+          statusCode?: number;
+          code?: string;
+          message?: string;
+          missing?: MissingConnectorRequirement[];
+          missingInputs?: MissingInputRequirement[];
+        } | null;
+        const isSuspended = errObj?.statusCode === 428;
+        let suspendedSettlement: Awaited<ReturnType<typeof settleWorkflowPayment>> | null = null;
+        if (composeBillWei === 0n) {
+          await abortWorkflowPayment(
+            request,
+            error instanceof Error ? error.message : 'workflow_step_failed',
+            fetchImpl,
+          );
+        } else {
+          suspendedSettlement = await settleWorkflowPayment(
+            request,
+            reply,
+            composeBillWei,
+            fetchImpl,
+          ).catch(() => null);
+        }
+
+        const updatedThreadBilling = isSuspended
+          ? {
+            composeBillWei: (
+              priorThreadBilling.composeBillWei +
+              (suspendedSettlement
+                ? parseBillingBigInt(suspendedSettlement.composeBillWei)
+                : composeBillWei)
+            ).toString(),
+            creatorFeeWei: (
+              priorThreadBilling.creatorFeeWei +
+              (suspendedSettlement ? parseBillingBigInt(suspendedSettlement.creatorFeeWei) : 0n)
+            ).toString(),
+            platformFeeWei: (
+              priorThreadBilling.platformFeeWei +
+              (suspendedSettlement ? parseBillingBigInt(suspendedSettlement.platformFeeWei) : 0n)
+            ).toString(),
+            serviceFeeWei: (
+              priorThreadBilling.serviceFeeWei +
+              (suspendedSettlement ? parseBillingBigInt(suspendedSettlement.serviceFeeWei) : 0n)
+            ).toString(),
+            totalChargedWei: (
+              priorThreadBilling.totalChargedWei +
+              (suspendedSettlement
+                ? parseBillingBigInt(suspendedSettlement.totalChargedWei)
+                : composeBillWei)
+            ).toString(),
+            lastTxHash: suspendedSettlement?.txHash ?? priorThreadBilling.lastTxHash,
+            lastPaymentIntentId:
+              suspendedSettlement?.paymentIntentId ?? priorThreadBilling.lastPaymentIntentId,
+            bills: [...priorThreadBilling.bills, ...turnBills],
+          }
+          : null;
+
+        if (threadOwnerAddress) {
+          const nextStatus =
+            errObj?.code === 'INPUT_REQUIRED'
+              ? 'input_required'
+              : errObj?.code === 'CONNECTOR_REQUIRED'
+                ? 'connector_required'
+                : 'failed';
+          await workflows
+            .upsertThread({
+              threadId,
+              workflowId: flow.id,
+              userAddress: threadOwnerAddress,
+              status: nextStatus,
+              runId: rootRunId,
+              dry: isDry,
+              runningStepId: null,
+              stepOutputs: liveStepOutputsRecord,
+              ...(errObj?.missingInputs
+                ? {
+                  missingInputs: errObj.missingInputs as unknown as Array<
+                    Record<string, unknown>
+                  >,
+                }
+                : {}),
+              ...(errObj?.missing
+                ? {
+                  missingConnectors: errObj.missing as unknown as Array<Record<string, unknown>>,
+                }
+                : {}),
+              error: error instanceof Error ? error.message : 'Workflow execution failed.',
+              billing: updatedThreadBilling,
+            })
+            .catch(() => undefined);
+        }
+        if (!isSuspended) {
+          const failedComposeWei = priorThreadBilling.composeBillWei + composeBillWei;
+          await workflows
+            .recordRun({
+              id: turnRunId,
+              workflowId: flow.id,
+              workflowName: flow.name,
+              userAddress: paymentCtx.userAddress,
+              creatorAddress: flow.userAddress,
+              network: network,
+              status: 'failed',
+              durationMs: Date.now() - startedAtMs,
+              composeBillWei: failedComposeWei.toString(),
+              creatorFeeWei: priorThreadBilling.creatorFeeWei.toString(),
+              platformFeeWei: priorThreadBilling.platformFeeWei.toString(),
+              totalChargedWei: (
+                priorThreadBilling.totalChargedWei +
+                (suspendedSettlement
+                  ? parseBillingBigInt(suspendedSettlement.totalChargedWei)
+                  : composeBillWei)
+              ).toString(),
+              txHash: suspendedSettlement?.txHash ?? priorThreadBilling.lastTxHash,
+              proofCid: null,
+              steps: stepResults,
+            })
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+
+      const settlement = await settleWorkflowPayment(request, reply, composeBillWei, fetchImpl);
+      const totalComposeBillWei = (
+        priorThreadBilling.composeBillWei + parseBillingBigInt(settlement.composeBillWei)
+      ).toString();
+      const totalCreatorFeeWei = (
+        priorThreadBilling.creatorFeeWei + parseBillingBigInt(settlement.creatorFeeWei)
+      ).toString();
+      const totalPlatformFeeWei = (
+        priorThreadBilling.platformFeeWei + parseBillingBigInt(settlement.platformFeeWei)
+      ).toString();
+      const totalServiceFeeWei = (
+        priorThreadBilling.serviceFeeWei + parseBillingBigInt(settlement.serviceFeeWei)
+      ).toString();
+      const totalChargedWei = (
+        priorThreadBilling.totalChargedWei + parseBillingBigInt(settlement.totalChargedWei)
+      ).toString();
+      const effectiveTxHash = settlement.txHash ?? priorThreadBilling.lastTxHash;
+      const effectivePaymentIntentId =
+        settlement.paymentIntentId ?? priorThreadBilling.lastPaymentIntentId;
+      const callerAddress = paymentCtx.userAddress;
+      const callerNetwork = network;
+
+      let proofCid: string | null = null;
+      let proofUrl: string | null = null;
+      if (proofAccumulator) {
+        const bundle = proofAccumulator.finalize();
+        const pinnedProof = await pinProofBundleToIPFS(bundle, fetchImpl);
+        proofCid = pinnedProof.proofCid;
+        proofUrl = pinnedProof.proofUrl;
+      }
+
+      await workflows
+        .recordRun({
+          id: turnRunId,
+          workflowId: flow.id,
+          workflowName: flow.name,
+          userAddress: callerAddress,
+          creatorAddress: flow.userAddress,
+          network: callerNetwork,
+          status: 'succeeded',
+          durationMs: Date.now() - startedAtMs,
+          composeBillWei: totalComposeBillWei,
+          creatorFeeWei: totalCreatorFeeWei,
+          platformFeeWei: totalPlatformFeeWei,
+          totalChargedWei,
+          txHash: effectiveTxHash,
+          proofCid,
+          steps: stepResults,
+        })
+        .catch(() => undefined);
+
+      for (const s of stepResults) {
+        liveStepOutputsRecord[s.id] = s.output;
+      }
+
+      const mergedBills = [...priorThreadBilling.bills, ...turnBills];
+      const finalExecution = {
+        ok: true,
+        threadId,
+        workflowId: flow.id,
+        chainWorkflowId: flow.terms?.chainWorkflowId ?? null,
+        name: flow.name,
+        creatorUserAddress: flow.userAddress,
+        userAddress: callerAddress,
+        network: callerNetwork,
+        dry: isDry,
+        composeBillWei: totalComposeBillWei,
+        creatorFeePercent: settlement.creatorFeePercent,
+        creatorFeeWei: totalCreatorFeeWei,
+        platformFeePercent: settlement.platformFeePercent,
+        platformFeeWei: totalPlatformFeeWei,
+        serviceFeeWei: totalServiceFeeWei,
+        totalChargedWei,
+        txHash: effectiveTxHash,
+        paymentIntentId: effectivePaymentIntentId,
+        proofCid,
+        proofUrl,
+        output: currentOutput,
+        steps: stepResults,
+        ...(mergedBills.length > 0 ? { bills: mergedBills } : {}),
+      };
+
+      if (threadOwnerAddress) {
+        await workflows
+          .upsertThread({
+            threadId,
+            workflowId: flow.id,
+            userAddress: threadOwnerAddress,
+            status: 'succeeded',
+            runId: rootRunId,
+            dry: isDry,
+            runningStepId: null,
+            stepOutputs: liveStepOutputsRecord,
+            missingInputs: [],
+            missingConnectors: [],
+            error: null,
+            billing: null,
+            execution: finalExecution as unknown as Record<string, unknown>,
+          })
+          .catch(() => undefined);
+      }
+
+      return finalExecution;
+    };
+
+    if (ndjsonStream) {
+      reply.header('content-type', 'application/x-ndjson; charset=utf-8');
+      reply.header('cache-control', 'no-cache, no-transform');
+      reply.header('x-accel-buffering', 'no');
+      const pingTimer = setInterval(() => {
+        emitEvent({ type: 'ping', ts: Date.now() });
+      }, 5_000);
+      pingTimer.unref?.();
+      void (async () => {
+        try {
+          const execution = await runCore();
+          emitEvent({ type: 'result', execution });
+        } catch (err) {
+          const failure = err as {
+            statusCode?: number;
+            code?: string;
+            message?: string;
+            threadId?: string;
+            missing?: MissingConnectorRequirement[];
+            missingInputs?: MissingInputRequirement[];
+          };
+          emitEvent({
+            type: 'error',
+            statusCode: failure.statusCode ?? 500,
+            ...(failure.code ? { code: failure.code } : {}),
+            ...(failure.threadId ? { threadId: failure.threadId } : {}),
+            ...(failure.missing ? { missing: failure.missing } : {}),
+            ...(failure.missingInputs ? { missingInputs: failure.missingInputs } : {}),
+            error: failure.message ?? 'Workflow execution failed.',
+          });
+        } finally {
+          clearInterval(pingTimer);
+          if (!ndjsonStream.destroyed) ndjsonStream.end();
+        }
+      })();
+      return reply.send(ndjsonStream);
+    }
+
+    return runCore();
+  }
+
   return app;
 }
