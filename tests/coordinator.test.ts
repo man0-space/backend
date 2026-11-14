@@ -1591,3 +1591,209 @@ test('runWorkflow reconciles real /api/receipts per-step billing via models_call
   assert.equal(res.bills.filter(b => b.category === 'model').length, 3);
   assert.equal(res.bills.filter(b => b.category === 'connector').length, 0);
 });
+
+test('runWorkflow isolates Compose memory (scope=local), strips unrelated connected accounts from sessionGrants/backpackAccounts, and never labels read/search URLs as Published', async () => {
+  const stepNotionId = randomUUID();
+  const flow: Listing = {
+    id: randomUUID(),
+    name: 'Scoped Notion Publisher',
+    brief: 'Publish fresh note to Notion without cross-run memory or unrelated connectors',
+    userAddress: 'alice.testnet',
+    terms: null,
+    published: null,
+    modified: new Date().toISOString(),
+    nodes: [
+      {
+        id: stepNotionId,
+        type: 'step',
+        position: { x: 0, y: 0 },
+        data: {
+          label: 'Publish Note',
+          kind: 'connector',
+          note: 'Create a Notion page for the fresh note',
+          entry: { id: 'account:notion', kind: 'connector', name: 'Notion', description: 'Notion' },
+        },
+      },
+    ],
+    edges: [],
+  };
+
+  let capturedStreamBody: Record<string, unknown> | null = null;
+  const decidedCalls: Array<Record<string, unknown>> = [];
+
+  const mockFetch: typeof fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes('/connectors/status')) {
+      return new Response(
+        JSON.stringify({
+          userAddress: 'alice.testnet',
+          accounts: [
+            { slug: 'notion', name: 'Notion', connected: true, granted: true, connectedAccountId: 'ca_notion' },
+            { slug: 'github', name: 'GitHub', connected: true, granted: true, connectedAccountId: 'ca_github' },
+            { slug: 'linear', name: 'Linear', connected: true, granted: true, connectedAccountId: 'ca_linear' },
+          ],
+          connectors: [
+            { slug: 'slack-mcp', name: 'Slack MCP', connected: true, allowed: true, missingVars: [] },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (
+      url.includes('/accounts/toolkits/notion/actions') ||
+      url.includes('/connectors/notion/actions')
+    ) {
+      return new Response(
+        JSON.stringify({
+          toolkit: 'notion',
+          actions: [
+            { slug: 'NOTION_SEARCH_NOTION_PAGE', name: 'NOTION_SEARCH_NOTION_PAGE', description: 'Search Notion', inputParameters: { type: 'object', properties: {} } },
+            { slug: 'NOTION_CREATE_NOTION_PAGE', name: 'NOTION_CREATE_NOTION_PAGE', description: 'Create Notion page', inputParameters: { type: 'object', properties: {} } },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url.includes('/runs/wf-scope-1/connector')) {
+      const raw = input instanceof Request ? await input.clone().text() : String(init?.body ?? '{}');
+      decidedCalls.push(JSON.parse(raw) as Record<string, unknown>);
+      return new Response(
+        JSON.stringify({ success: true, requestId: 'req-unlisted-gh', state: 'discarded' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url.includes('/receipts')) {
+      return new Response(JSON.stringify({ receipts: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.endsWith('/stream')) {
+      const raw = input instanceof Request ? await input.clone().text() : String(init?.body ?? '{}');
+      capturedStreamBody = JSON.parse(raw) as Record<string, unknown>;
+      const sse = [
+        // Unsolicited connector request for github (NOT in workflow) must be discarded, NEVER auto-approved as connected!
+        `data: ${JSON.stringify({
+          domain: 'activity',
+          type: 'activity.connector',
+          id: 'conn:gh:1',
+          kind: 'connector',
+          status: 'pending',
+          spanId: 'span-gh-1',
+          ts: Date.now(),
+          payload: {
+            state: 'requested',
+            requestId: 'req-unlisted-gh',
+            bindingId: 'account:github',
+            slug: 'github',
+            runId: 'wf-scope-1',
+          },
+        })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join('');
+      return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }
+    if (url.includes('/runs/wf-scope-1/events')) {
+      const watchSse = [
+        // Exploratory search returning an old page URL
+        `data: ${JSON.stringify({
+          domain: 'activity',
+          type: 'activity.tool',
+          id: 'tool:search:start',
+          kind: 'tool',
+          status: 'running',
+          spanId: 'span-search-1',
+          name: 'connectors_call',
+          ts: Date.now(),
+          payload: {
+            input: { connectorRef: 'connector:account:notion', action: 'NOTION_SEARCH_NOTION_PAGE' },
+          },
+        })}\n\n`,
+        `data: ${JSON.stringify({
+          domain: 'activity',
+          type: 'activity.tool',
+          id: 'tool:search:end',
+          kind: 'tool',
+          status: 'completed',
+          spanId: 'span-search-1',
+          name: 'connectors_call',
+          ts: Date.now(),
+          payload: {
+            output: {
+              success: true,
+              data: { url: 'https://app.notion.com/p/Stale-Old-Run-Page-111' },
+            },
+          },
+        })}\n\n`,
+        // Actual page creation returning the new page URL
+        `data: ${JSON.stringify({
+          domain: 'activity',
+          type: 'activity.tool',
+          id: 'tool:create:start',
+          kind: 'tool',
+          status: 'running',
+          spanId: 'span-create-2',
+          name: 'connectors_call',
+          ts: Date.now(),
+          payload: {
+            input: { connectorRef: 'connector:account:notion', action: 'NOTION_CREATE_NOTION_PAGE' },
+          },
+        })}\n\n`,
+        `data: ${JSON.stringify({
+          domain: 'activity',
+          type: 'activity.tool',
+          id: 'tool:create:end',
+          kind: 'tool',
+          status: 'completed',
+          spanId: 'span-create-2',
+          name: 'connectors_call',
+          ts: Date.now(),
+          payload: {
+            output: {
+              success: true,
+              data: { url: 'https://app.notion.com/p/Fresh-Run-Page-999' },
+            },
+          },
+        })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join('');
+      return new Response(watchSse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const runSdk = new ComposeSDK({
+    fetch: mockFetch,
+    storage: createMemoryStorage(),
+    userAddress: 'alice.testnet',
+    network: 'near:testnet',
+    key: 'compose-test-token',
+  });
+
+  const cleanRes = await runWorkflow({
+    flow,
+    coordinator: testCoord,
+    runSdk,
+    runId: 'wf-scope-1',
+    threadId: 'wf-scope-thread-1',
+    subject: 'alice.testnet',
+    userInput: 'Publish fresh note',
+    emitEvent: () => undefined,
+    onBillDelta: () => undefined,
+  });
+
+  assert.equal(decidedCalls.length, 1);
+  assert.equal(decidedCalls[0]?.['requestId'], 'req-unlisted-gh');
+  assert.equal(decidedCalls[0]?.['decision'], 'discarded');
+  assert.ok(capturedStreamBody);
+  assert.equal(capturedStreamBody['scope'], 'local');
+  assert.deepEqual(capturedStreamBody['sessionGrants'], ['account:notion']);
+  assert.deepEqual(capturedStreamBody['backpackAccounts'], [
+    { slug: 'notion', name: 'notion', connected: true, accountId: 'ca_notion' },
+  ]);
+
+  const notionOut = cleanRes.stepOutputs[stepNotionId] ?? '';
+  assert.equal(notionOut.includes('Published: https://app.notion.com/p/Stale-Old-Run-Page-111'), false);
+  assert.equal(notionOut.includes('Stale-Old-Run-Page-111'), false);
+  assert.match(notionOut, /Published: https:\/\/app\.notion\.com\/p\/Fresh-Run-Page-999/);
+});
