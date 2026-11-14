@@ -1025,6 +1025,146 @@ export async function build(deps: ServerDeps = {}) {
     ]);
     reply.code(204).send();
   });
+  app.get('/api/profile/:address', async request => {
+    const address = z
+      .string()
+      .trim()
+      .min(2)
+      .max(160)
+      .parse((request.params as { address: string }).address);
+    const loaded = await loadCreatorProfiles([address]);
+    return (
+      loaded.get(address.toLowerCase()) ?? {
+        userAddress: address,
+        name: '',
+        bio: '',
+        image: null,
+        banner: null,
+        socials: [],
+      }
+    ) satisfies CreatorProfile;
+  });
+
+  app.get('/api/profiles', async request => {
+    const query = z
+      .object({
+        addresses: z.string().max(16_000).optional(),
+      })
+      .parse(request.query);
+    const list = (query.addresses ?? '')
+      .split(',')
+      .map(item => item.trim())
+      .filter(s => s.length >= 2 && s.length <= 160)
+      .slice(0, 100);
+    const loaded = await loadCreatorProfiles(list);
+    const profiles: Record<string, CreatorProfile> = {};
+    for (const [lower, item] of loaded.entries()) {
+      profiles[lower] = item;
+    }
+    return { profiles };
+  });
+
+  app.put('/api/profile', async request => {
+    await token.ensureUserColumns();
+    const raw = bearer(request.headers.authorization);
+    const account = await token.authorize(raw);
+    const data = profile.parse(request.body);
+    const nextImage = data.image === undefined ? account.image : data.image || null;
+    const nextBanner = data.banner === undefined ? account.banner : data.banner || null;
+
+    let nextSocials = account.socials;
+    if (data.socials !== undefined) {
+      const deduped = new Map<string, SocialLink>();
+      for (const item of data.socials) {
+        deduped.set(item.platform, item);
+      }
+      nextSocials = [...deduped.values()];
+
+      if (nextSocials.length > 0) {
+        const others = await user`
+          SELECT "userAddress", socials
+          FROM users
+          WHERE "userAddress" <> ${account.userAddress}
+            AND jsonb_typeof(socials) = 'array'
+            AND jsonb_array_length(socials) > 0
+        `;
+        const normHandle = (h: string) => h.trim().replace(/^@+/, '').toLowerCase();
+        for (const incoming of nextSocials) {
+          const incomingPid = incoming.providerId?.trim().toLowerCase();
+          const incomingH = normHandle(incoming.handle);
+          for (const other of others) {
+            const existingList = Array.isArray(other.socials)
+              ? (other.socials as SocialLink[])
+              : [];
+            for (const existing of existingList) {
+              const existingPid = existing.providerId?.trim().toLowerCase();
+              if (incomingPid && existingPid && incomingPid === existingPid) {
+                throw Object.assign(
+                  new Error('Account already linked to a different creator.'),
+                  { statusCode: 409 },
+                );
+              }
+              if (
+                existing.platform === incoming.platform &&
+                incomingH &&
+                normHandle(existing.handle) === incomingH
+              ) {
+                throw Object.assign(
+                  new Error('Account already linked to a different creator.'),
+                  { statusCode: 409 },
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const [updated] = await user`
+      UPDATE users
+      SET name = ${data.name},
+          bio = ${data.bio},
+          image = ${nextImage},
+          banner = ${nextBanner},
+          socials = ${JSON.stringify(nextSocials)}::jsonb,
+          modified = now()
+      WHERE "userAddress" = ${account.userAddress}
+      RETURNING "userAddress", name, bio, image, banner, socials
+    `;
+    const normalized = token.normalizeUserRow(updated, account.consented);
+    const walletsMap = await loadCreatorWallets([normalized.userAddress]);
+    const wallets = walletsMap.get(normalized.userAddress.toLowerCase()) ?? {
+      near: normalized.userAddress,
+      evm: null,
+      svm: null,
+    };
+    const updatedCreatorProfile: CreatorProfile = {
+      userAddress: normalized.userAddress,
+      name: normalized.name,
+      bio: normalized.bio,
+      image: normalized.image,
+      banner: normalized.banner,
+      socials: normalized.socials,
+      wallets,
+    };
+    const staleProfileKeys = new Set<string>([
+      workflows.MARKET_LIST_CACHE_KEY,
+      workflows.userWorkflowsCacheKey(account.userAddress),
+    ]);
+    for (const rawName of [account.name, normalized.name]) {
+      const trimmed = (rawName ?? '').trim();
+      if (!trimmed) continue;
+      staleProfileKeys.add(profileCacheKey(trimmed));
+      const slug = toProfileSlug(trimmed);
+      if (slug) staleProfileKeys.add(profileCacheKey(slug));
+    }
+    await Promise.all([
+      cacheSet(profileCacheKey(account.userAddress), updatedCreatorProfile, 300, 30_000),
+      cacheDel(...staleProfileKeys),
+      token.invalidateUserSessions(account.userAddress, raw),
+    ]);
+    return normalized;
+  });
 
   return app;
 }
