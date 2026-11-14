@@ -197,6 +197,34 @@ test('profile banner, socials, collision checks, config fees/telegram, and unpub
     assert.equal(delWip.statusCode, 204);
     assert.equal(await workflows.current(userAddress), null);
 
+    // Multi-WIP index in Composer Valkey: multiple unsaved WIPs coexist, saving promotes only one, DELETE /api/draft/:id discards individually
+    const wip1 = { ...draftFlow, id: randomUUID(), name: 'WIP Alpha', modified: new Date(Date.now() - 2000).toISOString() };
+    const wip2 = { ...draftFlow, id: randomUUID(), name: 'WIP Beta', modified: new Date().toISOString() };
+    assert.equal((await app.inject({ method: 'PUT', url: '/api/draft', headers: headersA, payload: wip1 })).statusCode, 200);
+    assert.equal((await app.inject({ method: 'PUT', url: '/api/draft', headers: headersA, payload: wip2 })).statusCode, 200);
+
+    const listWipsBoth = await app.inject({ method: 'GET', url: '/api/drafts', headers: headersA });
+    assert.equal(listWipsBoth.statusCode, 200);
+    assert.deepEqual(
+      (listWipsBoth.json() as Array<{ id: string }>).map(d => d.id),
+      [wip2.id, wip1.id],
+    );
+
+    // Promote wip1 to Saved in Neon -> only wip2 remains in unsaved WIPs
+    const promotedWip1 = await app.inject({ method: 'POST', url: '/api/workflows', headers: headersA, payload: wip1 });
+    assert.equal(promotedWip1.statusCode, 200);
+    const listAfterSave = await app.inject({ method: 'GET', url: '/api/drafts', headers: headersA });
+    assert.deepEqual(
+      (listAfterSave.json() as Array<{ id: string }>).map(d => d.id),
+      [wip2.id],
+    );
+
+    // Discard wip2 individually via DELETE /api/draft/:id
+    const discardWip2 = await app.inject({ method: 'DELETE', url: `/api/draft/${wip2.id}`, headers: headersA });
+    assert.equal(discardWip2.statusCode, 204);
+    const listAfterDiscard = await app.inject({ method: 'GET', url: '/api/drafts', headers: headersA });
+    assert.deepEqual(listAfterDiscard.json(), []);
+
     const anonGet = await app.inject({ method: 'GET', url: `/api/workflows/${draftFlow.id}` });
     assert.equal(anonGet.statusCode, 404);
     const otherGet = await app.inject({ method: 'GET', url: `/api/workflows/${draftFlow.id}`, headers: headersB });
