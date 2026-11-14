@@ -1333,6 +1333,77 @@ function formatLegDisplayAmount(amountAtomic: bigint, token: OneClickToken): str
     : `${Number(humanIn.toFixed(Math.min(6, token.decimals)))} ${token.symbol}`;
 }
 
+function extractOriginBridgeCapAtomicFromError(
+  err: unknown,
+  originToken: OneClickToken,
+  destToken: OneClickToken,
+): bigint | null {
+  if (typeof err !== 'object' || err === null) return null;
+  const msg = extractOneClickErrorMessage(err, '');
+  if (/would\s+pay\s+out/i.test(msg)) {
+    return null;
+  }
+  const symMatch = msg.match(/\b([A-Za-z0-9]+)\s+is\s+capped\s+at\s+(\d+(?:\.\d+)?)/i);
+  if (
+    symMatch?.[1] &&
+    symMatch[1].toUpperCase() === destToken.symbol.toUpperCase() &&
+    symMatch[1].toUpperCase() !== originToken.symbol.toUpperCase()
+  ) {
+    return null;
+  }
+  const body =
+    'body' in err
+      ? ((err as { body?: unknown }).body as
+          | {
+              capWei?: string;
+              capLamports?: string;
+              capAtomic?: string;
+              maxUnits?: string;
+            }
+          | undefined)
+      : undefined;
+  const direct = body?.capWei ?? body?.capLamports ?? body?.capAtomic ?? body?.maxUnits;
+  if (typeof direct === 'string' && /^\d+$/.test(direct) && BigInt(direct) > 0n) {
+    return BigInt(direct);
+  }
+  if (!msg) return null;
+  const parenUnits = msg.match(/\((\d{4,})\s*[a-zA-Z]*\)/);
+  if (parenUnits?.[1]) {
+    const v = BigInt(parenUnits[1]);
+    if (v > 0n) return v;
+  }
+  if (symMatch?.[2]) {
+    const v = decimalToAtomic(Number(symMatch[2]), originToken.decimals);
+    if (v > 0n) return v;
+  }
+  return null;
+}
+
+export function isUniversalNearAccountId(address: string): boolean {
+  return /^0u[0-9a-z]{52}$/.test(address.trim());
+}
+
+export function extractOneClickErrorMessage(err: unknown, fallback: string): string {
+  if (typeof err === 'object' && err !== null && 'body' in err) {
+    const body = (err as { body?: unknown }).body as
+      | { message?: string | string[]; error?: string }
+      | undefined;
+    if (Array.isArray(body?.message) && body.message.length > 0) {
+      return body.message.join('; ');
+    }
+    if (typeof body?.message === 'string' && body.message.trim()) {
+      return body.message.trim();
+    }
+    if (typeof body?.error === 'string' && body.error.trim()) {
+      return body.error.trim();
+    }
+  }
+  if (err instanceof Error && err.message.trim()) {
+    return err.message.trim();
+  }
+  return String(err || fallback);
+}
+
 async function quoteSingleLegWithRetry(input: {
   network?: 'mainnet' | 'testnet';
   dry: boolean;
@@ -1343,7 +1414,8 @@ async function quoteSingleLegWithRetry(input: {
   recipientAddress: string;
   connectedWallets: string[];
 }): Promise<ResolvedIntentLeg> {
-  configureOneClickBase(input.network ?? config.network);
+  const activeNet = input.network ?? config.network;
+  configureOneClickBase(activeNet);
   const isIntentsDeposit = input.holding.source === 'intents' && Boolean(input.holding.intentsAccountId);
   const depositType = isIntentsDeposit
     ? QuoteRequest.depositType.INTENTS
@@ -1355,9 +1427,17 @@ async function quoteSingleLegWithRetry(input: {
     ? input.holding.intentsAccountId!
     : input.holding.walletAddress;
 
+  const isNearUniversalRecipient =
+    input.destToken.blockchain === 'near' && isUniversalNearAccountId(input.recipientAddress);
+  let recipientType =
+    activeNet === 'mainnet' && isNearUniversalRecipient
+      ? QuoteRequest.recipientType.INTENTS
+      : QuoteRequest.recipientType.DESTINATION_CHAIN;
+
   const tryQuote = async (
     amt: bigint,
     depositMode: QuoteRequest.depositMode,
+    reqRecipientType: QuoteRequest.recipientType = recipientType,
   ): Promise<OneClickQuotePayload['quote']> => {
     const res = await OneClickService.getQuote({
       dry: input.dry,
@@ -1367,7 +1447,7 @@ async function quoteSingleLegWithRetry(input: {
       originAsset: input.holding.token.assetId,
       depositType,
       destinationAsset: input.destToken.assetId,
-      recipientType: QuoteRequest.recipientType.DESTINATION_CHAIN,
+      recipientType: reqRecipientType,
       refundType,
       amount: amt.toString(),
       refundTo,
@@ -1383,36 +1463,49 @@ async function quoteSingleLegWithRetry(input: {
   };
 
   let finalAmount = input.amountAtomic;
-  let initialMode =
+  let currentMode =
     input.holding.token.blockchain === 'stellar' || input.holding.token.blockchain === 'xrp'
       ? QuoteRequest.depositMode.MEMO
       : QuoteRequest.depositMode.SIMPLE;
 
-  let quote: OneClickQuotePayload['quote'];
-  try {
-    quote = await tryQuote(finalAmount, initialMode);
-  } catch (err) {
-    const errMsg =
-      err instanceof ApiError
-        ? ((err.body as { message?: string } | undefined)?.message ?? err.message)
-        : err instanceof Error
-          ? err.message
-          : String(err);
-
-    if (/memo/i.test(errMsg) && initialMode === QuoteRequest.depositMode.SIMPLE) {
-      initialMode = QuoteRequest.depositMode.MEMO;
-      quote = await tryQuote(finalAmount, initialMode);
-    } else {
-      const capAtomic = extractBridgeCapAtomicFromError(err, input.holding.token.decimals);
+  let quote: OneClickQuotePayload['quote'] | undefined;
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      quote = await tryQuote(finalAmount, currentMode, recipientType);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      const errMsg = extractOneClickErrorMessage(err, 'NEAR Intents quote failed.');
+      const capAtomic = extractOriginBridgeCapAtomicFromError(
+        err,
+        input.holding.token,
+        input.destToken,
+      );
       if (capAtomic && capAtomic < finalAmount) {
         finalAmount = capAtomic;
-        quote = await tryQuote(finalAmount, initialMode);
-      } else {
-        throw Object.assign(new Error(errMsg || 'NEAR Intents quote failed.'), {
-          statusCode: 400,
-        });
+        continue;
       }
+      if (/memo/i.test(errMsg) && currentMode === QuoteRequest.depositMode.SIMPLE) {
+        currentMode = QuoteRequest.depositMode.MEMO;
+        continue;
+      }
+      if (
+        isNearUniversalRecipient &&
+        recipientType === QuoteRequest.recipientType.DESTINATION_CHAIN
+      ) {
+        recipientType = QuoteRequest.recipientType.INTENTS;
+        continue;
+      }
+      break;
     }
+  }
+  if (!quote) {
+    const errMsg = extractOneClickErrorMessage(lastErr, 'NEAR Intents quote failed.');
+    throw Object.assign(new Error(errMsg || 'NEAR Intents quote failed.'), {
+      statusCode: 400,
+    });
   }
 
   return {
@@ -2512,25 +2605,4 @@ export async function broadcastSolanaOriginTransfer(input: {
     txHash,
     explorerUrl: buildSolanaExplorerTxUrl(explorerBase, txHash),
   };
-}
-
-function extractBridgeCapAtomicFromError(err: unknown, decimals: number): bigint | null {
-  if (!(err instanceof ApiError)) return null;
-  const body = err.body as { capWei?: string; capAtomic?: string; message?: string } | undefined;
-  const direct = body?.capWei ?? body?.capAtomic;
-  if (typeof direct === 'string' && /^\d+$/.test(direct) && BigInt(direct) > 0n) {
-    return BigInt(direct);
-  }
-  const msg = typeof body?.message === 'string' ? body.message : err.message;
-  const parenUnits = msg.match(/\((\d{4,})\s*[a-zA-Z]*\)/);
-  if (parenUnits?.[1]) {
-    const v = BigInt(parenUnits[1]);
-    if (v > 0n) return v;
-  }
-  const cappedDec = msg.match(/capped\s+at\s+(\d+(?:\.\d+)?)/i);
-  if (cappedDec?.[1]) {
-    const v = decimalToAtomic(Number(cappedDec[1]), decimals);
-    if (v > 0n) return v;
-  }
-  return null;
 }
