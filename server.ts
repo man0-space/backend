@@ -237,6 +237,7 @@ const coordinatorMintBody = z.object({
   image: z.string().trim().url().max(2048),
   personality: z.string().trim().min(1).max(8000),
   model: z.string().trim().min(1).max(256),
+  creatorFee: z.number().int().min(1).max(3).optional(),
   contractId: z.string().trim().min(2).max(128).optional(),
   network: z.enum(['near:mainnet', 'near:testnet']).optional(),
 });
@@ -910,7 +911,7 @@ export async function build(deps: ServerDeps = {}) {
           x402: true,
           x402Support: true,
           licensePrice: '0',
-          creatorFee: 0,
+          creatorFee: body.creatorFee ?? 1,
           licenses: 0,
           cloneable: false,
           skills: [],
@@ -2181,7 +2182,9 @@ export async function build(deps: ServerDeps = {}) {
           }
           (request as unknown as { workflow: Listing }).workflow = flow;
           return {
-            action: 'workflow-run',
+            service: 'workflow',
+            action: 'run',
+            meterSubject: flow.name?.trim() || flow.id,
             creatorUserAddress: flow.userAddress,
             creatorFeePercent: 0,
           } satisfies Charge;
@@ -2189,7 +2192,9 @@ export async function build(deps: ServerDeps = {}) {
 
         (request as unknown as { workflow: Listing }).workflow = flow;
         return {
-          action: 'workflow-run',
+          service: 'workflow',
+          action: 'run',
+          meterSubject: flow.name?.trim() || flow.id,
           creatorUserAddress: flow.userAddress,
           creatorFeePercent: flow.terms.creatorFee,
         } satisfies Charge;
@@ -2225,8 +2230,11 @@ export async function build(deps: ServerDeps = {}) {
             statusCode: 401,
           });
         }
+        const rawFlow = (request.body as { flow?: { name?: string; id?: string } } | null)?.flow;
         return {
-          action: 'workflow-run',
+          service: 'workflow',
+          action: 'run',
+          meterSubject: rawFlow?.name?.trim() || rawFlow?.id || 'draft',
           creatorUserAddress: callerMainAddress,
           creatorFeePercent: 0,
         } satisfies Charge;
