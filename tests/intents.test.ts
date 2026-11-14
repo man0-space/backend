@@ -7,7 +7,9 @@ import {
   detectSymbolInSegment,
   discoverDynamicChains,
   encodeSolanaTransferTransaction,
+  extractOneClickErrorMessage,
   getLiveOneClickTokens,
+  isUniversalNearAccountId,
   NO_FUNDED_WALLET_CODE,
   NO_FUNDED_WALLET_MESSAGE,
   prepareSolanaOriginTransfer,
@@ -368,4 +370,257 @@ test('resolveUserIntentQuote routes dynamically on Mainnet Defuse and Testnet Ti
   assert.ok(livePrepared.recentBlockhash.length >= 32);
   assert.ok(livePrepared.lastValidBlockHeight > 0);
   assert.ok(livePrepared.messageBase58.length > 80);
+
+  // 6. Mainnet 0u... universal account quoting & new-user ($0 Smart Account + linked EVM wallet) swaps
+  const universalAcct = '0u0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghjk';
+  assert.equal(isUniversalNearAccountId(universalAcct), true);
+  assert.equal(isUniversalNearAccountId('composer.near'), false);
+
+  assert.equal(
+    extractOneClickErrorMessage(
+      Object.assign(new Error('Bad Request - Invalid input or quote state'), {
+        body: { message: 'recipient is not valid' },
+      }),
+      'Fallback',
+    ),
+    'recipient is not valid',
+  );
+  assert.equal(
+    extractOneClickErrorMessage(
+      Object.assign(new Error('Bad Request - Invalid input or quote state'), {
+        body: { message: ['amount is too low', 'recipient is invalid'] },
+      }),
+      'Fallback',
+    ),
+    'amount is too low; recipient is invalid',
+  );
+
+  const universalDepositQuote = await resolveUserIntentQuote({
+    userAddress: universalAcct,
+    prompt: 'Fund $5',
+    dry: true,
+    network: 'mainnet',
+    connectedWallets: [
+      { network: 'evm', address: '0xd8da6bf26964af9d7eed9e03e53415d37aa96045' },
+    ],
+    tokensOverride: mainnetTokens,
+    holdingsOverride: [
+      {
+        source: 'external',
+        walletNetwork: 'evm',
+        walletAddress: '0xd8da6bf26964af9d7eed9e03e53415d37aa96045',
+        token: baseUsdc,
+        chainLabel: 'Base',
+        hexChainId: '0x2105',
+        balanceAtomic: '25000000',
+        balanceFormatted: 25,
+        balanceUsd: 25,
+        hasNativeGas: true,
+      },
+    ],
+  });
+  assert.equal(universalDepositQuote.action, 'deposit');
+  assert.equal(universalDepositQuote.destinationToken.blockchain, 'near');
+  assert.equal(universalDepositQuote.legs.length, 1);
+  assert.equal(universalDepositQuote.legs[0]!.originWalletNetwork, 'evm');
+
+  const newUserSwapToSol = await resolveUserIntentQuote({
+    userAddress: universalAcct,
+    prompt: 'Swap $5 to SOL',
+    dry: true,
+    network: 'mainnet',
+    connectedWallets: [
+      { network: 'evm', address: '0xd8da6bf26964af9d7eed9e03e53415d37aa96045' },
+      { network: 'svm', address: sender },
+    ],
+    tokensOverride: mainnetTokens,
+    holdingsOverride: [
+      {
+        source: 'external',
+        walletNetwork: 'evm',
+        walletAddress: '0xd8da6bf26964af9d7eed9e03e53415d37aa96045',
+        token: baseUsdc,
+        chainLabel: 'Base',
+        hexChainId: '0x2105',
+        balanceAtomic: '25000000',
+        balanceFormatted: 25,
+        balanceUsd: 25,
+        hasNativeGas: true,
+      },
+    ],
+  });
+  assert.equal(newUserSwapToSol.action, 'swap');
+  assert.equal(newUserSwapToSol.destinationToken.symbol.toUpperCase(), 'SOL');
+  assert.equal(newUserSwapToSol.legs[0]!.originWalletNetwork, 'evm');
+
+  const newUserSwapToNear = await resolveUserIntentQuote({
+    userAddress: universalAcct,
+    prompt: 'Swap $5 to NEAR',
+    dry: true,
+    network: 'mainnet',
+    connectedWallets: [
+      { network: 'evm', address: '0xd8da6bf26964af9d7eed9e03e53415d37aa96045' },
+    ],
+    tokensOverride: mainnetTokens,
+    holdingsOverride: [
+      {
+        source: 'external',
+        walletNetwork: 'evm',
+        walletAddress: '0xd8da6bf26964af9d7eed9e03e53415d37aa96045',
+        token: baseUsdc,
+        chainLabel: 'Base',
+        hexChainId: '0x2105',
+        balanceAtomic: '25000000',
+        balanceFormatted: 25,
+        balanceUsd: 25,
+        hasNativeGas: true,
+      },
+    ],
+  });
+  assert.equal(newUserSwapToNear.action, 'swap');
+  assert.equal(newUserSwapToNear.destinationToken.blockchain, 'near');
+  assert.equal(newUserSwapToNear.legs[0]!.originWalletNetwork, 'evm');
+
+  // 7. Regression: Deposit excludes internal Smart Account dust (e.g. wNEAR on NEAR Testnet),
+  //    pools multi-chain EVM Sepolia ETH cleanly up to 0.006 ETH per chain, and reports
+  //    testnet bridge per-swap caps accurately instead of contradictory "$314.82 < $100" errors.
+  const nearTestnetWnear = testnetTokens.find(
+    tok => tok.blockchain === 'near' && tok.symbol.toUpperCase() === 'WNEAR',
+  );
+  assert.ok(nearTestnetWnear, 'Testnet wNEAR exists in Tidepool catalog');
+
+  const multiLegTestnetDeposit = await resolveUserIntentQuote({
+    userAddress: universalAcct,
+    prompt: 'Deposit $18',
+    dry: true,
+    network: 'testnet',
+    connectedWallets: [
+      { network: 'evm', address: '0x89caf60b0e742b9299e14d611b205870207b5ce3' },
+      { network: 'svm', address: sender },
+    ],
+    tokensOverride: testnetTokens,
+    holdingsOverride: [
+      {
+        source: 'account',
+        walletNetwork: 'near',
+        walletAddress: universalAcct,
+        token: nearTestnetWnear,
+        chainLabel: 'NEAR Testnet',
+        balanceAtomic: '146300000000000000000000',
+        balanceFormatted: 0.1463,
+        balanceUsd: 0.47,
+        hasNativeGas: true,
+      },
+      {
+        source: 'external',
+        walletNetwork: 'svm',
+        walletAddress: sender,
+        token: solTestnet,
+        chainLabel: 'Solana Devnet',
+        balanceAtomic: '16980000000',
+        balanceFormatted: 16.98,
+        balanceUsd: 16.98 * solTestnet.price,
+        hasNativeGas: true,
+      },
+      {
+        source: 'external',
+        walletNetwork: 'evm',
+        walletAddress: '0x89caf60b0e742b9299e14d611b205870207b5ce3',
+        token: arbEth,
+        chainLabel: 'Arbitrum Sepolia',
+        hexChainId: '0x66eee',
+        balanceAtomic: '133800000000000000',
+        balanceFormatted: 0.1338,
+        balanceUsd: 0.1338 * arbEth.price,
+        hasNativeGas: true,
+      },
+      {
+        source: 'external',
+        walletNetwork: 'evm',
+        walletAddress: '0x89caf60b0e742b9299e14d611b205870207b5ce3',
+        token: baseEth,
+        chainLabel: 'Base Sepolia',
+        hexChainId: '0x14a34',
+        balanceAtomic: '47600000000000000',
+        balanceFormatted: 0.0476,
+        balanceUsd: 0.0476 * baseEth.price,
+        hasNativeGas: true,
+      },
+    ],
+  });
+  assert.equal(multiLegTestnetDeposit.action, 'deposit');
+  assert.ok(
+    multiLegTestnetDeposit.legs.every(l => l.source === 'external' && l.originToken.blockchain !== 'near'),
+    'Deposit never pulls internal Smart Account wNEAR dust',
+  );
+  assert.ok(Number(multiLegTestnetDeposit.totalOutFormatted) >= 17);
+
+  await assert.rejects(
+    () =>
+      resolveUserIntentQuote({
+        userAddress: universalAcct,
+        prompt: 'Deposit $100',
+        dry: true,
+        network: 'testnet',
+        connectedWallets: [
+          { network: 'evm', address: '0x89caf60b0e742b9299e14d611b205870207b5ce3' },
+          { network: 'svm', address: sender },
+        ],
+        tokensOverride: testnetTokens,
+        holdingsOverride: [
+          {
+            source: 'account',
+            walletNetwork: 'near',
+            walletAddress: universalAcct,
+            token: nearTestnetWnear,
+            chainLabel: 'NEAR Testnet',
+            balanceAtomic: '146300000000000000000000',
+            balanceFormatted: 0.1463,
+            balanceUsd: 0.47,
+            hasNativeGas: true,
+          },
+          {
+            source: 'external',
+            walletNetwork: 'svm',
+            walletAddress: sender,
+            token: solTestnet,
+            chainLabel: 'Solana Devnet',
+            balanceAtomic: '16980000000',
+            balanceFormatted: 16.98,
+            balanceUsd: 16.98 * solTestnet.price,
+            hasNativeGas: true,
+          },
+          {
+            source: 'external',
+            walletNetwork: 'evm',
+            walletAddress: '0x89caf60b0e742b9299e14d611b205870207b5ce3',
+            token: arbEth,
+            chainLabel: 'Arbitrum Sepolia',
+            hexChainId: '0x66eee',
+            balanceAtomic: '133800000000000000',
+            balanceFormatted: 0.1338,
+            balanceUsd: 0.1338 * arbEth.price,
+            hasNativeGas: true,
+          },
+          {
+            source: 'external',
+            walletNetwork: 'evm',
+            walletAddress: '0x89caf60b0e742b9299e14d611b205870207b5ce3',
+            token: baseEth,
+            chainLabel: 'Base Sepolia',
+            hexChainId: '0x14a34',
+            balanceAtomic: '47600000000000000',
+            balanceFormatted: 0.0476,
+            balanceUsd: 0.0476 * baseEth.price,
+            hasNativeGas: true,
+          },
+        ],
+      }),
+    (err: { message?: string }) => {
+      assert.match(err.message ?? '', /Testnet bridge per-swap cap/i);
+      assert.doesNotMatch(err.message ?? '', /wNEAR/i);
+      assert.doesNotMatch(err.message ?? '', /NEAR Testnet/i);
+      return true;
+    },
+  );
 });
