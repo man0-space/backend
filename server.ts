@@ -1165,6 +1165,99 @@ export async function build(deps: ServerDeps = {}) {
     ]);
     return normalized;
   });
+  app.get('/api/catalog/:kind', async request => {
+    const { kind: kindParam } = request.params as { kind: string };
+    const { refresh } = (request.query ?? {}) as { refresh?: string };
+    return catalog(kindParam, refresh === '1' || refresh === 'true');
+  });
+  app.get('/api/workflows', async request => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    return attachCreatorProfiles(await workflows.list(authUser.userAddress));
+  });
+  app.post('/api/workflows', async request => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const saved = await workflows.save(
+      graph.parse(request.body),
+      authUser.userAddress,
+      request.headers['if-match'] as string | undefined,
+    );
+    const [enriched] = await attachCreatorProfiles([saved]);
+    return enriched!;
+  });
+  app.get('/api/workflows/:id', async request => {
+    const id = z.string().uuid().parse((request.params as { id: string }).id);
+    const raw = bearer(request.headers.authorization);
+    const authUser = raw ? await token.read(raw).catch(() => null) : null;
+    const found = await workflows.get(id, authUser?.userAddress);
+    const [enriched] = await attachCreatorProfiles([found]);
+    return enriched!;
+  });
+  app.delete('/api/workflows/:id', async (request, reply) => {
+    const user = await token.authorize(bearer(request.headers.authorization));
+    const id = z.string().uuid().parse((request.params as { id: string }).id);
+    const match = z.string().datetime().parse(request.headers['if-match']);
+    await workflows.remove(id, user.userAddress, match);
+    reply.code(204).send();
+  });
+  app.post('/api/workflows/:id/publish', async request => {
+    const user = await token.authorize(bearer(request.headers.authorization));
+    const id = z.string().uuid().parse((request.params as { id: string }).id);
+    const match = z.string().datetime().parse(request.headers['if-match']);
+    const data = terms.parse(request.body);
+    const flow = await workflows.get(id, user.userAddress);
+    if (flow.userAddress !== user.userAddress)
+      throw Object.assign(new Error('This workflow belongs to another creator.'), {
+        statusCode: 403,
+      });
+    if (!flow.nodes.length || flow.nodes.some(node => !node.data.entry))
+      throw Object.assign(new Error('Choose a catalog entry for every step before publishing.'), {
+        statusCode: 400,
+      });
+    const roles = [...new Set(flow.nodes.map(node => node.data.kind))];
+    const catalogs = await Promise.all(roles.map(async role => [role, await catalog(role)] as const));
+    for (const node of flow.nodes)
+      if (!catalogs.find(([role]) => role === node.data.kind)![1].some(entry => entry.id === node.data.entry!.id))
+        throw Object.assign(new Error(`Choose an available ${node.data.kind} before publishing.`), {
+          statusCode: 400,
+        });
+
+    if (data.chainWorkflowId !== undefined) {
+      const targetContract = data.contractId ?? config.contracts.workflow;
+      const targetNetwork = targetContract.endsWith('.testnet') ? 'testnet' : 'mainnet';
+      const resolved = await resolveUserAddressOnNetwork(user.userAddress, targetNetwork);
+      const onChain = await viewContract<{
+        workflow_id: number;
+        creator: string;
+        owner: string;
+        workflow_card_uri: string;
+      } | null>({
+        contractId: targetContract,
+        methodName: 'get_workflow',
+        args: { workflow_id: data.chainWorkflowId },
+      });
+      if (!onChain) {
+        throw Object.assign(
+          new Error(`On-chain workflow #${data.chainWorkflowId} was not found on ${targetContract}.`),
+          { statusCode: 400 },
+        );
+      }
+      if (
+        onChain.creator !== resolved.signerId &&
+        onChain.owner !== resolved.signerId &&
+        onChain.creator !== user.userAddress &&
+        onChain.owner !== user.userAddress
+      ) {
+        throw Object.assign(
+          new Error(`On-chain workflow #${data.chainWorkflowId} does not belong to your account.`),
+          { statusCode: 403 },
+        );
+      }
+    }
+
+    const published = await workflows.publish(id, user.userAddress, data, match);
+    const [enriched] = await attachCreatorProfiles([published]);
+    return enriched!;
+  });
 
   return app;
 }
