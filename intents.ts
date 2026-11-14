@@ -2250,51 +2250,96 @@ export async function generateUserIntent(
   userAddress: string,
   input: {
     depositAddress: string;
+    assetId?: string;
+    amountAtomic?: string;
+    memo?: string;
   },
 ): Promise<{
   mode: 'submitted';
+  submittedOnChain?: boolean;
+  txHash?: string;
   intentHash: string;
   correlationId: string;
 }> {
-  configureOneClickBase(config.network);
+  const activeNet = config.network;
+  configureOneClickBase(activeNet);
   const rec = await ensureSpendingRecord(userAddress);
   await ensureDepositReady(userAddress);
   if (!derive(rec.seedId).equals(rec.ownerCompressedKey)) {
     throw Object.assign(new Error('Account authorization mismatch.'), { statusCode: 401 });
   }
 
+  const intentsMeta = await discoverNearIntentsContracts(activeNet).catch(() => null);
+  const verifier =
+    intentsMeta?.verifier ??
+    (activeNet === 'mainnet' ? 'intents.near' : 'verifier.tidepool-sandbox.testnet');
+
+  const assetId = input.assetId?.trim();
+  const amountAtomic = input.amountAtomic?.trim();
+  if (assetId && amountAtomic && /^[1-9]\d*$/.test(amountAtomic)) {
+    const executed = await executeContractCall(userAddress, {
+      contractId: verifier,
+      methodName: 'mt_transfer',
+      args: {
+        receiver_id: input.depositAddress,
+        token_id: assetId,
+        amount: amountAtomic,
+        approval: null,
+        memo: input.memo?.trim() || null,
+      },
+      deposit: '1',
+      gas: 100_000_000_000_000,
+    });
+    await submitUserDepositTx({
+      txHash: executed.txHash,
+      depositAddress: input.depositAddress,
+      nearSenderAccount: executed.signerId,
+      ...(input.memo?.trim() ? { memo: input.memo.trim() } : {}),
+    }).catch(() => undefined);
+    await invalidateNearBalanceCache(userAddress);
+    return {
+      mode: 'submitted',
+      submittedOnChain: true,
+      txHash: executed.txHash,
+      intentHash: executed.txHash,
+      correlationId: executed.txHash,
+    };
+  }
+
   const signerId = rec.activeMainAddress;
-  const generated = await OneClickService.generateIntent({
-    type: GenerateSwapTransferIntentRequest.type.SWAP_TRANSFER,
-    standard: IntentStandardEnum.WEBAUTHN,
-    signerId,
-    depositAddress: input.depositAddress,
-  });
-  const payload = String(generated.intent.payload);
-  const challenge32 = createHash('sha256').update(payload, 'utf8').digest();
-  const publicKey = intentsPublicKey('p256', rec.ownerCompressedKey);
-  const proof = signWebAuthnP256(
-    derivePrivate(rec.seedId),
-    challenge32,
-    'https://man0.space',
-    'man0.space',
-  );
-  const submitted = await OneClickService.submitIntent({
-    type: SubmitSwapTransferIntentRequest.type.SWAP_TRANSFER,
-    signedData: {
-      standard: 'webauthn' as MultiPayload.standard,
-      payload,
-      public_key: publicKey,
-      signature: proof.signature,
-      authenticator_data: proof.authenticator_data,
-      client_data_json: proof.client_data_json,
-    } as MultiPayload,
-  });
-  return {
-    mode: 'submitted',
-    intentHash: submitted.intentHash,
-    correlationId: submitted.correlationId,
-  };
+  const edKey = deriveIntentsEd25519(rec.seedId);
+  await ensureIntentsPublicKeyRegistered(userAddress, edKey.intentsKey, verifier);
+
+  try {
+    const generated = await OneClickService.generateIntent({
+      type: GenerateSwapTransferIntentRequest.type.SWAP_TRANSFER,
+      standard: IntentStandardEnum.RAW_ED25519,
+      signerId,
+      depositAddress: input.depositAddress,
+    });
+    const payload = String(generated.intent.payload);
+    const sig = ed25519.sign(Buffer.from(payload, 'utf8'), edKey.secretKey32);
+    const submitted = await OneClickService.submitIntent({
+      type: SubmitSwapTransferIntentRequest.type.SWAP_TRANSFER,
+      signedData: {
+        standard: 'raw_ed25519' as MultiPayload.standard,
+        payload,
+        public_key: edKey.intentsKey,
+        signature: `ed25519:${base58.encode(sig)}`,
+      } as MultiPayload,
+    });
+    await invalidateNearBalanceCache(userAddress);
+    return {
+      mode: 'submitted',
+      intentHash: submitted.intentHash,
+      correlationId: submitted.correlationId,
+    };
+  } catch (err) {
+    throw Object.assign(
+      new Error(extractOneClickErrorMessage(err, 'Failed to generate or submit NEAR intent.')),
+      { statusCode: err instanceof ApiError ? err.status : 400 },
+    );
+  }
 }
 
 export async function submitUserDepositTx(input: {
@@ -2304,12 +2349,19 @@ export async function submitUserDepositTx(input: {
   memo?: string;
 }): Promise<SubmitDepositTxResponse> {
   configureOneClickBase(config.network);
-  return OneClickService.submitDepositTx({
-    txHash: input.txHash,
-    depositAddress: input.depositAddress,
-    ...(input.nearSenderAccount ? { nearSenderAccount: input.nearSenderAccount } : {}),
-    ...(input.memo ? { memo: input.memo } : {}),
-  });
+  try {
+    return await OneClickService.submitDepositTx({
+      txHash: input.txHash,
+      depositAddress: input.depositAddress,
+      ...(input.nearSenderAccount ? { nearSenderAccount: input.nearSenderAccount } : {}),
+      ...(input.memo ? { memo: input.memo } : {}),
+    });
+  } catch (err) {
+    throw Object.assign(
+      new Error(extractOneClickErrorMessage(err, 'Failed to submit deposit transaction.')),
+      { statusCode: err instanceof ApiError ? err.status : 400 },
+    );
+  }
 }
 
 export async function getUserIntentStatus(input: {
@@ -2317,7 +2369,14 @@ export async function getUserIntentStatus(input: {
   depositMemo?: string;
 }): Promise<GetExecutionStatusResponse> {
   configureOneClickBase(config.network);
-  return OneClickService.getExecutionStatus(input.depositAddress, input.depositMemo);
+  try {
+    return await OneClickService.getExecutionStatus(input.depositAddress, input.depositMemo);
+  } catch (err) {
+    throw Object.assign(
+      new Error(extractOneClickErrorMessage(err, 'Failed to fetch transfer status.')),
+      { statusCode: err instanceof ApiError ? err.status : 400 },
+    );
+  }
 }
 
 interface SolanaInstructionAccount {
