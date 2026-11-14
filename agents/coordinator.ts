@@ -791,7 +791,7 @@ function buildCoordinatorMessage(params: {
       bindingId && completed === undefined && !dry
         ? isAuthorizedConnector
           ? actionSummary
-            ? `   connectorRule: Pre-registered as "connector:${bindingLower}" — invoke connectors_call({ connectorRef: "connector:${bindingLower}", action: "<ACTION>", args: { ... } }) directly using the schema below (if a required parent/resource ID is needed first, call a search/list action on "connector:${bindingLower}" to obtain it, then call the write action).\n   actions (* = required):\n${actionSummary}`
+            ? `   connectorRule: Pre-registered as "connector:${bindingLower}" — invoke connectors_call({ connectorRef: "connector:${bindingLower}", action: "<ACTION>", args: { ... } }) directly using the schema below (if a required parent/container ID is not explicitly provided in this request, perform at most ONE targeted search/list call to obtain a top-level parent container, then execute the write action; NEVER browse, inspect, or modify unrelated existing pages or items).\n   actions (* = required):\n${actionSummary}`
             : `   connectorRule: Pre-registered as "connector:${bindingLower}" — invoke connectors_call({ connectorRef: "connector:${bindingLower}", action: "<ACTION>", args: { ... } }) or discover actions via connectors_find -> connector_select({ bindingId: "${bindingId}" }).`
           : `   connectorRule: Discover/select "${bindingId}" via connectors_find -> connector_select (or propose_connector if authorization is required), then execute the connector action.`
         : '',
@@ -805,10 +805,14 @@ function buildCoordinatorMessage(params: {
       .join('\n');
   };
 
+  const isolationRule =
+    'Isolation: Treat this run as strictly self-contained. NEVER access, modify, or cite URLs, page IDs, database IDs, or artifacts from prior workflows or unrelated workspace items not explicitly provided in this User request, step instructions, or Completed upstream outputs.';
+
   if (isResumingThread && completedNodes.length > 0 && firstPending) {
     return [
       `RESUME WORKFLOW "${flow.name}" STARTING IMMEDIATELY AT STEP [${firstPending.id}] "${firstPending.data.label}".`,
       `Steps already completed in this thread (${completedNodes.map(n => `[${n.id}] "${n.data.label}"`).join(', ')}) are IMMUTABLE — DO NOT re-run, re-select, or re-execute any completed step.`,
+      isolationRule,
       dry
         ? 'Mode: DRY RUN — do NOT mutate external accounts or submit irreversible transactions.'
         : 'Mode: LIVE RUN — execute all pending external connector actions and deliver the upstream output.',
@@ -829,6 +833,7 @@ function buildCoordinatorMessage(params: {
     `Execute workflow "${flow.name}".`,
     flow.brief?.trim() ? `Brief: ${flow.brief.trim()}` : '',
     coordinator.personality?.trim() ? `Directive: ${coordinator.personality.trim()}` : '',
+    isolationRule,
     dry
       ? 'Mode: DRY RUN — execute read/model steps, do NOT mutate external accounts or submit irreversible transactions.'
       : 'Mode: LIVE RUN — execute every step including external connector deliveries.',
