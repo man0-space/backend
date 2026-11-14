@@ -930,24 +930,53 @@ export interface LinkedWalletRecord {
   publicKey: string;
   status: 'pending' | 'active' | 'failed';
   transaction: string | null;
+  providerRdns?: string;
+  providerName?: string;
+}
+
+function parseLinkAuthMeta(raw: unknown): { providerRdns?: string; providerName?: string } {
+  let obj: Record<string, unknown> | null = null;
+  if (raw && typeof raw === 'object') {
+    obj = raw as Record<string, unknown>;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object') {
+        obj = parsed as Record<string, unknown>;
+      }
+    } catch {
+      obj = null;
+    }
+  }
+  if (!obj) return {};
+  const rdns = typeof obj.rdns === 'string' ? obj.rdns.trim() : '';
+  const walletName = typeof obj.walletName === 'string' ? obj.walletName.trim() : '';
+  return {
+    ...(rdns ? { providerRdns: rdns } : {}),
+    ...(walletName ? { providerName: walletName } : {}),
+  };
 }
 
 export async function listLinkedWallets(userAddress: string): Promise<LinkedWalletRecord[]> {
   const rows = await user`
-    SELECT id, "userAddress", network, address, "publicKey", status, transaction
+    SELECT id, "userAddress", network, address, "publicKey", status, transaction, "authorization"
     FROM links
     WHERE "userAddress" = ${userAddress}
     ORDER BY created ASC
   `;
-  return rows.map(row => ({
-    id: row.id as string,
-    userAddress: row.userAddress as string,
-    network: row.network as 'evm' | 'svm',
-    address: row.address as string,
-    publicKey: row.publicKey as string,
-    status: row.status as 'pending' | 'active' | 'failed',
-    transaction: (row.transaction as string | null) ?? null,
-  }));
+  return rows.map(row => {
+    const meta = parseLinkAuthMeta(row.authorization);
+    return {
+      id: row.id as string,
+      userAddress: row.userAddress as string,
+      network: row.network as 'evm' | 'svm',
+      address: row.address as string,
+      publicKey: row.publicKey as string,
+      status: row.status as 'pending' | 'active' | 'failed',
+      transaction: (row.transaction as string | null) ?? null,
+      ...meta,
+    };
+  });
 }
 
 export async function attachExternalWallet(
@@ -955,12 +984,14 @@ export async function attachExternalWallet(
   input: {
     network: 'evm' | 'svm';
     address: string;
+    providerRdns?: string;
+    providerName?: string;
   },
 ): Promise<LinkedWalletRecord> {
   const normalizedAddress = normalizeExternalAddress(input.network, input.address);
 
   const [existingLink] = await user`
-    SELECT id, "userAddress" FROM links
+    SELECT id, "userAddress", "authorization" FROM links
     WHERE network = ${input.network} AND address = ${normalizedAddress}
   `;
   if (existingLink && existingLink.userAddress !== userAddress) {
@@ -970,8 +1001,16 @@ export async function attachExternalWallet(
     );
   }
 
+  const prevMeta = parseLinkAuthMeta(existingLink?.authorization);
+  const cleanRdns = input.providerRdns?.trim() || prevMeta.providerRdns || '';
+  const cleanName = input.providerName?.trim() || prevMeta.providerName || '';
+
   const linkId = (existingLink?.id as string | undefined) ?? randomBytes(16).toString('hex');
-  const serializedAuth = JSON.stringify({ mode: 'smart' });
+  const serializedAuth = JSON.stringify({
+    mode: 'smart',
+    ...(cleanRdns ? { rdns: cleanRdns } : {}),
+    ...(cleanName ? { walletName: cleanName } : {}),
+  });
   const [saved] = await user`
     INSERT INTO links(id, "userAddress", network, address, "publicKey", status, "authorization", modified)
     VALUES (
@@ -986,10 +1025,12 @@ export async function attachExternalWallet(
     )
     ON CONFLICT (network, address) DO UPDATE
     SET status = 'active',
+        "authorization" = EXCLUDED."authorization",
         modified = now()
-    RETURNING id, "userAddress", network, address, "publicKey", status, transaction
+    RETURNING id, "userAddress", network, address, "publicKey", status, transaction, "authorization"
   `;
 
+  const meta = parseLinkAuthMeta(saved.authorization);
   return {
     id: saved.id as string,
     userAddress: saved.userAddress as string,
@@ -998,7 +1039,34 @@ export async function attachExternalWallet(
     publicKey: saved.publicKey as string,
     status: 'active',
     transaction: (saved.transaction as string | null) ?? null,
+    ...meta,
   };
+}
+
+export async function detachExternalWallet(
+  userAddress: string,
+  linkId: string,
+): Promise<{ removed: boolean; id: string }> {
+  const cleanId = linkId.trim();
+  if (!cleanId) {
+    throw Object.assign(new Error('Wallet link ID is required.'), { statusCode: 400 });
+  }
+  const [existing] = await user`
+    SELECT id, "userAddress" FROM links WHERE id = ${cleanId}
+  `;
+  if (!existing) {
+    throw Object.assign(new Error('Linked wallet not found.'), { statusCode: 404 });
+  }
+  if (existing.userAddress !== userAddress) {
+    throw Object.assign(
+      new Error('Cannot remove a wallet linked to another account.'),
+      { statusCode: 403 },
+    );
+  }
+  await user`
+    DELETE FROM links WHERE id = ${cleanId} AND "userAddress" = ${userAddress}
+  `;
+  return { removed: true, id: cleanId };
 }
 
 export async function assertAllowedNearContract(
