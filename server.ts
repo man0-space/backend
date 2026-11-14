@@ -997,5 +997,34 @@ export async function build(deps: ServerDeps = {}) {
     );
   });
 
+  app.get('/api/policy', async () => ({ hash: consent.hash, ...consent.policy }));
+  app.get('/api/consent', async request =>
+    consent.read((await token.read(bearer(request.headers.authorization))).userAddress),
+  );
+  app.post('/api/consent', async request => {
+    const raw = bearer(request.headers.authorization);
+    const user = await token.read(raw);
+    const accepted = await consent.accept(
+      request.body,
+      user.userAddress,
+      digest(raw!),
+      request.headers['user-agent'],
+    );
+    await token.invalidateUserSessions(user.userAddress, raw);
+    return accepted;
+  });
+  app.get('/api/user', async request =>
+    token.read(bearer(request.headers.authorization), { reconcileIfNeeded: true }),
+  );
+  app.delete('/api/auth', async (request, reply) => {
+    const raw = bearer(request.headers.authorization);
+    const current = await token.read(raw);
+    await Promise.all([
+      token.destroy(raw!),
+      token.invalidateUserSessions(current.userAddress, raw),
+    ]);
+    reply.code(204).send();
+  });
+
   return app;
 }
