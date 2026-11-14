@@ -2148,5 +2148,23 @@ export async function build(deps: ServerDeps = {}) {
     },
   );
 
+  app.get('/api/market', async () => attachCreatorProfiles(await workflows.list()));
+  app.get('/api/draft', async request =>
+    workflows.current((await token.authorize(bearer(request.headers.authorization))).userAddress),
+  );
+  app.put('/api/draft', async request => {
+    const user = await token.authorize(bearer(request.headers.authorization));
+    return workflows.draft(
+      graph.parse(request.body),
+      user.userAddress,
+      request.headers['if-match'] as string | undefined,
+    );
+  });
+  app.delete('/api/draft', async (request, reply) => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    await workflows.clearDraft(authUser.userAddress);
+    reply.code(204).send();
+  });
+
   return app;
 }
