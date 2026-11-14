@@ -1609,11 +1609,16 @@ export async function resolveUserIntentQuote(input: {
   ];
 
   if (action === 'withdraw') {
-    const withdrawable = holdings.filter(
-      h =>
-        (h.source === 'account' || h.source === 'intents') &&
-        h.token.assetId === nearUsdcToken.assetId,
-    );
+    const withdrawable = holdings
+      .filter(
+        h =>
+          (h.source === 'account' || h.source === 'intents') &&
+          h.token.assetId === nearUsdcToken.assetId,
+      )
+      .sort((a, b) => {
+        const diff = BigInt(b.balanceAtomic) - BigInt(a.balanceAtomic);
+        return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+      });
     const primaryHolding = withdrawable[0];
     const availableAtomic = BigInt(primaryHolding?.balanceAtomic ?? '0');
     const reqAtomic =
@@ -1633,12 +1638,24 @@ export async function resolveUserIntentQuote(input: {
     const destChainHint = detectChainInSegment(destSegment, tokens);
     const destSymbolHint = detectSymbolInSegment(destSegment, tokens);
     const explicitRecipient = extractExplicitAddress(destSegment);
+    const wantsEvmDest = /\b(evm|metamask)\b/i.test(destSegment);
+    const wantsSvmDest = /\b(svm|phantom)\b/i.test(destSegment);
 
-    const externalHoldings = holdings.filter(h => h.source === 'external');
+    const externalHoldings = holdings.filter(h => {
+      if (h.source !== 'external') return false;
+      if (wantsEvmDest && !wantsSvmDest) return h.walletNetwork === 'evm';
+      if (wantsSvmDest && !wantsEvmDest) return h.walletNetwork === 'svm';
+      return true;
+    });
     const fallbackFamily =
-      externalWallets.some(w => w.network === 'svm') && !externalWallets.some(w => w.network === 'evm')
+      wantsSvmDest && !wantsEvmDest
         ? 'svm'
-        : 'evm';
+        : wantsEvmDest && !wantsSvmDest
+          ? 'evm'
+          : externalWallets.some(w => w.network === 'svm') &&
+              !externalWallets.some(w => w.network === 'evm')
+            ? 'svm'
+            : 'evm';
     const fallbackChain = [...chainMap.values()].find(c => c.walletFamily === fallbackFamily)?.blockchain;
 
     const inferredChain =
@@ -1676,6 +1693,25 @@ export async function resolveUserIntentQuote(input: {
     }
 
     const destChainLabel = chainMap.get(pickedDest.blockchain)?.label ?? formatChainLabel(pickedDest.blockchain);
+    const withdrawDestMeta = chainMap.get(pickedDest.blockchain);
+    if (!pickedDest.contractAddress && withdrawDestMeta?.maxSwapCapDecimal) {
+      const reqUsd = atomicToDecimal(reqAtomic, nearUsdcToken.decimals);
+      const maxPayoutUsd = withdrawDestMeta.maxSwapCapDecimal * effectiveTokenUsdPrice(pickedDest);
+      if (reqUsd > maxPayoutUsd * 1.05) {
+        const safeOutUsd = (Math.floor(maxPayoutUsd * 90) / 100).toFixed(2);
+        const hasChainUsdc = tokens.some(
+          t => t.blockchain === pickedDest.blockchain && t.symbol.toUpperCase() === 'USDC',
+        );
+        throw Object.assign(
+          new Error(
+            `Testnet bridge payout cap: ${destChainLabel} caps native ${pickedDest.symbol} payouts at ${withdrawDestMeta.maxSwapCapDecimal} ${pickedDest.symbol} (~$${maxPayoutUsd.toFixed(2)}) per withdrawal — try "Withdraw $${safeOutUsd} to ${pickedDest.symbol}"${
+              hasChainUsdc ? ` or "Withdraw $${reqUsd} to ${destChainLabel} USDC"` : ''
+            }.`,
+          ),
+          { statusCode: 400 },
+        );
+      }
+    }
     const leg = await quoteSingleLegWithRetry({
       network: activeNet,
       dry: input.dry,
@@ -1756,22 +1792,56 @@ export async function resolveUserIntentQuote(input: {
     recipientAddress = matchedRecipient;
   }
 
-  const smartAccountHoldings = holdings.filter(
-    h => h.source === 'account' || h.source === 'intents',
-  );
+  const depositAcctLower = depositAccountId.trim().toLowerCase();
+  const isInternalSmartAccountHolding = (h: WalletHolding): boolean =>
+    h.source === 'account' ||
+    h.walletAddress.trim().toLowerCase() === depositAcctLower ||
+    Boolean(h.intentsAccountId && h.intentsAccountId.trim().toLowerCase() === depositAcctLower);
+
+  const smartAccountHoldings = holdings.filter(isInternalSmartAccountHolding);
+  const externalSourceHoldings = holdings.filter(h => !isInternalSmartAccountHolding(h));
+  const spendableSmartAccountUsd = smartAccountHoldings.reduce((acc, h) => {
+    if (recipientAddress === depositAccountId && h.token.assetId === destToken.assetId) {
+      return acc;
+    }
+    const sp = maxSpendableAtomic(h, chainMap.get(h.token.blockchain));
+    return acc + atomicToDecimal(sp, h.token.decimals) * effectiveTokenUsdPrice(h.token);
+  }, 0);
   const hasExplicitExternalOrigin =
     originChainHints.some(ch => ch !== 'near') ||
     Boolean(
       originSymbolHint &&
         !smartAccountHoldings.some(h => h.token.symbol.toUpperCase() === originSymbolHint),
     );
-  const restrictToSmartAccount = action === 'swap' && !hasExplicitExternalOrigin;
+  const restrictToSmartAccount =
+    action === 'swap' &&
+    !hasExplicitExternalOrigin &&
+    (spendableSmartAccountUsd >= 0.1 || externalWallets.length === 0);
+
+  const hasExplicitInternalOrigin =
+    originChainHints.includes('near') ||
+    Boolean(
+      originSymbolHint &&
+        smartAccountHoldings.some(h => h.token.symbol.toUpperCase() === originSymbolHint) &&
+        !externalSourceHoldings.some(h => h.token.symbol.toUpperCase() === originSymbolHint),
+    );
+  const restrictToExternalSources =
+    action === 'deposit' && !hasExplicitInternalOrigin && externalWallets.length > 0;
 
   const candidatePool = holdings.filter(h => {
-    if (restrictToSmartAccount && h.source !== 'account' && h.source !== 'intents') {
+    if (restrictToSmartAccount && !isInternalSmartAccountHolding(h)) {
       return false;
     }
-    if (h.token.assetId === destToken.assetId && h.source === 'account') {
+    if (restrictToExternalSources && isInternalSmartAccountHolding(h)) {
+      return false;
+    }
+    if (
+      h.token.assetId === destToken.assetId &&
+      (h.source === 'account' ||
+        (h.source === 'intents' &&
+          recipientAddress === depositAccountId &&
+          (!h.intentsAccountId || h.intentsAccountId === depositAccountId)))
+    ) {
       return false;
     }
     if (h.source === 'external' && Boolean(h.token.contractAddress) && h.hasNativeGas === false) {
@@ -1824,8 +1894,14 @@ export async function resolveUserIntentQuote(input: {
       if (bySym.length > 0) {
         filtered = bySym;
       } else {
+        const testnetStableHint =
+          activeNet === 'testnet' && (originSymbolHint === 'USDC' || originSymbolHint === 'USDT')
+            ? ` (Note: standard Circle faucet ${originSymbolHint} uses a different contract than the NEAR Intents testnet bridge — omit "${originSymbolHint}" to fund from native ETH/SOL, or claim testnet ${originSymbolHint} at app.usetidepool.tech/faucet.)`
+            : '';
         throw Object.assign(
-          new Error(`No funded ${originSymbolHint} balance found in your connected wallets.`),
+          new Error(
+            `No funded ${originSymbolHint} balance found in your connected wallets.${testnetStableHint}`,
+          ),
           { statusCode: 400 },
         );
       }
@@ -1837,13 +1913,20 @@ export async function resolveUserIntentQuote(input: {
 
   const sortedCandidates = [...filtered]
     .map(h => {
-      const spendable = maxSpendableAtomic(h, chainMap.get(h.token.blockchain));
-      const spendableUsd =
-        atomicToDecimal(spendable, h.token.decimals) * effectiveTokenUsdPrice(h.token);
+      const chainMeta = chainMap.get(h.token.blockchain);
+      const rawSpendable = rawWalletSpendableAtomic(h);
+      const spendable = maxSpendableAtomic(h, chainMeta);
+      const price = effectiveTokenUsdPrice(h.token);
+      const rawSpendableUsd = atomicToDecimal(rawSpendable, h.token.decimals) * price;
+      const spendableUsd = atomicToDecimal(spendable, h.token.decimals) * price;
       return {
         holding: h,
+        chainMeta,
+        rawSpendable,
+        rawSpendableUsd,
         spendable,
         spendableUsd,
+        isBridgeCapped: rawSpendable > spendable,
       };
     })
     .filter(x => x.spendable > 0n)
@@ -1858,12 +1941,73 @@ export async function resolveUserIntentQuote(input: {
       if (Math.abs(b.spendableUsd - a.spendableUsd) > 1e-6) {
         return b.spendableUsd - a.spendableUsd;
       }
-      return b.holding.balanceUsd - a.holding.balanceUsd;
+      return b.rawSpendableUsd - a.rawSpendableUsd;
     });
 
   if (sortedCandidates.length === 0) {
     throw noFundedWalletError();
   }
+
+  const pickHighestCandidate = (cands: typeof sortedCandidates) =>
+    cands.reduce(
+      (best, cur) =>
+        cur.spendableUsd > best.spendableUsd + 1e-6 ||
+        (Math.abs(cur.spendableUsd - best.spendableUsd) <= 1e-6 &&
+          cur.rawSpendableUsd > best.rawSpendableUsd)
+          ? cur
+          : best,
+      cands[0]!,
+    );
+
+  const formatShortfallUsdError = (requestedUsd: number): Error => {
+    const totalSpendableUsd = sortedCandidates.reduce((acc, c) => acc + c.spendableUsd, 0);
+    const totalRawSpendableUsd = sortedCandidates.reduce((acc, c) => acc + c.rawSpendableUsd, 0);
+    if (restrictToSmartAccount) {
+      return Object.assign(
+        new Error(
+          `Insufficient Smart Account balance for this swap (~$${totalSpendableUsd.toFixed(2)} available). Deposit funds first or specify an external origin chain.`,
+        ),
+        { statusCode: 400 },
+      );
+    }
+    const cappedCandidates = sortedCandidates.filter(c => c.isBridgeCapped);
+    if (cappedCandidates.length > 0 && totalRawSpendableUsd >= totalSpendableUsd + 0.05) {
+      const capSummaries = cappedCandidates.map(c => {
+        const capDec = atomicToDecimal(c.spendable, c.holding.token.decimals);
+        const capTokenStr = Number(capDec.toFixed(Math.min(6, c.holding.token.decimals)));
+        return `${capTokenStr} ${c.holding.token.symbol} (~$${c.spendableUsd.toFixed(2)}) on ${c.holding.chainLabel}`;
+      });
+      const safeMaxUsd = totalSpendableUsd * 0.95;
+      const suggestedUsd =
+        safeMaxUsd >= 1
+          ? `$${Math.floor(safeMaxUsd)}`
+          : `$${(Math.floor(safeMaxUsd * 100) / 100).toFixed(2)}`;
+      const verb = action === 'deposit' ? 'Deposit' : 'Swap';
+      const prefix =
+        totalRawSpendableUsd >= requestedUsd * 0.95
+          ? `Testnet bridge per-swap cap: your connected wallets hold ~$${totalRawSpendableUsd.toFixed(2)}, but the testnet bridge caps native gas swaps at ${capSummaries.join(', ')}`
+          : `Insufficient single-swap capacity: ~$${totalRawSpendableUsd.toFixed(2)} in connected wallets, capped by the testnet bridge at ${capSummaries.join(', ')}`;
+      return Object.assign(
+        new Error(
+          `${prefix} — max ~$${totalSpendableUsd.toFixed(2)} per ${action}. Try "${verb} ${suggestedUsd}" or "${verb} max"${
+            activeNet === 'testnet'
+              ? ', or claim uncapped testnet USDC at app.usetidepool.tech/faucet'
+              : ''
+          }.`,
+        ),
+        { statusCode: 400 },
+      );
+    }
+    const best = pickHighestCandidate(sortedCandidates);
+    const bestDec = atomicToDecimal(best.spendable, best.holding.token.decimals);
+    const bestStr = Number(bestDec.toFixed(Math.min(4, best.holding.token.decimals)));
+    return Object.assign(
+      new Error(
+        `Insufficient spendable balance: ~$${totalSpendableUsd.toFixed(2)} available across connected wallets (highest: ${bestStr} ${best.holding.token.symbol} / ~$${best.spendableUsd.toFixed(2)} on ${best.holding.chainLabel}).`,
+      ),
+      { statusCode: 400 },
+    );
+  };
 
   if (!input.dry && recipientAddress === depositAccountId) {
     await ensureDepositReady(input.userAddress);
@@ -1931,16 +2075,37 @@ export async function resolveUserIntentQuote(input: {
         lastQuoteError = err;
       }
     }
-    if (legs.length === 0 && lastQuoteError) {
-      throw lastQuoteError;
-    }
     if (remainingTokens > parsedAmount.value * 0.02) {
-      const best = sortedCandidates[0]!.holding;
+      if (lastQuoteError) {
+        throw lastQuoteError;
+      }
+      const cappedCandidates = sortedCandidates.filter(c => c.isBridgeCapped);
+      if (cappedCandidates.length > 0) {
+        const totalCapTokens = sortedCandidates.reduce(
+          (acc, c) => acc + atomicToDecimal(c.spendable, c.holding.token.decimals),
+          0,
+        );
+        const totalRawTokens = sortedCandidates.reduce(
+          (acc, c) => acc + atomicToDecimal(c.rawSpendable, c.holding.token.decimals),
+          0,
+        );
+        const sym = sortedCandidates[0]!.holding.token.symbol;
+        if (totalRawTokens > totalCapTokens + 1e-6) {
+          throw Object.assign(
+            new Error(
+              `Testnet bridge per-swap cap: your connected wallets hold ${Number(totalRawTokens.toFixed(4))} ${sym}, but the testnet bridge caps swaps at ${Number(totalCapTokens.toFixed(4))} ${sym} total across ${cappedCandidates.map(c => c.holding.chainLabel).join(', ')}.`,
+            ),
+            { statusCode: 400 },
+          );
+        }
+      }
+      const best = pickHighestCandidate(sortedCandidates);
+      const bestDec = atomicToDecimal(best.spendable, best.holding.token.decimals);
       throw Object.assign(
         new Error(
-          `Insufficient funded balance: highest spendable balance is ${best.balanceFormatted.toFixed(
-            Math.min(4, best.token.decimals),
-          )} ${best.token.symbol} (~$${sortedCandidates[0]!.spendableUsd.toFixed(2)}) on ${best.chainLabel}.`,
+          `Insufficient funded balance: highest spendable balance is ${Number(
+            bestDec.toFixed(Math.min(4, best.holding.token.decimals)),
+          )} ${best.holding.token.symbol} (~$${best.spendableUsd.toFixed(2)}) on ${best.holding.chainLabel}.`,
         ),
         { statusCode: 400 },
       );
@@ -1948,17 +2113,28 @@ export async function resolveUserIntentQuote(input: {
   } else {
     const totalSpendableUsd = sortedCandidates.reduce((acc, c) => acc + c.spendableUsd, 0);
     if (totalSpendableUsd < parsedAmount.value * 0.95) {
-      const best = sortedCandidates[0]!;
-      throw Object.assign(
-        new Error(
-          restrictToSmartAccount
-            ? `Insufficient Smart Account balance for this swap (~$${totalSpendableUsd.toFixed(2)} available). Deposit funds first or swap a smaller amount.`
-            : `Insufficient spendable balance: ~$${totalSpendableUsd.toFixed(2)} available across connected wallets (highest: ${best.holding.balanceFormatted.toFixed(
-                Math.min(4, best.holding.token.decimals),
-              )} ${best.holding.token.symbol} / ~$${best.spendableUsd.toFixed(2)} spendable on ${best.holding.chainLabel}).`,
-        ),
-        { statusCode: 400 },
-      );
+      throw formatShortfallUsdError(parsedAmount.value);
+    }
+
+    if (action === 'swap') {
+      const destMeta = chainMap.get(destToken.blockchain);
+      if (!destToken.contractAddress && destMeta?.maxSwapCapDecimal) {
+        const maxPayoutUsd = destMeta.maxSwapCapDecimal * effectiveTokenUsdPrice(destToken);
+        if (parsedAmount.value > maxPayoutUsd * 1.05) {
+          const safeOutUsd = (Math.floor(maxPayoutUsd * 90) / 100).toFixed(2);
+          const hasChainUsdc = tokens.some(
+            t => t.blockchain === destToken.blockchain && t.symbol.toUpperCase() === 'USDC',
+          );
+          throw Object.assign(
+            new Error(
+              `Testnet bridge payout cap: ${destChainLabel} caps native ${destToken.symbol} payouts at ${destMeta.maxSwapCapDecimal} ${destToken.symbol} (~$${maxPayoutUsd.toFixed(2)}) per swap — try "Swap $${safeOutUsd} to ${destToken.symbol}"${
+                hasChainUsdc ? ` or "Swap $${parsedAmount.value} to ${destChainLabel} USDC"` : ''
+              }.`,
+            ),
+            { statusCode: 400 },
+          );
+        }
+      }
     }
 
     const explicitMultiChainCount = originChainHints.length >= 2 ? originChainHints.length : 1;
@@ -2020,22 +2196,11 @@ export async function resolveUserIntentQuote(input: {
       }
     }
 
-    if (legs.length === 0 && lastQuoteError) {
-      throw lastQuoteError;
-    }
     if (remainingUsd > Math.max(0.05, parsedAmount.value * 0.05)) {
-      const totalSpendableUsd = sortedCandidates.reduce((acc, c) => acc + c.spendableUsd, 0);
-      const best = sortedCandidates[0]!;
-      throw Object.assign(
-        new Error(
-          restrictToSmartAccount
-            ? `Insufficient Smart Account balance for this swap (~$${totalSpendableUsd.toFixed(2)} available). Deposit funds first or swap a smaller amount.`
-            : `Insufficient spendable balance: ~$${totalSpendableUsd.toFixed(2)} available across connected wallets (highest: ${best.holding.balanceFormatted.toFixed(
-                Math.min(4, best.holding.token.decimals),
-              )} ${best.holding.token.symbol} / ~$${best.spendableUsd.toFixed(2)} spendable on ${best.holding.chainLabel}).`,
-        ),
-        { statusCode: 400 },
-      );
+      if (lastQuoteError) {
+        throw lastQuoteError;
+      }
+      throw formatShortfallUsdError(parsedAmount.value);
     }
   }
 
