@@ -357,6 +357,9 @@ const intentsQuoteBody = z.object({
 
 const intentsGenerateBody = z.object({
   depositAddress: z.string().trim().min(1).max(256),
+  assetId: z.string().trim().min(1).max(256).optional(),
+  amountAtomic: z.string().regex(/^[1-9]\d*$/, 'Enter a positive amount.').optional(),
+  memo: z.string().trim().min(1).max(256).optional(),
 });
 
 const intentsDepositBody = z.object({
@@ -408,6 +411,9 @@ export async function nearRoutes(app: FastifyInstance) {
     const body = intentsGenerateBody.parse(request.body);
     return generateUserIntent(account.userAddress, {
       depositAddress: body.depositAddress,
+      assetId: body.assetId,
+      amountAtomic: body.amountAtomic,
+      memo: body.memo,
     });
   });
 
