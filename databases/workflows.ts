@@ -8,6 +8,7 @@ import { digest } from '../auth/digest.js';
 type Flow = z.infer<typeof graph>;
 
 export const WIP_TTL_SECONDS = 86_400;
+export const MAX_WIP_DRAFTS = 8;
 export const MARKET_LIST_CACHE_KEY = 'workflows:market';
 
 export function userWorkflowsCacheKey(userAddress: string): string {
@@ -26,19 +27,23 @@ function activeDraftKey(userAddress: string): string {
   return `draft:${digest(userAddress)}:active`;
 }
 
+function draftIndexKey(userAddress: string): string {
+  return `draft:${digest(userAddress)}:index`;
+}
+
 function flowDraftKey(userAddress: string, flowId: string): string {
   return `draft:${digest(userAddress)}:${flowId}`;
 }
 
 async function deleteFlowDraftFromComposer(userAddress: string, flowId: string): Promise<void> {
   const activeKey = activeDraftKey(userAddress);
+  const indexKey = draftIndexKey(userAddress);
   const targetKey = flowDraftKey(userAddress, flowId);
   const currentActive = await composer.get(activeKey);
-  if (currentActive === targetKey) {
-    await composer.del(activeKey, targetKey);
-  } else {
-    await composer.del(targetKey);
-  }
+  await Promise.all([
+    composer.zrem(indexKey, flowId),
+    currentActive === targetKey ? composer.del(activeKey, targetKey) : composer.del(targetKey),
+  ]);
 }
 
 const select = `id,"userAddress",name,graph,terms,published,modified`;
@@ -210,22 +215,30 @@ export async function remove(id: string, userAddress: string, match: string) {
 }
 
 export async function draft(flow: Flow, userAddress: string, match?: string) {
-  const key = flowDraftKey(userAddress, flow.id);
+  const prefix = `draft:${digest(userAddress)}:`;
+  const key = `${prefix}${flow.id}`;
   const activeKey = activeDraftKey(userAddress);
+  const indexKey = draftIndexKey(userAddress);
   const canonicalTasks = resolveCanonicalTasks(flow.tasks);
+  const nowMs = Date.now();
   const stored = JSON.stringify({
     ...flow,
     ...(canonicalTasks.length > 0 ? { tasks: canonicalTasks } : { tasks: undefined }),
-    modified: new Date().toISOString(),
+    modified: new Date(nowMs).toISOString(),
   });
   const result = await composer.eval(
-    `if ARGV[1]~='' then local previous=redis.call('GET',KEYS[1]); if not previous or cjson.decode(previous).modified~=ARGV[1] then return 0 end end; local prevActive=redis.call('GET',KEYS[2]); if prevActive and prevActive~=KEYS[1] then redis.call('DEL',prevActive) end; redis.call('SET',KEYS[1],ARGV[2],'EX',tonumber(ARGV[3])); redis.call('SET',KEYS[2],KEYS[1],'EX',tonumber(ARGV[3])); return 1`,
-    2,
+    `if ARGV[1]~='' then local previous=redis.call('GET',KEYS[1]); if not previous or cjson.decode(previous).modified~=ARGV[1] then return 0 end end; redis.call('SET',KEYS[1],ARGV[2],'EX',tonumber(ARGV[3])); redis.call('SET',KEYS[2],KEYS[1],'EX',tonumber(ARGV[3])); redis.call('ZADD',KEYS[3],tonumber(ARGV[4]),ARGV[5]); redis.call('EXPIRE',KEYS[3],tonumber(ARGV[3])); local count=redis.call('ZCARD',KEYS[3]); local maxKeep=tonumber(ARGV[6]); if count>maxKeep then local stale=redis.call('ZRANGE',KEYS[3],0,count-maxKeep-1); for _,id in ipairs(stale) do redis.call('ZREM',KEYS[3],id); redis.call('DEL',ARGV[7]..id); end end; return 1`,
+    3,
     key,
     activeKey,
+    indexKey,
     match ?? '',
     stored,
     String(WIP_TTL_SECONDS),
+    String(nowMs),
+    flow.id,
+    String(MAX_WIP_DRAFTS),
+    prefix,
   );
   if (result !== 1)
     throw Object.assign(new Error('The draft changed in another tab. Reload before editing.'), {
