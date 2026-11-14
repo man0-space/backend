@@ -427,7 +427,7 @@ function extractBillItemsFromReceipt(
   }
 
   if (
-    service === 'runtime' &&
+    (service === 'agent' || service === 'runtime') &&
     subjectStr &&
     subjectStr.toLowerCase() !== `agent:${coordLower}` &&
     subjectStr.toLowerCase() !== coordLower
@@ -452,7 +452,7 @@ function extractBillItemsFromReceipt(
     category: 'coordinator',
     kind: service || 'coordinator',
     name:
-      service === 'runtime'
+      service === 'agent' || service === 'runtime'
         ? coordinator.name
         : `${coordinator.name} · ${subjectStr || action || service || 'compute'}`,
     ...(subjectStr ? { subject: subjectStr } : { subject: `agent:${coordinator.walletAddress}` }),
