@@ -761,3 +761,174 @@ test('createVibeStream prioritizes frontier worker models, chains multi-step sym
   assert.ok(workerUrlsHit.some(u => u.startsWith(`${COMPOSE_MODELS_ORIGIN}/search`)));
   assert.ok(workerUrlsHit.some(u => u.startsWith(`${COMPOSE_CONNECTORS_ORIGIN}/`)));
 });
+
+test('createVibeStream defaults to clean create mode ignoring dirty canvas nodes/history, and edit mode never auto-chains unanchored steps', async () => {
+  const dirtyExistingNodeId = randomUUID();
+  const dirtyFlow: Flow = {
+    id: randomUUID(),
+    name: 'Stale Unsaved Canvas',
+    brief: 'Old unrelated brief',
+    banner: 'https://example.com/old-banner.png',
+    tasks: ['Analytics'],
+    nodes: [
+      {
+        id: dirtyExistingNodeId,
+        type: 'step',
+        position: { x: 100, y: 100 },
+        data: {
+          label: 'Old Stale Step',
+          kind: 'connector',
+          note: 'Old notion action',
+          entry: { id: 'account:notion', kind: 'connector', name: 'Notion' },
+        },
+      },
+    ],
+    edges: [],
+    modified: new Date().toISOString(),
+  };
+
+  let createTurn = 0;
+  const capturedCreateMessages: Array<Array<{ role: string; content?: string }>> = [];
+  const createMockFetch: typeof fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    assert.equal(url, NEBIUS_CHAT_URL);
+    const parsed = JSON.parse(String(init?.body)) as {
+      messages: Array<{ role: string; content?: string }>;
+    };
+    capturedCreateMessages.push(parsed.messages);
+    createTurn += 1;
+    if (createTurn === 1) {
+      return makeSseResponse([
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'tc_new_title',
+                    function: {
+                      name: 'set_title',
+                      arguments: JSON.stringify({ title: 'Fresh Clean Workflow' }),
+                    },
+                  },
+                  {
+                    index: 1,
+                    id: 'tc_new_step',
+                    function: {
+                      name: 'add_step',
+                      arguments: JSON.stringify({
+                        label: 'Fresh Step',
+                        kind: 'model',
+                        entryId: 'deepseek-v3',
+                        note: 'Summarize fresh input',
+                      }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ]);
+    }
+    return makeSseResponse([{ choices: [{ delta: { content: 'Created fresh workflow.' } }] }]);
+  };
+
+  let rawCreate = '';
+  for await (const chunk of createVibeStream(
+    {
+      prompt: 'Build a fresh summarizer',
+      flow: dirtyFlow,
+      history: [
+        { role: 'user', content: 'Old conversation turn' },
+        { role: 'assistant', content: 'Old assistant reply' },
+      ],
+    },
+    {
+      fetchImpl: createMockFetch,
+      catalogLoader: async () => [
+        { id: 'deepseek-v3', kind: 'model', name: 'DeepSeek V3', description: 'LLM' },
+      ],
+      bannerGenerator: async () => ({ imageUrl: 'https://example.com/fresh.png', cid: 'fresh' }),
+    },
+  )) {
+    rawCreate += String(chunk);
+  }
+
+  // Stale history and stale nodes must NOT appear in create mode prompt or output
+  const firstPromptJson = JSON.stringify(capturedCreateMessages[0]);
+  assert.equal(firstPromptJson.includes('Old Stale Step'), false);
+  assert.equal(firstPromptJson.includes('Old conversation turn'), false);
+
+  const createEvents = rawCreate
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as VibeStreamEvent);
+  const createDone = createEvents.find(e => e.type === 'done');
+  assert.ok(createDone && createDone.type === 'done');
+  assert.equal(createDone.flow.nodes.length, 1);
+  assert.equal(createDone.flow.nodes[0]?.data.label, 'Fresh Step');
+  assert.equal(createDone.flow.edges.length, 0);
+
+  // Even in explicit edit mode, an unanchored add_step must NOT auto-wire to dirtyExistingNodeId
+  let editTurn = 0;
+  const editMockFetch: typeof fetch = async (_input, _init) => {
+    editTurn += 1;
+    if (editTurn === 1) {
+      return makeSseResponse([
+        {
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'tc_unanchored',
+                    function: {
+                      name: 'add_step',
+                      arguments: JSON.stringify({
+                        label: 'Standalone Step',
+                        kind: 'model',
+                        entryId: 'deepseek-v3',
+                        note: 'Independent node',
+                      }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ]);
+    }
+    return makeSseResponse([{ choices: [{ delta: { content: 'Added standalone step.' } }] }]);
+  };
+
+  let rawEdit = '';
+  for await (const chunk of createVibeStream(
+    {
+      prompt: 'Add a standalone step',
+      flow: dirtyFlow,
+      mode: 'edit',
+    },
+    {
+      fetchImpl: editMockFetch,
+      catalogLoader: async () => [
+        { id: 'deepseek-v3', kind: 'model', name: 'DeepSeek V3', description: 'LLM' },
+      ],
+      bannerGenerator: async () => ({ imageUrl: 'https://example.com/edit.png', cid: 'edit' }),
+    },
+  )) {
+    rawEdit += String(chunk);
+  }
+
+  const editEvents = rawEdit
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as VibeStreamEvent);
+  const editDone = editEvents.find(e => e.type === 'done');
+  assert.ok(editDone && editDone.type === 'done');
+  assert.equal(editDone.flow.nodes.length, 2);
+  assert.equal(editDone.flow.edges.length, 0);
+});
