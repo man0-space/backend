@@ -580,6 +580,7 @@ test('GET /api/coordinators merges agents.compose.market?role=coordinator and DB
   assert.equal(pinnedCoordMeta?.keyvalues?.['type'], 'agent-card');
   const pinnedCoordCard = pinnedProofBodies[0]!['pinataContent'] as Record<string, unknown>;
   assert.equal(pinnedCoordCard['walletAddress'], mintedCoordWallet);
+  assert.equal(pinnedCoordCard['creatorFee'], 1);
   assert.equal('dnaHash' in pinnedCoordCard, false);
   assert.equal('walletTimestamp' in pinnedCoordCard, false);
 
@@ -652,11 +653,13 @@ test('All workflow runs execute via Coordinator /agent/:wallet/stream, Facilitat
   assert.equal(draftTestRes.statusCode, 200);
   const draftJson = draftTestRes.json();
   assert.equal(draftJson.composeBillWei, '25000');
-  assert.equal(draftJson.totalChargedWei, '25000');
+  assert.equal(draftJson.totalChargedWei, '25500');
   assert.equal(draftJson.proofCid, null);
   assert.equal(draftJson.proofUrl, null);
   assert.equal(pinnedProofBodies.length, 0);
   assert.equal(agentStreams.length, 1);
+  assert.equal(preparedPayments[0]!['service'], 'workflow');
+  assert.equal(preparedPayments[0]!['action'], 'run');
   assert.ok(agentStreams[0]!.url.includes(`/agent/${mintedCoordWallet}/stream`));
   assert.equal('approvedPlan' in agentStreams[0]!.body, false);
   assert.equal('agentCard' in agentStreams[0]!.body, false);
@@ -685,9 +688,9 @@ test('All workflow runs execute via Coordinator /agent/:wallet/stream, Facilitat
   assert.equal(dryJson.proofUrl, null);
   assert.equal(pinnedProofBodies.length, 0);
   assert.equal((agentStreams[1]!.body['constraints'] as { dryRun?: boolean }).dryRun, true);
-  assert.equal(preparedPayments.length, 1);
-  assert.equal(settledPayments.length, 1);
-  assert.equal(settledPayments[0]!['finalAmountWei'], '500');
+  assert.equal(preparedPayments.length, 2);
+  assert.equal(settledPayments.length, 2);
+  assert.equal(settledPayments[1]!['finalAmountWei'], '500');
 
   // 3. Live Workflow Run (dry: false) -> Session billed AND proof.ts pinned with provider inside IPFS payload, never in client JSON!
   const liveRunRes = await app.inject({
