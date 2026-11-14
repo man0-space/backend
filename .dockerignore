@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+.env.*
+cloudrun.yaml
+deploy.ts
+deployment.ts
+.git
+.DS_Store
