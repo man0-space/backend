@@ -69,6 +69,28 @@ export function derive(id: string): Buffer {
   return Buffer.from(ecdh.getPublicKey(null, 'compressed'));
 }
 
+export function deriveIntentsEd25519(id: string): {
+  secretKey32: Buffer;
+  pubKey32: Buffer;
+  intentsKey: string;
+} {
+  const secretKey32 = Buffer.from(
+    hkdfSync(
+      'sha256',
+      Buffer.from(config.secret, 'hex'),
+      Buffer.from(id, 'utf8'),
+      Buffer.from('universal account intents ed25519', 'utf8'),
+      32,
+    ),
+  );
+  const pubKey32 = Buffer.from(ed25519.getPublicKey(secretKey32));
+  return {
+    secretKey32,
+    pubKey32,
+    intentsKey: intentsPublicKey('ed25519', pubKey32),
+  };
+}
+
 export async function prepare(
   key: Uint8Array,
   network: 'mainnet' | 'testnet' = config.network,
@@ -1361,6 +1383,75 @@ export async function getNearBalances(userAddress: string): Promise<{
   });
 }
 
+async function registerIntentsKeyForRecord(
+  rec: SpendingRecord,
+  publicKey: string,
+  verifier: string,
+  activeNet: 'mainnet' | 'testnet',
+): Promise<void> {
+  if (!derive(rec.seedId).equals(rec.ownerCompressedKey)) {
+    return;
+  }
+  const activeRpc = rpcFor(activeNet);
+  const alreadyHas = await hasIntentsPublicKey(
+    activeRpc,
+    rec.activeMainAddress,
+    publicKey,
+    verifier,
+  );
+  if (alreadyHas) return;
+
+  const privKey = derivePrivate(rec.seedId);
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const existing = await viewAccount(activeRpc, rec.activeMainAddress);
+    const actions: Uint8Array[] = [];
+    if (!existing) {
+      actions.push(transferAction(12_000_000_000_000_000_000_000n));
+      actions.push(universalStateInitAction(rec.rawActiveMainInit, 0n));
+    } else if (BigInt(existing.amount) < 5_000_000_000_000_000_000_000n) {
+      actions.push(transferAction(12_000_000_000_000_000_000_000n));
+    }
+    const msg = buildWalletAddPublicKeyMessage({
+      signerId: rec.activeMainAddress,
+      networkId: activeNet,
+      publicKey,
+      nonce: randomInt(1, 0x100000000),
+      intentsContractId: verifier,
+    });
+    const proof = signWebAuthnP256(privKey, commitment(msg));
+    const execArgs = Buffer.from(JSON.stringify({ msg, proof: JSON.stringify(proof) }), 'utf8');
+    actions.push(functionCallAction('w_execute_signed', execArgs, 100_000_000_000_000n, 1n));
+    try {
+      await broadcastActionsWithOutcome(activeRpc, rec.activeMainAddress, actions, activeNet);
+      return;
+    } catch (err) {
+      const msgText = err instanceof Error ? err.message : String(err);
+      if (/already exists|PublicKeyAlreadyAdded|public key already/i.test(msgText)) {
+        return;
+      }
+      lastError = err;
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
+}
+
+export async function ensureIntentsPublicKeyRegistered(
+  userAddress: string,
+  publicKey: string,
+  verifier?: string,
+): Promise<void> {
+  const rec = await ensureSpendingRecord(userAddress);
+  const activeNet = config.network;
+  const resolvedVerifier =
+    verifier ??
+    (await discoverNearIntentsContracts(activeNet).catch(() => null))?.verifier ??
+    (activeNet === 'mainnet' ? 'intents.near' : 'verifier.tidepool-sandbox.testnet');
+  await registerIntentsKeyForRecord(rec, publicKey, resolvedVerifier, activeNet);
+}
+
 export async function ensureDepositReady(userAddress: string): Promise<{
   userAddress: string;
   depositAddress: string;
@@ -1414,33 +1505,7 @@ export async function ensureDepositReady(userAddress: string): Promise<{
 
   if (intentsMeta?.verifier && derive(rec.seedId).equals(rec.ownerCompressedKey)) {
     const ownerIntentsKey = intentsPublicKey('p256', rec.ownerCompressedKey);
-    const hasKey = await hasIntentsPublicKey(
-      activeRpc,
-      rec.activeMainAddress,
-      ownerIntentsKey,
-      intentsMeta.verifier,
-    );
-    if (!hasKey) {
-      const existing = await viewAccount(activeRpc, rec.activeMainAddress);
-      const actions: Uint8Array[] = [];
-      if (existing && BigInt(existing.amount) < 5_000_000_000_000_000_000_000n) {
-        actions.push(transferAction(12_000_000_000_000_000_000_000n));
-      }
-      const privKey = derivePrivate(rec.seedId);
-      const msg = buildWalletAddPublicKeyMessage({
-        signerId: rec.activeMainAddress,
-        networkId: activeNet,
-        publicKey: ownerIntentsKey,
-        nonce: randomInt(1, 0x100000000),
-        intentsContractId: intentsMeta.verifier,
-      });
-      const proof = signWebAuthnP256(privKey, commitment(msg));
-      const execArgs = Buffer.from(JSON.stringify({ msg, proof: JSON.stringify(proof) }), 'utf8');
-      actions.push(functionCallAction('w_execute_signed', execArgs, 100_000_000_000_000n, 1n));
-      await broadcastActionsWithOutcome(activeRpc, rec.activeMainAddress, actions, activeNet).catch(
-        () => undefined,
-      );
-    }
+    await registerIntentsKeyForRecord(rec, ownerIntentsKey, intentsMeta.verifier, activeNet);
   }
 
   await ensureFtStorageDeposit(activeRpc, usdcFor(activeNet), rec.activeMainAddress, activeNet);
