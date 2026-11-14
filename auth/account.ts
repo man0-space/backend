@@ -1332,24 +1332,45 @@ export async function readIntentsTokenBalanceWei(
 
 interface ActiveAccountBalances {
   mainWei: bigint;
+  nep141MainWei: bigint;
+  intentsMainWei: bigint;
   spendingWei: bigint;
   settlementUsdc: string;
+  verifier: string | null;
 }
 
 async function readActiveAccountBalances(rec: SpendingRecord): Promise<ActiveAccountBalances> {
   const activeNet = config.network;
   const activeRpc = rpcFor(activeNet);
   const settlementUsdc = usdcFor(activeNet);
+  const intentsMeta = await discoverNearIntentsContracts(activeNet).catch(() => null);
+  const verifier =
+    intentsMeta?.verifier ??
+    (activeNet === 'mainnet' ? 'intents.near' : 'verifier.tidepool-sandbox.testnet');
 
-  const [mainStr, spendingStr] = await Promise.all([
+  const [mainStr, spendingStr, intentsStr] = await Promise.all([
     readFtBalanceWei(activeRpc, settlementUsdc, rec.activeMainAddress),
     readFtBalanceWei(activeRpc, settlementUsdc, rec.activeSpendingAddress),
+    verifier
+      ? readIntentsTokenBalanceWei(
+          activeRpc,
+          verifier,
+          rec.activeMainAddress,
+          `nep141:${settlementUsdc}`,
+        )
+      : Promise.resolve('0'),
   ]);
 
+  const nep141MainWei = BigInt(mainStr);
+  const intentsMainWei = BigInt(intentsStr);
+
   return {
-    mainWei: BigInt(mainStr),
+    mainWei: nep141MainWei + intentsMainWei,
+    nep141MainWei,
+    intentsMainWei,
     spendingWei: BigInt(spendingStr),
     settlementUsdc,
+    verifier,
   };
 }
 
@@ -1592,41 +1613,89 @@ export async function approveSpendingLimit(
 
   await ensureFtStorageDeposit(activeRpc, balances.settlementUsdc, nearSpending, activeNet);
 
-  const privKey = derivePrivate(rec.seedId);
-  const msg = buildWalletContractCallMessage({
-    signerId: nearMain,
-    networkId: activeNet,
-    receiverId: balances.settlementUsdc,
-    methodName: 'ft_transfer',
-    args: {
-      receiver_id: nearSpending,
-      amount: delta.toString(),
-    },
-    deposit: '1',
-    gas: 50_000_000_000_000,
-    nonce: randomInt(1, 0x100000000),
-  });
-  const proof = signWebAuthnP256(privKey, commitment(msg));
+  const fromNep141 = balances.nep141MainWei >= delta ? delta : balances.nep141MainWei;
+  const fromIntents = delta - fromNep141;
 
-  const existingMain = await viewAccount(activeRpc, nearMain);
-  const mainActions: Uint8Array[] = [];
-  if (!existingMain) {
-    mainActions.push(transferAction(12_000_000_000_000_000_000_000n));
-    mainActions.push(universalStateInitAction(nearMainInit, 0n));
-  } else if (BigInt(existingMain.amount) < 5_000_000_000_000_000_000_000n) {
-    mainActions.push(transferAction(12_000_000_000_000_000_000_000n));
+  const privKey = derivePrivate(rec.seedId);
+  let existingMain = await viewAccount(activeRpc, nearMain);
+  let lastTxHash = '';
+
+  const broadcastMainSignedCall = async (callParams: {
+    receiverId: string;
+    methodName: string;
+    args: Record<string, unknown>;
+    gas: number;
+  }): Promise<string> => {
+    const msg = buildWalletContractCallMessage({
+      signerId: nearMain,
+      networkId: activeNet,
+      receiverId: callParams.receiverId,
+      methodName: callParams.methodName,
+      args: callParams.args,
+      deposit: '1',
+      gas: callParams.gas,
+      nonce: randomInt(1, 0x100000000),
+    });
+    const proof = signWebAuthnP256(privKey, commitment(msg));
+    const mainActions: Uint8Array[] = [];
+    if (!existingMain) {
+      mainActions.push(transferAction(12_000_000_000_000_000_000_000n));
+      mainActions.push(universalStateInitAction(nearMainInit, 0n));
+    } else if (BigInt(existingMain.amount) < 5_000_000_000_000_000_000_000n) {
+      mainActions.push(transferAction(12_000_000_000_000_000_000_000n));
+    }
+    const execArgs = Buffer.from(
+      JSON.stringify({ msg, proof: JSON.stringify(proof) }),
+      'utf8',
+    );
+    mainActions.push(functionCallAction('w_execute_signed', execArgs, 200_000_000_000_000n, 1n));
+    const outcome = await broadcastActionsWithOutcome(activeRpc, nearMain, mainActions, activeNet);
+    existingMain = {
+      amount: '12000000000000000000000',
+      locked: '0',
+      code_hash: existingMain?.code_hash ?? '11111111111111111111111111111111',
+      storage_usage: existingMain?.storage_usage ?? 0,
+    };
+    return outcome.txHash;
+  };
+
+  if (fromIntents > 0n) {
+    if (!balances.verifier) {
+      throw Object.assign(
+        new Error('NEAR Intents verifier contract is unavailable on this network.'),
+        { statusCode: 502 },
+      );
+    }
+    lastTxHash = await broadcastMainSignedCall({
+      receiverId: balances.verifier,
+      methodName: 'ft_withdraw',
+      args: {
+        token: balances.settlementUsdc,
+        receiver_id: nearSpending,
+        amount: fromIntents.toString(),
+        memo: null,
+        msg: null,
+      },
+      gas: 120_000_000_000_000,
+    });
   }
-  const execArgs = Buffer.from(
-    JSON.stringify({ msg, proof: JSON.stringify(proof) }),
-    'utf8',
-  );
-  mainActions.push(functionCallAction('w_execute_signed', execArgs, 200_000_000_000_000n, 1n));
-  const outcome = await broadcastActionsWithOutcome(activeRpc, nearMain, mainActions, activeNet);
+
+  if (fromNep141 > 0n) {
+    lastTxHash = await broadcastMainSignedCall({
+      receiverId: balances.settlementUsdc,
+      methodName: 'ft_transfer',
+      args: {
+        receiver_id: nearSpending,
+        amount: fromNep141.toString(),
+      },
+      gas: 50_000_000_000_000,
+    });
+  }
 
   await invalidateNearBalanceCache(userAddress);
   const updated = await readActiveAccountBalances(rec);
   return {
-    txHash: outcome.txHash,
+    txHash: lastTxHash,
     userAddress: rec.userAddress,
     depositAddress: nearMain,
     spendingAddress: nearSpending,
