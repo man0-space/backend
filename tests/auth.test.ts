@@ -6,8 +6,10 @@ import { base58 } from '@scure/base';
 import { p256 } from '@noble/curves/nist.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { ed25519 } from '@noble/curves/ed25519.js';
+import { OneClickService } from '@defuse-protocol/one-click-sdk-typescript';
 import { ready, composer } from '../databases/cache.js';
 import { user, workflow } from '../databases/client.js';
+import { config, rpcFor, usdcFor } from '../config.js';
 import { build } from '../server.js';
 import {
   codeFor,
@@ -19,6 +21,7 @@ import {
   keccak256,
 } from '../auth/protocol.js';
 import { digest } from '../auth/digest.js';
+import { accept as acceptConsent, hash as policyHash } from '../consent.js';
 import { issuer, privateKey } from '../auth/config.js';
 import { SESSION_TTL_SECONDS, sign as signJwt } from '../auth/token.js';
 
@@ -38,6 +41,10 @@ interface MockChainState {
     }
   >;
   intentsKeys: Map<string, Set<string>>;
+  mtBalances: Map<string, string>;
+  ftBalances: Map<string, string>;
+  broadcastCalls: Array<{ receiverId: string; txText: string }>;
+  depositSubmittedTxs: Array<{ txHash: string; depositAddress: string }>;
   failBroadcastCount: number;
   skipHasPublicKeyCount: number;
 }
@@ -45,6 +52,10 @@ interface MockChainState {
 const mockChain: MockChainState = {
   initializedAccounts: new Map(),
   intentsKeys: new Map(),
+  mtBalances: new Map(),
+  ftBalances: new Map(),
+  broadcastCalls: [],
+  depositSubmittedTxs: [],
   failBroadcastCount: 0,
   skipHasPublicKeyCount: 0,
 };
@@ -71,7 +82,26 @@ before(async () => {
       deliveredEmailCodes.set(body.to[0]!, code);
       return new Response('{"id":"email-fixture"}', { status: 200 });
     }
+    if (url.endsWith('/deposit/submit')) {
+      const body = JSON.parse(String(init?.body || '{}')) as {
+        txHash: string;
+        depositAddress: string;
+      };
+      mockChain.depositSubmittedTxs.push(body);
+      return new Response(JSON.stringify({ status: 'OK' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.endsWith('/v0/tokens')) {
+      return new Response('[]', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
     if (
+      url === rpcFor('mainnet') ||
+      url === rpcFor('testnet') ||
       url.includes('fastnear.com') ||
       url.includes('near.org') ||
       url.includes('quiknode.pro') ||
@@ -157,7 +187,10 @@ before(async () => {
             );
           }
 
-          if (accountId === 'intents.near' && methodName === 'has_public_key') {
+          const isVerifierContract =
+            accountId === 'intents.near' || accountId === 'verifier.tidepool-sandbox.testnet';
+
+          if (isVerifierContract && methodName === 'has_public_key') {
             if (mockChain.skipHasPublicKeyCount > 0) {
               mockChain.skipHasPublicKeyCount--;
               const falseBytes = Array.from(Buffer.from('false', 'utf8'));
@@ -176,10 +209,41 @@ before(async () => {
             );
           }
 
-          if (accountId === 'intents.near' && methodName === 'public_keys_of') {
+          if (isVerifierContract && methodName === 'public_keys_of') {
             const targetAcct = String(argsJson.account_id || '');
             const keys = Array.from(mockChain.intentsKeys.get(targetAcct) ?? []);
             const resultBytes = Array.from(Buffer.from(JSON.stringify(keys), 'utf8'));
+            return new Response(
+              JSON.stringify({ jsonrpc: '2.0', id: '1', result: { result: resultBytes } }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            );
+          }
+
+          if (isVerifierContract && methodName === 'mt_balance_of') {
+            const targetAcct = String(argsJson.account_id || '');
+            const tokenId = String(argsJson.token_id || '');
+            const bal = mockChain.mtBalances.get(`${targetAcct}:${tokenId}`) ?? '0';
+            const resultBytes = Array.from(Buffer.from(JSON.stringify(bal), 'utf8'));
+            return new Response(
+              JSON.stringify({ jsonrpc: '2.0', id: '1', result: { result: resultBytes } }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            );
+          }
+
+          if (methodName === 'ft_balance_of') {
+            const targetAcct = String(argsJson.account_id || '');
+            const bal = mockChain.ftBalances.get(`${accountId}:${targetAcct}`) ?? '0';
+            const resultBytes = Array.from(Buffer.from(JSON.stringify(bal), 'utf8'));
+            return new Response(
+              JSON.stringify({ jsonrpc: '2.0', id: '1', result: { result: resultBytes } }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            );
+          }
+
+          if (methodName === 'storage_balance_of') {
+            const resultBytes = Array.from(
+              Buffer.from(JSON.stringify({ total: '1250000000000000000000', available: '0' }), 'utf8'),
+            );
             return new Response(
               JSON.stringify({ jsonrpc: '2.0', id: '1', result: { result: resultBytes } }),
               { status: 200, headers: { 'content-type': 'application/json' } },
@@ -209,6 +273,33 @@ before(async () => {
           .subarray(receiverOffset + 4, receiverOffset + 4 + receiverLen)
           .toString('utf8');
         const txText = signedBytes.toString('latin1');
+        mockChain.broadcastCalls.push({ receiverId, txText });
+
+        // Simulate ft_withdraw moving USDC from intents.near mt_balance_of to receiver NEP-141 balance
+        if (txText.includes('ft_withdraw')) {
+          const allArgs = [...txText.matchAll(/"args":"([A-Za-z0-9+/=]+)"/g)];
+          for (const m of allArgs) {
+            try {
+              const parsedArgs = JSON.parse(Buffer.from(m[1]!, 'base64').toString('utf8')) as {
+                token?: string;
+                receiver_id?: string;
+                amount?: string;
+              };
+              const signerMatch = txText.match(/"signer_id":"([^"]+)"/);
+              if (parsedArgs.token && parsedArgs.receiver_id && parsedArgs.amount && signerMatch) {
+                const mtKey = `${signerMatch[1]}:nep141:${parsedArgs.token}`;
+                const prevMt = BigInt(mockChain.mtBalances.get(mtKey) ?? '0');
+                const amt = BigInt(parsedArgs.amount);
+                mockChain.mtBalances.set(mtKey, (prevMt > amt ? prevMt - amt : 0n).toString());
+                const ftKey = `${parsedArgs.token}:${parsedArgs.receiver_id}`;
+                const prevFt = BigInt(mockChain.ftBalances.get(ftKey) ?? '0');
+                mockChain.ftBalances.set(ftKey, (prevFt + amt).toString());
+              }
+            } catch {
+              // ignore non-JSON args
+            }
+          }
+        }
 
         // Check if transaction initializes a 0u account in Postgres `accounts`
         if (receiverId.startsWith('0u')) {
@@ -538,18 +629,49 @@ test('POST /api/auth/link attaches EVM and Solana wallets with zero signatures, 
   });
   assert.equal(invalidEvmRes.statusCode, 400);
 
-  // 3. Zero-signature EVM attachment on User A
+  // 3. Zero-signature EVM attachment on User A (with EIP-6963 provider metadata)
   const attachEvmRes = await app.inject({
     method: 'POST',
     url: '/api/auth/link',
     headers: { authorization: `Bearer ${tokenA}` },
-    payload: { network: 'evm', address: evmAddress.toUpperCase().replace(/^0X/, '0x') },
+    payload: {
+      network: 'evm',
+      address: evmAddress.toUpperCase().replace(/^0X/, '0x'),
+      providerRdns: 'io.metamask',
+      providerName: 'MetaMask',
+    },
   });
   assert.equal(attachEvmRes.statusCode, 200);
-  const attachedEvm = attachEvmRes.json() as { status: string; address: string; network: string };
+  const attachedEvm = attachEvmRes.json() as {
+    id: string;
+    status: string;
+    address: string;
+    network: string;
+    providerRdns?: string;
+    providerName?: string;
+  };
+  assert.ok(attachedEvm.id);
   assert.equal(attachedEvm.status, 'active');
   assert.equal(attachedEvm.network, 'evm');
   assert.equal(attachedEvm.address, evmAddress.toLowerCase());
+  assert.equal(attachedEvm.providerRdns, 'io.metamask');
+  assert.equal(attachedEvm.providerName, 'MetaMask');
+
+  const listARes = await app.inject({
+    method: 'GET',
+    url: '/api/auth/links',
+    headers: { authorization: `Bearer ${tokenA}` },
+  });
+  assert.equal(listARes.statusCode, 200);
+  const linksA = listARes.json() as Array<{
+    id: string;
+    address: string;
+    providerRdns?: string;
+    providerName?: string;
+  }>;
+  assert.equal(linksA.length, 1);
+  assert.equal(linksA[0]!.providerRdns, 'io.metamask');
+  assert.equal(linksA[0]!.providerName, 'MetaMask');
 
   // 4. Cross-account conflict rejection (User B tries to attach User A's EVM wallet)
   const conflictRes = await app.inject({
@@ -560,16 +682,55 @@ test('POST /api/auth/link attaches EVM and Solana wallets with zero signatures, 
   });
   assert.equal(conflictRes.statusCode, 409);
 
-  // 5. Zero-signature Solana attachment on User B + GET /api/auth/links
+  // 5. Cross-account unlink rejection (User B cannot unlink User A's EVM wallet)
+  const forbiddenUnlinkRes = await app.inject({
+    method: 'DELETE',
+    url: `/api/auth/link/${encodeURIComponent(attachedEvm.id)}`,
+    headers: { authorization: `Bearer ${tokenB}` },
+  });
+  assert.equal(forbiddenUnlinkRes.statusCode, 403);
+
+  // 6. Owner unlink succeeds (200), freeing the EVM wallet so User B can attach it
+  const unlinkARes = await app.inject({
+    method: 'DELETE',
+    url: `/api/auth/link/${encodeURIComponent(attachedEvm.id)}`,
+    headers: { authorization: `Bearer ${tokenA}` },
+  });
+  assert.equal(unlinkARes.statusCode, 200);
+  assert.deepEqual(unlinkARes.json(), { removed: true, id: attachedEvm.id });
+
+  const missingUnlinkRes = await app.inject({
+    method: 'DELETE',
+    url: `/api/auth/link/${encodeURIComponent(attachedEvm.id)}`,
+    headers: { authorization: `Bearer ${tokenA}` },
+  });
+  assert.equal(missingUnlinkRes.statusCode, 404);
+
+  const reattachToBRes = await app.inject({
+    method: 'POST',
+    url: '/api/auth/link',
+    headers: { authorization: `Bearer ${tokenB}` },
+    payload: {
+      network: 'evm',
+      address: evmAddress,
+      providerRdns: 'io.rabby',
+      providerName: 'Rabby',
+    },
+  });
+  assert.equal(reattachToBRes.statusCode, 200);
+  assert.equal(reattachToBRes.json().providerRdns, 'io.rabby');
+
+  // 7. Zero-signature Solana attachment on User B + GET /api/auth/links
   const attachSvmRes = await app.inject({
     method: 'POST',
     url: '/api/auth/link',
     headers: { authorization: `Bearer ${tokenB}` },
-    payload: { network: 'svm', address: svmAddress },
+    payload: { network: 'svm', address: svmAddress, providerName: 'Phantom' },
   });
   assert.equal(attachSvmRes.statusCode, 200);
   assert.equal(attachSvmRes.json().status, 'active');
   assert.equal(attachSvmRes.json().address, svmAddress);
+  assert.equal(attachSvmRes.json().providerName, 'Phantom');
 
   const listB = await app.inject({
     method: 'GET',
@@ -577,9 +738,127 @@ test('POST /api/auth/link attaches EVM and Solana wallets with zero signatures, 
     headers: { authorization: `Bearer ${tokenB}` },
   });
   assert.equal(listB.statusCode, 200);
-  const linksB = listB.json() as Array<{ network: string; address: string; status: string }>;
-  assert.equal(linksB.length, 1);
-  assert.equal(linksB[0]!.network, 'svm');
-  assert.equal(linksB[0]!.address, svmAddress);
-  assert.equal(linksB[0]!.status, 'active');
+  const linksB = listB.json() as Array<{
+    network: string;
+    address: string;
+    status: string;
+    providerRdns?: string;
+    providerName?: string;
+  }>;
+  assert.equal(linksB.length, 2);
+  const svmLinkB = linksB.find(l => l.network === 'svm');
+  assert.ok(svmLinkB);
+  assert.equal(svmLinkB.address, svmAddress);
+  assert.equal(svmLinkB.status, 'active');
+  assert.equal(svmLinkB.providerName, 'Phantom');
+});
+
+test('0u Universal Account aggregates NEP-141 + intents.near USDC balances, auto-withdraws via ft_withdraw on spending approve, and executes on-chain mt_transfer for intents deposits', async t => {
+  t.mock.method(
+    OneClickService,
+    'submitDepositTx',
+    async (req: { txHash: string; depositAddress: string }) => {
+      mockChain.depositSubmittedTxs.push({
+        txHash: req.txHash,
+        depositAddress: req.depositAddress,
+      });
+      return {} as never;
+    },
+  );
+  const activeNet = config.network;
+  const settlementUsdc = usdcFor(activeNet);
+  const identityC = `email:intents-user-${randomUUID()}@man0.space`;
+  const ownerCompressedC = derive(identityC);
+  const preparedC = await prepare(ownerCompressedC, activeNet);
+  const walletC = preparedC.account;
+  createdWallets.add(walletC);
+  registerExpectedWalletOnMock(walletC, ownerCompressedC, codeFor(activeNet));
+
+  await user`INSERT INTO users("userAddress", name) VALUES (${walletC}, 'User C')`;
+  await user`
+    INSERT INTO accounts("userAddress", network, state, code, status)
+    VALUES (${walletC}, ${activeNet}, ${preparedC.state}, ${preparedC.code}, 'active')
+  `;
+  await user`
+    INSERT INTO identities(id, "userAddress", provider)
+    VALUES (${identityC}, ${walletC}, 'email')
+  `;
+  await acceptConsent(
+    { policy: policyHash, terms: true, privacy: true },
+    walletC,
+    'test-token',
+  );
+  const tokenC = await signJwt(
+    privateKey,
+    issuer!,
+    walletC,
+    randomBytes(32).toString('base64url'),
+    3600,
+  );
+  await user`
+    INSERT INTO tokens(id, "userAddress", jwt, expires)
+    VALUES (${digest(tokenC)}, ${walletC}, 'enc-c', now() + interval '1 hour')
+  `;
+
+  // Seed $1.50 in NEP-141 USDC + $3.50 in NEAR Intents multi-token USDC = $5.00 total
+  mockChain.ftBalances.set(`${settlementUsdc}:${walletC}`, '1500000');
+  mockChain.mtBalances.set(`${walletC}:nep141:${settlementUsdc}`, '3500000');
+
+  const balRes = await app.inject({
+    method: 'GET',
+    url: '/api/near/balance',
+    headers: { authorization: `Bearer ${tokenC}` },
+  });
+  assert.equal(balRes.statusCode, 200);
+  const balBody = balRes.json() as {
+    mainBalanceWei: string;
+    spendingBalanceWei: string;
+    spendingAddress: string;
+  };
+  assert.equal(balBody.mainBalanceWei, '5000000');
+  assert.equal(balBody.spendingBalanceWei, '0');
+
+  // Approve $4.00 spending limit -> requires $1.50 from NEP-141 + $2.50 via ft_withdraw from intents verifier
+  mockChain.broadcastCalls.length = 0;
+  const approveRes = await app.inject({
+    method: 'POST',
+    url: '/api/near/spending/approve',
+    headers: { authorization: `Bearer ${tokenC}` },
+    payload: { amountWei: '4000000' },
+  });
+  assert.equal(approveRes.statusCode, 200);
+  const approveBody = approveRes.json() as {
+    mainBalanceWei: string;
+    spendingBalanceWei: string;
+    txHash: string | null;
+  };
+  assert.ok(approveBody.txHash);
+  assert.ok(
+    mockChain.broadcastCalls.some(c => c.txText.includes('ft_withdraw')),
+    'Expected approveSpendingLimit to execute ft_withdraw from NEAR Intents verifier',
+  );
+
+  // Execute gasless/intents leg via on-chain mt_transfer on NEAR Intents verifier
+  mockChain.broadcastCalls.length = 0;
+  mockChain.depositSubmittedTxs.length = 0;
+  const genRes = await app.inject({
+    method: 'POST',
+    url: '/api/near/intents/generate',
+    headers: { authorization: `Bearer ${tokenC}` },
+    payload: {
+      depositAddress: 'deposit-target.near',
+      assetId: `nep141:${settlementUsdc}`,
+      amountAtomic: '1000000',
+    },
+  });
+  assert.equal(genRes.statusCode, 200);
+  const genBody = genRes.json() as { submittedOnChain?: boolean; txHash?: string };
+  assert.equal(genBody.submittedOnChain, true);
+  assert.ok(genBody.txHash);
+  assert.ok(
+    mockChain.broadcastCalls.some(c => c.txText.includes('mt_transfer')),
+    'Expected /api/near/intents/generate to execute mt_transfer on NEAR Intents verifier',
+  );
+  assert.equal(mockChain.depositSubmittedTxs.length, 1);
+  assert.equal(mockChain.depositSubmittedTxs[0]?.depositAddress, 'deposit-target.near');
 });
