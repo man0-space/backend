@@ -2165,6 +2165,62 @@ export async function build(deps: ServerDeps = {}) {
     await workflows.clearDraft(authUser.userAddress);
     reply.code(204).send();
   });
+  app.get('/api/analytics', async request => {
+    const user = await token.authorize(bearer(request.headers.authorization));
+    const query = z
+      .object({
+        from: z.string().datetime().optional(),
+        to: z.string().datetime().optional(),
+        interval: z.enum(['minute', 'hour', 'day']).optional(),
+        networks: z.string().optional(),
+        requestCursor: z.string().optional(),
+        settlementCursor: z.string().optional(),
+        limit: z.coerce.number().int().min(1).max(100).optional(),
+      })
+      .parse(request.query);
+    const networks = query.networks ? query.networks.split(',').filter(Boolean) : undefined;
+    const local = await workflows.analytics({
+      userAddress: user.userAddress,
+      from: query.from,
+      to: query.to,
+      interval: query.interval,
+      networks,
+      limit: query.limit,
+    });
+    if (local.totals.requests.total > 0) {
+      return local;
+    }
+    return sdk.analytics
+      .get({ ...query, networks }, { userAddress: user.userAddress })
+      .catch(() => local);
+  });
 
+  app.get('/api/analytics/earn', async request => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const query = z
+      .object({
+        from: z.string().datetime().optional(),
+        to: z.string().datetime().optional(),
+        limit: z.coerce.number().int().min(1).max(1000).optional(),
+      })
+      .parse(request.query);
+    return workflows.creatorEarnings({
+      creatorAddress: authUser.userAddress,
+      from: query.from,
+      to: query.to,
+      limit: query.limit ?? 500,
+    });
+  });
+
+  app.addHook('onClose', async () => close());
   return app;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await ready();
+  const app = await build();
+  await app.listen({ port: config.port, host: '0.0.0.0' });
+  const stop = () => void app.close();
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
 }
