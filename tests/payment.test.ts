@@ -36,16 +36,16 @@ test('ceilPercent and computeWorkflowServiceFees calculate creatorFee (1-3%) and
   assert.equal(creatorSelf.serviceFeeWei, 2_000n);
   assert.equal(creatorSelf.totalChargedWei, 102_000n);
 
-  const draftOwnerSelf = computeWorkflowServiceFees(100_000n, 0, true);
-  assert.equal(draftOwnerSelf.composeBillWei, 100_000n);
-  assert.equal(draftOwnerSelf.creatorFeePercent, 0);
-  assert.equal(draftOwnerSelf.creatorFeeWei, 0n);
-  assert.equal(draftOwnerSelf.platformFeePercent, 0);
-  assert.equal(draftOwnerSelf.platformFeeWei, 0n);
-  assert.equal(draftOwnerSelf.serviceFeeWei, 0n);
-  assert.equal(draftOwnerSelf.totalChargedWei, 100_000n);
+  const draftRun = computeWorkflowServiceFees(100_000n, 0, false);
+  assert.equal(draftRun.composeBillWei, 100_000n);
+  assert.equal(draftRun.creatorFeePercent, 0);
+  assert.equal(draftRun.creatorFeeWei, 0n);
+  assert.equal(draftRun.platformFeePercent, 2);
+  assert.equal(draftRun.platformFeeWei, 2_000n);
+  assert.equal(draftRun.serviceFeeWei, 2_000n);
+  assert.equal(draftRun.totalChargedWei, 102_000n);
 
-  assert.throws(() => computeWorkflowServiceFees(100_000n, 0, false), /between 1% and 3%/);
+  assert.throws(() => computeWorkflowServiceFees(100_000n, -1, false), /between 1% and 3%/);
   assert.throws(() => computeWorkflowServiceFees(100_000n, 4, false), /between 1% and 3%/);
 });
 
@@ -107,8 +107,8 @@ test('extractMetaFromReceiptPayload computes full {agentCreatorFee%&&agentPlatfo
   // while cumulative.totalAmountWei and bills[0].total hold full Compose spend (186940 wei).
   const coreParsedRuntimeReceipt = {
     id: 'rcpt_runtime_intent_1',
-    service: 'runtime',
-    action: 'agent-stream',
+    service: 'agent',
+    action: 'stream',
     subject: 'agent:0usamczf9mc35z6ek779cbtax780t8gn0qa192sww6k5004wrtp07g',
     providerAmountWei: '1820',
     platformFeeWei: '1820',
@@ -118,7 +118,7 @@ test('extractMetaFromReceiptPayload computes full {agentCreatorFee%&&agentPlatfo
     bills: [
       {
         kind: 'agent',
-        source: 'runtime',
+        source: 'agent',
         name: 'Fast executor',
         amountWei: '3640',
         total: '186940',
