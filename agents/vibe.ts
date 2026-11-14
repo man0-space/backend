@@ -1377,6 +1377,7 @@ export function createVibeStream(
     prompt: string;
     flow: Flow;
     userAddress: string;
+    mode?: 'create' | 'edit';
     history?: Array<{ role: 'user' | 'assistant'; content: string }>;
     signal?: AbortSignal;
   },
@@ -1397,13 +1398,28 @@ export function createVibeStream(
 
   void (async () => {
     try {
-      const hadInitialBanner = Boolean(input.flow.banner);
-      const working: Flow = {
-        ...input.flow,
-        nodes: input.flow.nodes.map(n => ({ ...n, position: { ...n.position }, data: { ...n.data } })),
-        edges: input.flow.edges.map(e => ({ ...e })),
-        tasks: input.flow.tasks ? [...input.flow.tasks] : undefined,
-      };
+      const mode = input.mode ?? 'create';
+      const hadInitialBanner = mode === 'edit' && Boolean(input.flow.banner);
+      const working: Flow =
+        mode === 'edit'
+          ? {
+              ...input.flow,
+              nodes: input.flow.nodes.map(n => ({
+                ...n,
+                position: { ...n.position },
+                data: { ...n.data },
+              })),
+              edges: input.flow.edges.map(e => ({ ...e })),
+              tasks: input.flow.tasks ? [...input.flow.tasks] : undefined,
+            }
+          : {
+              id: input.flow.id || randomUUID(),
+              name: '',
+              brief: '',
+              nodes: [],
+              edges: [],
+              modified: new Date().toISOString(),
+            };
 
       const discoveredEntries = new Map<string, CatalogEntry>();
       const stepAliases = new Map<string, string>();
@@ -1411,7 +1427,7 @@ export function createVibeStream(
         stepAliases.set(existingNode.id, existingNode.id);
         stepAliases.set(existingNode.data.label.trim().toLowerCase(), existingNode.id);
       }
-      let lastAddedNodeId: string | undefined = working.nodes[working.nodes.length - 1]?.id;
+      let lastAddedNodeId: string | undefined = undefined;
 
       const resolveNodeRef = (ref?: string): string | undefined => {
         if (!ref || !ref.trim()) return undefined;
@@ -1552,9 +1568,10 @@ export function createVibeStream(
         edges: working.edges.map(e => ({ source: e.source, target: e.target })),
       };
 
+      const effectiveHistory = mode === 'edit' ? (input.history ?? []).slice(-6) : [];
       const messages: Array<Record<string, unknown>> = [
         { role: 'system', content: VIBE_SYSTEM_PROMPT },
-        ...(input.history ?? []).slice(-6).map(m => ({ role: m.role, content: m.content })),
+        ...effectiveHistory.map(m => ({ role: m.role, content: m.content })),
         {
           role: 'user',
           content: `Current Studio Workflow State:\n${JSON.stringify(flowSummary)}\n\nCreator Request:\n${input.prompt}`,
@@ -2122,7 +2139,7 @@ export function createVibeStream(
       }
 
       // Guarantee background banner generation from Vibe's title + description + step logos
-      if (!hadInitialBanner && !working.banner && !bannerPromise) {
+      if (!hadInitialBanner && !working.banner && !bannerPromise && working.nodes.length > 0) {
         void startBannerGeneration({
           title: working.name,
           description: working.brief || input.prompt,
