@@ -18,9 +18,61 @@ export const PLATFORM_FEE_PERCENT = 2;
 export const MIN_CREATOR_FEE_PERCENT = 1;
 export const MAX_CREATOR_FEE_PERCENT = 3;
 export const DEFAULT_AUTHORIZATION_BUDGET_WEI = '500000';
+export const VIBE_PRICE_WEI = 20_000n;
+export const BANNER_PRICE_WEI = 30_000n;
+
+export interface MeterLineItem {
+  key: string;
+  unit: string;
+  quantity: number;
+  unitPriceUsd: number;
+  amountWei: string;
+}
+
+export interface FixedChargeSpec {
+  service: 'vibe' | 'banner';
+  action: string;
+  amountWei: bigint;
+  meterSubject: string;
+  lineItems: MeterLineItem[];
+}
+
+export const VIBE_CHARGE_SPEC: FixedChargeSpec = {
+  service: 'vibe',
+  action: 'generate',
+  amountWei: VIBE_PRICE_WEI,
+  meterSubject: 'vibe',
+  lineItems: [
+    {
+      key: 'turn',
+      unit: 'request',
+      quantity: 1,
+      unitPriceUsd: 0.02,
+      amountWei: VIBE_PRICE_WEI.toString(),
+    },
+  ],
+};
+
+export const BANNER_CHARGE_SPEC: FixedChargeSpec = {
+  service: 'banner',
+  action: 'generate',
+  amountWei: BANNER_PRICE_WEI,
+  meterSubject: 'banner',
+  lineItems: [
+    {
+      key: 'image',
+      unit: 'image',
+      quantity: 1,
+      unitPriceUsd: 0.03,
+      amountWei: BANNER_PRICE_WEI.toString(),
+    },
+  ],
+};
 
 export interface Charge {
+  service?: 'workflow' | 'vibe' | 'banner';
   action: string;
+  meterSubject?: string;
   creatorUserAddress: string;
   creatorFeePercent: number;
   maxAmountWei?: string;
@@ -997,4 +1049,21 @@ export async function settleWorkflowPayment(
     serviceFeeWei: fees.serviceFeeWei.toString(),
     totalChargedWei: fees.totalChargedWei.toString(),
   };
+}
+
+export interface PreparedFixedCharge {
+  spec: FixedChargeSpec;
+  mode: 'session' | 'x402';
+  network: PaymentNetwork;
+  treasuryAddress: string;
+  token?: string;
+  sessionSubject?: string;
+  keyId?: string;
+  paymentIntentId?: string;
+  paymentPayload?: Record<string, unknown>;
+  paymentRequirements?: Record<string, unknown>;
+  runId: string;
+  resourceUrl: string;
+  settled: boolean;
+  aborted: boolean;
 }
