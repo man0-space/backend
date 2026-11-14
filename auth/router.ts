@@ -16,6 +16,7 @@ import {
   approveSpendingLimit,
   attachExternalWallet,
   derive,
+  detachExternalWallet,
   ensureDepositReady,
   executeContractCall,
   getNearBalances,
@@ -60,6 +61,8 @@ const emailVerifyBody = z.object({
 const linkAttachBody = z.object({
   network: z.enum(['evm', 'svm']),
   address: z.string().trim().min(1),
+  providerRdns: z.string().trim().max(120).optional(),
+  providerName: z.string().trim().max(120).optional(),
 });
 
 export async function oauthRoutes(app: FastifyInstance) {
@@ -279,13 +282,35 @@ export async function routes(app: FastifyInstance) {
     const attached = await attachExternalWallet(account.userAddress, {
       network: body.network,
       address: body.address,
+      providerRdns: body.providerRdns,
+      providerName: body.providerName,
     });
     const staleKeys = [`profile:${account.userAddress.toLowerCase()}`];
     if (account.name?.trim()) {
       staleKeys.push(`profile:${account.name.trim().toLowerCase()}`);
     }
-    await cacheDel(...staleKeys).catch(() => undefined);
+    await Promise.all([
+      cacheDel(...staleKeys).catch(() => undefined),
+      invalidateNearBalanceCache(account.userAddress).catch(() => undefined),
+    ]);
     return attached;
+  });
+
+  app.delete('/link/:id', async request => {
+    const account = await token.read(bearer(request.headers.authorization));
+    const { id } = z
+      .object({ id: z.string().trim().min(1).max(120) })
+      .parse(request.params);
+    const result = await detachExternalWallet(account.userAddress, id);
+    const staleKeys = [`profile:${account.userAddress.toLowerCase()}`];
+    if (account.name?.trim()) {
+      staleKeys.push(`profile:${account.name.trim().toLowerCase()}`);
+    }
+    await Promise.all([
+      cacheDel(...staleKeys).catch(() => undefined),
+      invalidateNearBalanceCache(account.userAddress).catch(() => undefined),
+    ]);
+    return result;
   });
 
   app.get('/links', async request => {
