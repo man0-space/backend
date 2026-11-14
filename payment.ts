@@ -1094,3 +1094,228 @@ export interface PreparedFixedCharge {
   settled: boolean;
   aborted: boolean;
 }
+
+export async function prepareFixedCharge(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  spec: FixedChargeSpec,
+  fetchImpl: typeof fetch = fetch,
+): Promise<PreparedFixedCharge | null> {
+  const composeUrl = config.composeApiUrl;
+  const requestedNetwork =
+    (request.headers['x-network-id'] as string | undefined)?.trim() ||
+    (request.headers['x-network'] as string | undefined)?.trim() ||
+    (request.headers['x-chain-id'] as string | undefined)?.trim();
+  const amountStr = spec.amountWei.toString();
+  const resourceUrl = resolveRequestResourceUrl(request);
+  const runId = (request.headers['x-run-id'] as string | undefined)?.trim() || randomUUID();
+
+  const sessionToken = extractSessionToken(request);
+  const paymentSignature = extractPaymentSignature(request);
+
+  if (!sessionToken && !paymentSignature) {
+    const challengeNetworkId = requestedNetwork || `near:${config.network}`;
+    const targetChain = await chain(challengeNetworkId, fetchImpl);
+    const treasuryAddress = treasury(targetChain);
+    const paymentRequiredB64 = buildPaymentRequiredHeader({
+      resource: resourceUrl,
+      targetChain,
+      maxAmountWei: amountStr,
+      treasuryAddress,
+      creatorRecipientAddress: treasuryAddress,
+      description: `${spec.service} ${spec.action}`,
+    });
+    reply.header('PAYMENT-REQUIRED', paymentRequiredB64);
+    reply.code(402).send({
+      error: 'Payment Required: Active session or x402 PAYMENT-SIGNATURE header is required.',
+    });
+    return null;
+  }
+
+  if (sessionToken) {
+    const parsed = parseComposeToken(sessionToken);
+    if (!parsed || !parsed.sub) {
+      reply.code(401).send({ error: 'Invalid session token format.' });
+      return null;
+    }
+    if (parsed.exp && parsed.exp * 1000 < Date.now()) {
+      reply.code(401).send({ error: 'session token has expired.' });
+      return null;
+    }
+    const tokenNetworkId = parsed.network?.trim() || requestedNetwork;
+    if (!tokenNetworkId) {
+      reply.code(400).send({ error: 'session token is missing network identifier.' });
+      return null;
+    }
+    const targetChain = await chain(tokenNetworkId, fetchImpl);
+    const network = targetChain.network;
+    const treasuryAddress = treasury(targetChain);
+    const idempotencyKey = `${spec.service}:${spec.action}:${parsed.keyId ?? parsed.sub}:${runId}`;
+
+    const prepareRes = await fetchImpl(`${composeUrl}/api/payments/prepare`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${sessionToken}`,
+        'content-type': 'application/json',
+        'x-network-id': network,
+        'x-session-user-address': parsed.sub,
+      },
+      body: JSON.stringify({
+        service: spec.service,
+        action: spec.action,
+        meterSubject: spec.meterSubject,
+        lineItems: spec.lineItems,
+        resource: resourceUrl,
+        method: request.method,
+        maxAmountWei: amountStr,
+        payTo: treasuryAddress,
+        royalties: { treasury: treasuryAddress },
+        runId,
+        rootRunId: runId,
+        idempotencyKey,
+      }),
+    });
+
+    const preparePayload = (await prepareRes.json().catch(() => ({}))) as {
+      paymentIntentId?: string;
+      userAddress?: string;
+      error?: string;
+    };
+
+    const requiredHeader =
+      prepareRes.headers.get('payment-required') ?? prepareRes.headers.get('PAYMENT-REQUIRED');
+    if (requiredHeader) {
+      reply.header('PAYMENT-REQUIRED', requiredHeader);
+    }
+
+    if (!prepareRes.ok || !preparePayload.paymentIntentId) {
+      reply.code(prepareRes.status || 402).send({
+        error: preparePayload.error || 'Payment preparation failed.',
+      });
+      return null;
+    }
+
+    return {
+      spec,
+      mode: 'session',
+      network,
+      treasuryAddress,
+      token: sessionToken,
+      sessionSubject: preparePayload.userAddress ?? parsed.sub,
+      keyId: parsed.keyId ?? parsed.sub,
+      paymentIntentId: preparePayload.paymentIntentId,
+      runId,
+      resourceUrl,
+      settled: false,
+      aborted: false,
+    };
+  }
+
+  let paymentPayload: Record<string, unknown>;
+  try {
+    const decoded = Buffer.from(paymentSignature!, 'base64').toString('utf8');
+    paymentPayload = JSON.parse(decoded) as Record<string, unknown>;
+  } catch {
+    reply.code(400).send({ error: 'Invalid base64 PAYMENT-SIGNATURE header.' });
+    return null;
+  }
+
+  const acceptedObj = paymentPayload.accepted as { network?: string } | undefined;
+  const x402NetworkId =
+    acceptedObj?.network?.trim() ||
+    (typeof paymentPayload.network === 'string' ? paymentPayload.network.trim() : '') ||
+    requestedNetwork;
+  if (!x402NetworkId) {
+    reply.code(400).send({ error: 'x402 payment payload is missing network identifier.' });
+    return null;
+  }
+
+  const targetChain = await chain(x402NetworkId, fetchImpl);
+  const network = targetChain.network;
+  const treasuryAddress = treasury(targetChain);
+  const paymentRequirements: Record<string, unknown> = {
+    scheme: 'exact',
+    network,
+    amount: amountStr,
+    maxAmountRequired: amountStr,
+    resource: resourceUrl,
+    description: `${spec.service} ${spec.action}`,
+    mimeType: 'application/json',
+    payTo: treasuryAddress,
+    maxTimeoutSeconds: 300,
+    asset: targetChain.assetAddress,
+    extra: {
+      service: spec.service,
+      royalties: { treasury: treasuryAddress },
+    },
+  };
+
+  const verifyRes = await fetchImpl(`${composeUrl}/api/x402/facilitator/verify`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-network-id': network,
+    },
+    body: JSON.stringify({
+      x402Version: 2,
+      paymentPayload,
+      paymentRequirements,
+    }),
+  });
+  const verifyBody = (await verifyRes.json().catch(() => ({}))) as {
+    isValid?: boolean;
+    invalidReason?: string;
+    payer?: string;
+    error?: string;
+  };
+  if (!verifyRes.ok || !verifyBody.isValid || !verifyBody.payer) {
+    const paymentRequiredB64 = buildPaymentRequiredHeader({
+      resource: resourceUrl,
+      targetChain,
+      maxAmountWei: amountStr,
+      treasuryAddress,
+      creatorRecipientAddress: treasuryAddress,
+      description: `${spec.service} ${spec.action}`,
+    });
+    reply.header('PAYMENT-REQUIRED', paymentRequiredB64);
+    reply.code(402).send({
+      error: verifyBody.invalidReason ?? verifyBody.error ?? 'x402 payment verification failed.',
+    });
+    return null;
+  }
+
+  return {
+    spec,
+    mode: 'x402',
+    network,
+    treasuryAddress,
+    sessionSubject: verifyBody.payer,
+    paymentPayload,
+    paymentRequirements,
+    runId,
+    resourceUrl,
+    settled: false,
+    aborted: false,
+  };
+}
+
+export async function abortPreparedFixedCharge(
+  charge: PreparedFixedCharge,
+  reason: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  if (charge.settled || charge.aborted) return;
+  charge.aborted = true;
+  if (charge.mode !== 'session' || !charge.paymentIntentId) return;
+  await fetchImpl(`${config.composeApiUrl}/api/payments/abort`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-network-id': charge.network,
+    },
+    body: JSON.stringify({
+      paymentIntentId: charge.paymentIntentId,
+      reason,
+    }),
+  }).catch(() => undefined);
+}
