@@ -2259,6 +2259,9 @@ export async function build(deps: ServerDeps = {}) {
   );
 
   app.get('/api/market', async () => attachCreatorProfiles(await workflows.list()));
+  app.get('/api/drafts', async request =>
+    workflows.listDrafts((await token.authorize(bearer(request.headers.authorization))).userAddress),
+  );
   app.get('/api/draft', async request =>
     workflows.current((await token.authorize(bearer(request.headers.authorization))).userAddress),
   );
@@ -2269,6 +2272,12 @@ export async function build(deps: ServerDeps = {}) {
       user.userAddress,
       request.headers['if-match'] as string | undefined,
     );
+  });
+  app.delete('/api/draft/:id', async (request, reply) => {
+    const authUser = await token.authorize(bearer(request.headers.authorization));
+    const id = z.string().uuid().parse((request.params as { id: string }).id);
+    await workflows.deleteDraft(authUser.userAddress, id);
+    reply.code(204).send();
   });
   app.delete('/api/draft', async (request, reply) => {
     const authUser = await token.authorize(bearer(request.headers.authorization));
